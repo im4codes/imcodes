@@ -111,7 +111,7 @@ sessionMgmtRoutes.use('/*', requireAuth());
 sessionMgmtRoutes.use('/:id/*', async (c, next) => {
   if (c.get('authServerId' as never)) {
     const authority = await resolveDaemonCallerAuthority(c, {
-      denyParticipant: false,
+      denyParticipant: true,
       denySharedHostAbsentAuthority: false,
       targetServerId: c.req.param('id')!,
       allowOwnerCrossServer: false,
@@ -443,7 +443,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
 async function resolveSupervisorDefaultsOwner(
   c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
 ): Promise<
-  | { ok: true; ownerUserId: string; target: Exclude<ShareTarget, { kind: 'server' }> }
+  | { ok: true; ownerUserId: string; target: Exclude<ShareTarget, { kind: 'server' }>; access: HttpShareAccess }
   | { ok: false; response: Response }
 > {
   const userId = c.get('userId' as never) as string;
@@ -462,7 +462,7 @@ async function resolveSupervisorDefaultsOwner(
   }
   const server = await getServerById(c.env.DB, serverId);
   if (!server) return { ok: false, response: c.json({ error: 'not_found' }, 404) };
-  return { ok: true, ownerUserId: server.user_id, target };
+  return { ok: true, ownerUserId: server.user_id, target, access };
 }
 
 async function buildOwnerExecutionPoolCatalog(
@@ -640,22 +640,25 @@ function canonicalSessionIdentityScopeKey(
 sessionMgmtRoutes.get('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
+  const denyProjectScope = resolved.access.actor.kind === 'share' && !isWholeServerShareAccess(resolved.access);
   return handleSessionIdentityGet(c, resolved.ownerUserId,
-    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true, c.req.param('name')!);
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true, c.req.param('name')!, denyProjectScope);
 });
 
 sessionMgmtRoutes.put('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
+  const denyProjectScope = resolved.access.actor.kind === 'share' && !isWholeServerShareAccess(resolved.access);
   return handleSessionIdentityPut(c, resolved.ownerUserId,
-    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true, c.req.param('name')!);
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true, c.req.param('name')!, denyProjectScope);
 });
 
 sessionMgmtRoutes.delete('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
+  const denyProjectScope = resolved.access.actor.kind === 'share' && !isWholeServerShareAccess(resolved.access);
   return handleSessionIdentityDelete(c, resolved.ownerUserId,
-    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true, c.req.param('name')!);
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true, c.req.param('name')!, denyProjectScope);
 });
 
 /** PATCH /api/server/:id/sessions/:name — update session settings (label, description, cwd) */
@@ -694,7 +697,10 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   // generic gate. Whole-server participants intentionally follow the owner path.
   if (access.actor.kind === 'share'
     && !isWholeServerShareAccess(access)
-    && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
+    && (Object.prototype.hasOwnProperty.call(body, 'transportConfig')
+      || Object.prototype.hasOwnProperty.call(body, 'cwd')
+      || body.agentType === 'shell'
+      || body.agentType === 'script')) {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 
@@ -1326,7 +1332,7 @@ function isWholeServerShareAccess(access: HttpShareAccess): boolean {
   // The fallback preserves old internal test fixtures that model a server
   // grant directly as a server-target coverage snapshot.
   return access.shareProvenance === 'server'
-    || (access.shareProvenance === undefined && access.actor.coverage.target.kind === 'server');
+    || (access.shareProvenance === undefined && access.actor.coverage?.target?.kind === 'server');
 }
 
 async function httpP2pScopeTarget(

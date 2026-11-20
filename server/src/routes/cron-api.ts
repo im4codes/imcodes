@@ -391,7 +391,7 @@ async function resolveCronJobScope(
     targetRole: params.job.target_role,
     targetSessionName: params.job.target_session_name,
     action,
-  })) {
+  }, params.pinnedSessionName)) {
     return { ok: false, reason: 'share-direct-surface-denied' };
   }
   return access;
@@ -462,11 +462,33 @@ async function cronScopeCoversPayload(
   serverId: string,
   scope: CronScope,
   payload: { targetRole?: string | null; targetSessionName?: string | null; action?: z.infer<typeof cronActionSchema> },
+  pinnedSessionName?: string | null,
 ): Promise<boolean> {
+  if (pinnedSessionName && !pinnedSessionCoversPayload(pinnedSessionName, payload)) {
+    return false;
+  }
   if (!scope.shared) return true;
   if (!payload.action) return false;
   if (scope.sharedTargetKind === 'server') return true;
   if (!scope.projectName) return false;
+
+  if (scope.sharedTargetKind === 'subsession') {
+    if (!scope.sharedSessionName || payload.targetSessionName !== scope.sharedSessionName) {
+      return false;
+    }
+    if (payload.action.type === 'send' && payload.action.target !== scope.sharedSessionName) {
+      return false;
+    }
+    if (payload.action.type === 'p2p') {
+      if ((payload.action.participants?.length ?? 0) > 0) return false;
+      for (const entry of payload.action.participantEntries ?? []) {
+        if (entry.type !== 'session' || entry.value !== scope.sharedSessionName) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 
   if (payload.targetSessionName) {
     if (!await sessionBelongsToProject(c.env.DB, serverId, payload.targetSessionName, scope.projectName)) {
@@ -491,17 +513,78 @@ async function cronScopeCoversPayload(
   return true;
 }
 
+function pinnedSessionCoversPayload(
+  pinnedSessionName: string | null | undefined,
+  payload: { targetRole?: string | null; targetSessionName?: string | null; action?: z.infer<typeof cronActionSchema> },
+): boolean {
+  if (!pinnedSessionName) return true;
+  const isSubPinned = pinnedSessionName.startsWith('deck_sub_');
+  const mainRoleMatch = !isSubPinned ? /^deck_.+_(brain|w\d+)$/.exec(pinnedSessionName) : null;
+  const expectedMainRole = mainRoleMatch?.[1] ?? null;
+
+  if (isSubPinned) {
+    if (payload.targetSessionName !== pinnedSessionName) return false;
+  } else if (payload.targetSessionName) {
+    if (payload.targetSessionName !== pinnedSessionName) return false;
+  } else if (!expectedMainRole || payload.targetRole !== expectedMainRole) {
+    return false;
+  }
+
+  const action = payload.action;
+  if (action?.type === 'send') {
+    const allowedSendTarget = action.target === pinnedSessionName
+      || (!isSubPinned && expectedMainRole !== null && action.target === expectedMainRole);
+    if (!allowedSendTarget) return false;
+  }
+  if (action?.type === 'p2p') {
+    if (isSubPinned && (action.participants?.length ?? 0) > 0) return false;
+    if (!isSubPinned) {
+      for (const role of action.participants ?? []) {
+        if (!expectedMainRole || role !== expectedMainRole) return false;
+      }
+    }
+    for (const entry of action.participantEntries ?? []) {
+      if (entry.type === 'session') {
+        if (entry.value !== pinnedSessionName) return false;
+      } else if (isSubPinned || !expectedMainRole || entry.value !== expectedMainRole) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+async function isSharedCronMutationAllowed(
+  db: Database,
+  params: {
+    job: DbCronJob;
+    sharedScope: boolean;
+    isParticipantDaemon: boolean;
+    actingUserId: string;
+  },
+): Promise<boolean> {
+  const isSharedOrNonOwner = params.sharedScope
+    || params.isParticipantDaemon
+    || params.actingUserId !== params.job.user_id;
+  if (!isSharedOrNonOwner) return true;
+  const prov = await db.queryOne<{ shared?: boolean }>(
+    'SELECT shared FROM cron_job_provenance WHERE job_id = $1',
+    [params.job.id],
+  ).catch(() => null);
+  return Boolean(prov?.shared);
+}
+
 async function filterCronRowsForSharedScope<T extends {
   server_id: string;
   project_name?: string | null;
   target_role: string;
   target_session_name: string | null;
   action: string;
-}>(c: Context<CronRouteEnv>, scope: CronScope, rows: T[]): Promise<T[]> {
-  if (!scope.shared) return rows;
-  if (scope.sharedTargetKind !== 'server' && !scope.projectName) return [];
+}>(c: Context<CronRouteEnv>, scope: CronScope, rows: T[], pinnedSessionName?: string | null): Promise<T[]> {
+  if (!scope.shared && !pinnedSessionName) return rows;
+  if (scope.shared && scope.sharedTargetKind !== 'server' && !scope.projectName) return [];
   const checks = await Promise.all(rows.map(async (row) => {
-    if (scope.sharedTargetKind !== 'server' && row.project_name !== scope.projectName) return false;
+    if (scope.shared && scope.sharedTargetKind !== 'server' && row.project_name !== scope.projectName) return false;
     let action: z.infer<typeof cronActionSchema> | undefined;
     try {
       const parsed = cronActionSchema.safeParse(JSON.parse(row.action));
@@ -511,7 +594,7 @@ async function filterCronRowsForSharedScope<T extends {
       targetRole: row.target_role,
       targetSessionName: row.target_session_name,
       action,
-    });
+    }, pinnedSessionName);
   }));
   return rows.filter((_, index) => checks[index]);
 }
@@ -628,7 +711,7 @@ cronApiRoutes.get('/', requireCronAuth(), async (c) => {
       queryProjectName,
     ],
   );
-  return c.json({ jobs: await filterCronRowsForSharedScope(c, access.scope, jobs) });
+  return c.json({ jobs: await filterCronRowsForSharedScope(c, access.scope, jobs, pinnedSessionName) });
 });
 
 // POST /api/cron — create a cron job
@@ -667,14 +750,7 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
     pinnedSessionName,
   });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
-  if (
-    pinnedSessionName
-    && ((targetSessionName && targetSessionName !== pinnedSessionName)
-      || (action.type === 'send' && action.target.startsWith('deck_') && action.target !== pinnedSessionName))
-  ) {
-    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
-  }
-  if (!await cronScopeCoversPayload(c, serverId, access.scope, { targetRole, targetSessionName, action })) {
+  if (!await cronScopeCoversPayload(c, serverId, access.scope, { targetRole, targetSessionName, action }, pinnedSessionName)) {
     return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
   }
 
@@ -704,7 +780,7 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
       `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
        VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (job_id) DO NOTHING`,
-      [id, authority.actorUserId, serverId, access.scope.projectName ?? projectName ?? null, Boolean(access.scope.shared || authority.kind === 'participant_daemon'), now],
+      [id, authority.actorUserId, serverId, access.scope.projectName ?? projectName ?? null, Boolean(access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId), now],
     ).catch(() => {});
   }
 
@@ -752,6 +828,14 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
 
   const access = await resolveCronJobScope(c, { userId: authority.actorUserId, job, mode: 'write', pinnedSessionName });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  if (!await isSharedCronMutationAllowed(c.env.DB, {
+    job,
+    sharedScope: access.scope.shared,
+    isParticipantDaemon: authority.kind === 'participant_daemon',
+    actingUserId: authority.actorUserId,
+  })) {
+    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
+  }
 
   const updates = { ...parsed.data };
   if (access.scope.shared) updates.projectName = access.scope.projectName ?? undefined;
@@ -764,14 +848,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
     targetRole: updates.targetRole !== undefined ? updates.targetRole : job.target_role,
     targetSessionName: updates.targetSessionName !== undefined ? updates.targetSessionName : job.target_session_name,
     action: updates.action ?? existingAction,
-  })) {
-    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
-  }
-  if (
-    pinnedSessionName
-    && ((updates.targetSessionName && updates.targetSessionName !== pinnedSessionName)
-      || (updates.action?.type === 'send' && updates.action.target.startsWith('deck_') && updates.action.target !== pinnedSessionName))
-  ) {
+  }, pinnedSessionName)) {
     return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
   }
   const now = Date.now();
@@ -862,6 +939,18 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
     `UPDATE cron_jobs SET ${sets.join(', ')} WHERE id = $${idx}`,
     vals,
   );
+  if (access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== job.user_id) {
+    await c.env.DB.execute(
+      `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+       VALUES ($1, $2, $3, $4, TRUE, $5)
+       ON CONFLICT (job_id) DO UPDATE
+         SET creator_user_id = EXCLUDED.creator_user_id,
+             server_id = EXCLUDED.server_id,
+             project_name = EXCLUDED.project_name,
+             shared = TRUE`,
+      [jobId, authority.actorUserId, job.server_id, updates.projectName ?? job.project_name ?? null, now],
+    ).catch(() => {});
+  }
 
   await logAudit({
     userId,
@@ -905,6 +994,14 @@ cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
 
   const access = await resolveCronJobScope(c, { userId, job, mode: 'write', pinnedSessionName });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  if (!await isSharedCronMutationAllowed(c.env.DB, {
+    job,
+    sharedScope: access.scope.shared,
+    isParticipantDaemon: authority.kind === 'participant_daemon',
+    actingUserId: userId,
+  })) {
+    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
+  }
 
   if (newStatus === CRON_STATUS.ACTIVE && job.status !== CRON_STATUS.PAUSED) {
     return c.json({ error: 'cannot_resume', currentStatus: job.status }, 400);
@@ -940,6 +1037,14 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
 
   const access = await resolveCronJobScope(c, { userId, job, mode: 'write', pinnedSessionName });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  if (!await isSharedCronMutationAllowed(c.env.DB, {
+    job,
+    sharedScope: access.scope.shared,
+    isParticipantDaemon: authority.kind === 'participant_daemon',
+    actingUserId: userId,
+  })) {
+    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
+  }
 
   const completionPolicy = normalizeCronCompletionPolicy(job.completion_policy);
   const force = c.req.query('force') === 'true';
@@ -990,6 +1095,14 @@ cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
 
   const access = await resolveCronJobScope(c, { userId, job, mode: 'write', pinnedSessionName });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  if (!await isSharedCronMutationAllowed(c.env.DB, {
+    job,
+    sharedScope: access.scope.shared,
+    isParticipantDaemon: authority.kind === 'participant_daemon',
+    actingUserId: userId,
+  })) {
+    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
+  }
 
   try {
     await dispatchJobNow(c.env, job);
@@ -1036,7 +1149,7 @@ cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
        ORDER BY j.id, e.created_at DESC`,
       [access.scope.ownerUserId, serverId, access.scope.projectName],
     );
-    const visibleRows = await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>);
+    const visibleRows = await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>, pinnedSessionName);
     return c.json({ executions: normalizeCronExecutionRows(visibleRows) });
   }
 
@@ -1053,7 +1166,7 @@ cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
      LIMIT $4`,
     [access.scope.ownerUserId, serverId, access.scope.projectName, limit],
   );
-  const visibleRows = await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>);
+  const visibleRows = await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>, pinnedSessionName);
   return c.json({ executions: normalizeCronExecutionRows(visibleRows) });
 });
 

@@ -387,6 +387,46 @@ describe('session-mgmt persistence routes', () => {
     expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
+  it('PATCH /sessions/:name rejects cwd changes and shell/script agentType switches for single-session shares', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-1'],
+          primaryShareId: 'share-1',
+          authorizedAt: Date.now(),
+        },
+      },
+      shareProvenance: 'session',
+    });
+    const app = await buildApp();
+
+    const cwdRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd: '/etc' }),
+    });
+    expect(cwdRes.status).toBe(403);
+    expect(await cwdRes.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+
+    for (const agentType of ['shell', 'script']) {
+      const typeRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentType }),
+      });
+      expect(typeRes.status).toBe(403);
+      expect(await typeRes.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    }
+    expect(mockUpdateSession).not.toHaveBeenCalled();
+  });
+
   it('PATCH /sessions/:name gives a whole-server participant the owner settings path with stamped provenance', async () => {
     const coverage = {
       target: { kind: 'server', serverId: 'srv-1' } as const,
@@ -1275,7 +1315,7 @@ describe('session-mgmt persistence routes', () => {
     }));
   });
 
-  it('reads, overwrites, and clears the machine owner identity for a covered participant', async () => {
+  it('denies single-session participants PROJECT/USER identity while allowing whole-server participants PROJECT identity and denying USER identity', async () => {
     mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
       actor: {
         kind: 'share',
@@ -1285,12 +1325,38 @@ describe('session-mgmt persistence routes', () => {
           effectiveRole: 'participant',
         },
       },
-    });
-    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({
-      status: 'ok', content: 'Owner identity', contentHash: 'owner-hash', revision: 4, updatedAt: 10,
+      shareProvenance: 'session',
     });
     const app = await buildApp();
 
+    // Concrete single-session participant cannot read/write/delete PROJECT or USER identity
+    expect((await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=project&scopeKey=repo-stable-id')).status).toBe(403);
+    expect((await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'project', scopeKey: 'repo-stable-id', content: 'Participant overwrite' }),
+    })).status).toBe(403);
+    expect((await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=user&scopeKey=')).status).toBe(403);
+    expect(sendSessionIdentityLocalRequestMock).not.toHaveBeenCalled();
+
+    // Whole-server participant can read/write/delete PROJECT identity under owner server, but NEVER USER identity
+    resolveSessionIdentityProjectKeyMock.mockReturnValue('repo-stable-id');
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: {
+          target: { kind: 'server', serverId: 'srv-1' },
+          effectiveRole: 'participant',
+        },
+      },
+      shareProvenance: 'server',
+    });
+    expect((await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=user&scopeKey=')).status).toBe(403);
+
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({
+      status: 'ok', content: 'Owner identity', contentHash: 'owner-hash', revision: 4, updatedAt: 10,
+    });
     const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=project&scopeKey=repo-stable-id');
     expect(read.status).toBe(200);
     await expect(read.json()).resolves.toEqual({
@@ -1338,14 +1404,13 @@ describe('session-mgmt persistence routes', () => {
     expect(mockDbExecute).toHaveBeenLastCalledWith(expect.stringContaining('DELETE FROM session_identity_metadata'), [
       'owner-user', 'project', 'repo-stable-id',
     ]);
+    resolveSessionIdentityProjectKeyMock.mockImplementation(() => null);
   });
 
-  it('reads a participant\'s project identity under the daemon\'s canonical project key, not the browser\'s guess', async () => {
-    // Share recipients never receive contextNamespace, so the browser can
-    // only send the bare project name; the owner's daemon keys the project
-    // identity by the canonical project id.
+  it('reads a whole-server participant project identity under canonical key and fails closed when canonical key is null', async () => {
     mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
       actor: { kind: 'share', effectiveActorRole: 'participant' },
+      shareProvenance: 'server',
     });
     resolveSessionIdentityProjectKeyMock.mockImplementation((name) => (
       name === 'deck_proj_brain' ? 'github-org/repo' : null
@@ -1379,8 +1444,11 @@ describe('session-mgmt persistence routes', () => {
       expect.objectContaining({ op: 'set', scope: 'project', scopeKey: 'github-org/repo', content: 'Edited by participant' }),
       expect.any(Number),
     );
-    resolveSessionIdentityProjectKeyMock.mockReset();
+
+    // When canonical project key returns null for a non-owner, fail closed instead of accepting caller scopeKey
     resolveSessionIdentityProjectKeyMock.mockImplementation(() => null);
+    const failClosed = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=project&scopeKey=arbitrary-key');
+    expect(failClosed.status).toBe(400);
   });
 
   it('pins the session identity key to the covered session', async () => {

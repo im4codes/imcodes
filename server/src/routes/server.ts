@@ -16,6 +16,7 @@ import {
   setUserPref,
 } from '../db/queries.js';
 import { resolveServerRole } from '../security/authorization.js';
+import { resolveControlledMachineManagementAccess } from '../share/machine-access.js';
 import { isSharedOrContributedServer } from '../security/daemon-scope.js';
 import { resolveSharedMachineAuthority } from '../share/shared-machine-authority.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
@@ -399,10 +400,10 @@ serverRoutes.patch('/:id/name', requireAuth(), async (c) => {
 
   const server = await getServerById(c.env.DB, serverId);
   const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (!server || role !== 'owner') {
+  if (!server || server.user_id !== userId || role !== 'owner') {
     return c.json({ error: 'not_found' }, 404);
   }
-  const updated = await updateServerName(c.env.DB, serverId, server.user_id, parsed.data.name.trim());
+  const updated = await updateServerName(c.env.DB, serverId, userId, parsed.data.name.trim());
   if (!updated) return c.json({ error: 'not_found' }, 404);
   return c.json({ ok: true });
 });
@@ -414,10 +415,10 @@ serverRoutes.delete('/:id', requireAuth(), async (c) => {
 
   const server = await getServerById(c.env.DB, serverId);
   const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (!server || role !== 'owner') {
+  if (!server || server.user_id !== userId || role !== 'owner') {
     return c.json({ error: 'not_found' }, 404);
   }
-  const deleted = await deleteServer(c.env.DB, serverId, server.user_id);
+  const deleted = await deleteServer(c.env.DB, serverId, userId);
   if (!deleted) return c.json({ error: 'not_found' }, 404);
 
   // Notify daemon to self-destruct after DB ownership has been proven (best-effort — daemon may be offline)
@@ -453,14 +454,18 @@ serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
   if (!role || role === 'none') {
     return c.json({ error: 'not_found' }, 404);
   }
-  if (process.env.IMCODES_NODE_EXE_DIR?.trim()) {
-    const srv = await getServerById(c.env.DB, serverId) as (Awaited<ReturnType<typeof getServerById>> & {
-      node_role?: string | null;
-      os?: string | null;
-      arch?: string | null;
-      abi_profile?: unknown;
-    }) | null;
-    if (srv?.node_role === NODE_ROLE.CONTROLLED) {
+  const srv = await getServerById(c.env.DB, serverId) as (Awaited<ReturnType<typeof getServerById>> & {
+    node_role?: string | null;
+    os?: string | null;
+    arch?: string | null;
+    abi_profile?: unknown;
+  }) | null;
+  if (srv?.node_role === NODE_ROLE.CONTROLLED) {
+    const controlledAccess = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
+    if (!controlledAccess) {
+      return c.json({ error: 'not_found' }, 404);
+    }
+    if (process.env.IMCODES_NODE_EXE_DIR?.trim()) {
       const availability = await checkControlledNodeUpgradeArtifactAvailability({
         os: srv.os,
         arch: srv.arch,
@@ -641,7 +646,7 @@ serverRoutes.get('/:id/supervision/user-defaults/daemon', async (c) => {
   const serverId = c.req.param('id');
   const authed = await authenticateDaemonServer(c, serverId);
   if (!authed.ok) return daemonAuthFailure(c, authed);
-  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true });
+  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true, denyParticipant: true });
   if (denied) return denied;
   const serverRow = authed.auth;
   const raw = await getUserPref(c.env.DB, serverRow.userId, SUPERVISION_USER_DEFAULT_PREF_KEY);
@@ -659,7 +664,7 @@ serverRoutes.put('/:id/supervision/user-defaults/daemon', async (c) => {
   const serverId = c.req.param('id');
   const authed = await authenticateDaemonServer(c, serverId);
   if (!authed.ok) return daemonAuthFailure(c, authed);
-  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true });
+  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true, denyParticipant: true });
   if (denied) return denied;
   const body = await c.req.json().catch(() => null) as { defaults?: unknown } | null;
   const parsed = parseSupervisorDefaultConfig(body?.defaults);
@@ -684,7 +689,7 @@ serverRoutes.get('/:id/repo-callbacks/daemon', async (c) => {
   const serverId = c.req.param('id');
   const authed = await authenticateDaemonServer(c, serverId);
   if (!authed.ok) return daemonAuthFailure(c, authed);
-  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true });
+  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true, denyParticipant: true });
   if (denied) return denied;
   const serverRow = authed.auth;
   const [rawGlobal, rawServer] = await Promise.all([
@@ -715,7 +720,7 @@ serverRoutes.get('/:id/repo-callbacks/daemon', async (c) => {
 serverRoutes.post('/:id/bindings', async (c) => {
   const authed = await authenticateDaemonServer(c, c.req.param('id'));
   if (!authed.ok) return daemonAuthFailure(c, authed);
-  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true });
+  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true, denyParticipant: true });
   if (denied) return denied;
   const serverRow = authed.auth;
 
@@ -750,7 +755,7 @@ serverRoutes.post('/:id/bindings', async (c) => {
 serverRoutes.delete('/:id/bindings', async (c) => {
   const authed = await authenticateDaemonServer(c, c.req.param('id'));
   if (!authed.ok) return daemonAuthFailure(c, authed);
-  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true });
+  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true, denyParticipant: true });
   if (denied) return denied;
   const serverRow = authed.auth;
 

@@ -79,20 +79,67 @@ async function verifySharedCronCreatorStillAuthorized(
   });
   if (member.ok) return true;
 
-  if (job.target_session_name) {
-    const target = shareTargetFromSessionName(job.server_id, job.target_session_name);
-    if (target) {
-      const access = await resolveHttpShareAccessForCoveredSession(db, {
-        serverId: job.server_id,
-        userId: prov.creator_user_id,
-        target,
-      });
-      return access.actor.kind === 'share' && access.actor.effectiveActorRole === 'participant';
+  const shares = await listActiveSharesForUser(db, prov.creator_user_id, now).catch(() => []);
+  const participantShares = shares.filter((s) => s.serverId === job.server_id && s.role === 'participant');
+  if (participantShares.length === 0) return false;
+
+  let hasMatchingMainShare = false;
+  for (const s of participantShares) {
+    if (s.target.kind === 'main' && s.target.sessionName && job.project_name) {
+      const sess = await db.queryOne<{ project_name: string }>(
+        'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+        [job.server_id, s.target.sessionName],
+      ).catch(() => null);
+      if (sess?.project_name === job.project_name) {
+        hasMatchingMainShare = true;
+        break;
+      }
     }
   }
 
-  const shares = await listActiveSharesForUser(db, prov.creator_user_id, now).catch(() => []);
-  return shares.some((s) => s.serverId === job.server_id && s.role === 'participant');
+  let parsedAction: Record<string, unknown> | null = null;
+  try {
+    const parsed = JSON.parse(job.action);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      parsedAction = parsed as Record<string, unknown>;
+    }
+  } catch {
+    return false;
+  }
+
+  if (job.target_session_name) {
+    const target = shareTargetFromSessionName(job.server_id, job.target_session_name);
+    if (!target) return false;
+    const access = await resolveHttpShareAccessForCoveredSession(db, {
+      serverId: job.server_id,
+      userId: prov.creator_user_id,
+      target,
+    });
+    if (access.actor.kind !== 'share' || access.actor.effectiveActorRole !== 'participant') {
+      return false;
+    }
+    if (!hasMatchingMainShare) {
+      if (parsedAction?.type === 'send' && parsedAction.target !== job.target_session_name) {
+        return false;
+      }
+      if (parsedAction?.type === 'p2p') {
+        if (Array.isArray(parsedAction.participants) && parsedAction.participants.length > 0) {
+          return false;
+        }
+        const entries = Array.isArray(parsedAction.participantEntries) ? parsedAction.participantEntries : [];
+        for (const entry of entries) {
+          if (!entry || typeof entry !== 'object'
+            || (entry as Record<string, unknown>).type !== 'session'
+            || (entry as Record<string, unknown>).value !== job.target_session_name) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  return hasMatchingMainShare;
 }
 
 async function issueCronOwnerAuthority(

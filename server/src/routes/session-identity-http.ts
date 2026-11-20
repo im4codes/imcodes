@@ -48,8 +48,12 @@ function resolveScopeKey(
   scope: ReturnType<typeof readScope>,
   raw: unknown,
   canonical?: SessionIdentityCanonicalScopeKey,
+  failClosedOnNullCanonical = false,
 ): string | null {
   const resolved = scope && canonical ? canonical(scope) : null;
+  if (canonical && resolved === null && failClosedOnNullCanonical && scope !== SESSION_IDENTITY_SCOPES.PAIR && scope !== SESSION_IDENTITY_SCOPES.USER) {
+    return null;
+  }
   return normalizedScopeKey(scope, resolved ?? raw);
 }
 
@@ -139,10 +143,18 @@ export async function handleSessionIdentityGet<
   serverId?: string,
   sessionCoveredParticipant = false,
   sessionName?: string,
+  denyProjectScope = false,
 ): Promise<Response> {
+  const actingUserId = c.get('userId' as never) as string | undefined;
   const scope = readScope(c);
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
-  let scopeKey = resolveScopeKey(scope, c.req.query('scopeKey'), canonicalScopeKey);
+  if (scope === SESSION_IDENTITY_SCOPES.USER && (!actingUserId || actingUserId !== ownerUserId)) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+  if (denyProjectScope && scope === SESSION_IDENTITY_SCOPES.PROJECT) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+  let scopeKey = resolveScopeKey(scope, c.req.query('scopeKey'), canonicalScopeKey, !actingUserId || actingUserId !== ownerUserId);
   if (scopeKey === null) {
     if (scope === SESSION_IDENTITY_SCOPES.PAIR && (sessionCoveredParticipant || sessionName)) {
       scopeKey = '';
@@ -194,12 +206,20 @@ export async function handleSessionIdentityPut<
   serverId?: string,
   sessionCoveredParticipant = false,
   sessionName?: string,
+  denyProjectScope = false,
 ): Promise<Response> {
+  const actingUserId = c.get('userId' as never) as string | undefined;
   const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
   if (!body) return c.json({ error: 'identity_request_invalid' }, 400);
   const scope = isSessionIdentityScope(body.scope) ? body.scope : null;
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
-  let scopeKey = resolveScopeKey(scope, body.scopeKey, canonicalScopeKey);
+  if (scope === SESSION_IDENTITY_SCOPES.USER && (!actingUserId || actingUserId !== ownerUserId)) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+  if (denyProjectScope && scope === SESSION_IDENTITY_SCOPES.PROJECT) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+  let scopeKey = resolveScopeKey(scope, body.scopeKey, canonicalScopeKey, !actingUserId || actingUserId !== ownerUserId);
   if (scopeKey === null) {
     if (scope === SESSION_IDENTITY_SCOPES.PAIR && (sessionCoveredParticipant || sessionName)) {
       scopeKey = '';
@@ -276,10 +296,18 @@ export async function handleSessionIdentityDelete<
   serverId?: string,
   sessionCoveredParticipant = false,
   sessionName?: string,
+  denyProjectScope = false,
 ): Promise<Response> {
+  const actingUserId = c.get('userId' as never) as string | undefined;
   const scope = readScope(c);
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
-  let scopeKey = resolveScopeKey(scope, c.req.query('scopeKey'), canonicalScopeKey);
+  if (scope === SESSION_IDENTITY_SCOPES.USER && (!actingUserId || actingUserId !== ownerUserId)) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+  if (denyProjectScope && scope === SESSION_IDENTITY_SCOPES.PROJECT) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+  let scopeKey = resolveScopeKey(scope, c.req.query('scopeKey'), canonicalScopeKey, !actingUserId || actingUserId !== ownerUserId);
   if (scopeKey === null) {
     if (scope === SESSION_IDENTITY_SCOPES.PAIR && (sessionCoveredParticipant || sessionName)) {
       scopeKey = '';

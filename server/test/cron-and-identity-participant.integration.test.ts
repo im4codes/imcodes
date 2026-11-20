@@ -214,7 +214,25 @@ describe('Real-machine test: Shared session participant cron management', () => 
     expect(jobIds).not.toContain('cron-other-seeded');
   });
 
-  it('2. lets a sub-session shared participant see the corresponding project cron jobs', async () => {
+  it('2. restricts a sub-session shared participant to only crons targeting that sub-session', async () => {
+    await db.execute(
+      `INSERT INTO cron_jobs (id, user_id, server_id, name, cron_expr, project_name, target_role, target_session_name, action, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        'cron-sub-seeded',
+        OWNER_ID,
+        SERVER_ID,
+        'Sub-Session Check',
+        '0 8 * * *',
+        PROJECT_NAME,
+        'brain',
+        SUB_SESSION_NAME,
+        JSON.stringify({ type: 'command', command: '/sub-check' }),
+        CRON_STATUS.ACTIVE,
+        Date.now(),
+      ],
+    );
     const res = await app.request(
       `/api/cron?serverId=${SERVER_ID}&sessionName=${SUB_SESSION_NAME}`,
       { headers: { Authorization: bearer(PARTICIPANT_ID) } },
@@ -223,7 +241,8 @@ describe('Real-machine test: Shared session participant cron management', () => 
     expect(res.status).toBe(200);
     const body = (await res.json()) as { jobs: Array<{ id: string; name: string; project_name: string }> };
     const jobIds = body.jobs.map((j) => j.id);
-    expect(jobIds).toContain('cron-owner-seeded');
+    expect(jobIds).toContain('cron-sub-seeded');
+    expect(jobIds).not.toContain('cron-owner-seeded');
   });
 
   it('3. lets a shared participant CREATE a new scheduled cron task in the project', async () => {
@@ -263,7 +282,33 @@ describe('Real-machine test: Shared session participant cron management', () => 
     expect(dbRow?.project_name).toBe(PROJECT_NAME);
   });
 
-  it('4. lets a shared participant EDIT an existing cron task in the project', async () => {
+  it('4. blocks hijacking unshared owner cron via PUT while allowing EDIT on shared-provenance job with shared=true preserved', async () => {
+    const hijackRes = await app.request(
+      `/api/cron/cron-owner-seeded?sessionName=${MAIN_SESSION}`,
+      {
+        method: 'PUT',
+        headers: {
+          Authorization: bearer(PARTICIPANT_ID),
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ name: 'Hijacked Owner Job', cronExpr: '0 9 * * *' }),
+      },
+    );
+    expect(hijackRes.status).toBe(403);
+
+    const sharedJobId = 'cron-shared-seeded';
+    const now = Date.now();
+    await db.execute(
+      `INSERT INTO cron_jobs (id, user_id, server_id, name, cron_expr, project_name, target_role, action, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
+      [sharedJobId, OWNER_ID, SERVER_ID, 'Shared Editable Job', '0 8 * * *', PROJECT_NAME, 'brain', JSON.stringify({ type: 'command', command: '/shared' }), CRON_STATUS.ACTIVE, now],
+    );
+    await db.execute(
+      `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+       VALUES ($1, $2, $3, $4, TRUE, $5)`,
+      [sharedJobId, PARTICIPANT_ID, SERVER_ID, PROJECT_NAME, now],
+    );
+
     const updatePayload = {
       name: 'Participant Updated Health Check',
       cronExpr: '0 9 * * *',
@@ -271,7 +316,7 @@ describe('Real-machine test: Shared session participant cron management', () => 
     };
 
     const res = await app.request(
-      `/api/cron/cron-owner-seeded?sessionName=${MAIN_SESSION}`,
+      `/api/cron/${sharedJobId}?sessionName=${MAIN_SESSION}`,
       {
         method: 'PUT',
         headers: {
@@ -288,16 +333,21 @@ describe('Real-machine test: Shared session participant cron management', () => 
 
     const dbRow = await db.queryOne<{ name: string; cron_expr: string }>(
       'SELECT name, cron_expr FROM cron_jobs WHERE id = $1',
-      ['cron-owner-seeded'],
+      [sharedJobId],
     );
     expect(dbRow?.name).toBe('Participant Updated Health Check');
     expect(dbRow?.cron_expr).toBe('0 9 * * *');
+    const provRow = await db.queryOne<{ shared: boolean; creator_user_id: string }>(
+      'SELECT shared, creator_user_id FROM cron_job_provenance WHERE job_id = $1',
+      [sharedJobId],
+    );
+    expect(provRow).toEqual({ shared: true, creator_user_id: PARTICIPANT_ID });
   });
 
-  it('5. lets a shared participant PAUSE and RESUME an existing cron task', async () => {
+  it('5. lets a shared participant PAUSE and RESUME an existing shared cron task', async () => {
     // Pause
     const pauseRes = await app.request(
-      `/api/cron/cron-owner-seeded/status?sessionName=${MAIN_SESSION}`,
+      `/api/cron/cron-shared-seeded/status?sessionName=${MAIN_SESSION}`,
       {
         method: 'PATCH',
         headers: {
@@ -308,12 +358,12 @@ describe('Real-machine test: Shared session participant cron management', () => 
       },
     );
     expect(pauseRes.status).toBe(200);
-    let dbRow = await db.queryOne<{ status: string }>('SELECT status FROM cron_jobs WHERE id = $1', ['cron-owner-seeded']);
+    let dbRow = await db.queryOne<{ status: string }>('SELECT status FROM cron_jobs WHERE id = $1', ['cron-shared-seeded']);
     expect(dbRow?.status).toBe(CRON_STATUS.PAUSED);
 
     // Resume
     const resumeRes = await app.request(
-      `/api/cron/cron-owner-seeded/status?sessionName=${MAIN_SESSION}`,
+      `/api/cron/cron-shared-seeded/status?sessionName=${MAIN_SESSION}`,
       {
         method: 'PATCH',
         headers: {
@@ -324,17 +374,23 @@ describe('Real-machine test: Shared session participant cron management', () => 
       },
     );
     expect(resumeRes.status).toBe(200);
-    dbRow = await db.queryOne<{ status: string }>('SELECT status FROM cron_jobs WHERE id = $1', ['cron-owner-seeded']);
+    dbRow = await db.queryOne<{ status: string }>('SELECT status FROM cron_jobs WHERE id = $1', ['cron-shared-seeded']);
     expect(dbRow?.status).toBe(CRON_STATUS.ACTIVE);
   });
 
-  it('6. lets a shared participant DELETE a cron task in the project', async () => {
-    // Create a temporary cron to delete
+  it('6. lets a shared participant DELETE a shared cron task in the project', async () => {
+    // Create a temporary shared cron to delete
     const tempId = 'cron-to-delete-part';
+    const now = Date.now();
     await db.execute(
       `INSERT INTO cron_jobs (id, user_id, server_id, name, cron_expr, project_name, target_role, action, status, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
-      [tempId, OWNER_ID, SERVER_ID, 'Temp Job To Delete', '0 1 * * *', PROJECT_NAME, 'brain', JSON.stringify({ type: 'command', command: '/rm' }), CRON_STATUS.ACTIVE, Date.now()],
+      [tempId, OWNER_ID, SERVER_ID, 'Temp Job To Delete', '0 1 * * *', PROJECT_NAME, 'brain', JSON.stringify({ type: 'command', command: '/rm' }), CRON_STATUS.ACTIVE, now],
+    );
+    await db.execute(
+      `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+       VALUES ($1, $2, $3, $4, TRUE, $5)`,
+      [tempId, PARTICIPANT_ID, SERVER_ID, PROJECT_NAME, now],
     );
 
     const deleteRes = await app.request(
@@ -422,15 +478,13 @@ describe('Real-machine test: Shared session participant cron management', () => 
 });
 
 describe('Real-machine test: Shared session participant 3-level session identity', () => {
-  it('1. USER scope: allows a covered participant to read and update the machine owner user identity', async () => {
-    // Participant reads user identity
+  it('1. USER scope: denies a non-owner participant reading or mutating the machine owner user identity', async () => {
     const getRes = await app.request(
       `/api/server/${SERVER_ID}/sessions/${MAIN_SESSION}/identity?scope=${SESSION_IDENTITY_SCOPES.USER}`,
       { headers: { Authorization: bearer(PARTICIPANT_ID) } },
     );
-    expect(getRes.status).toBe(200);
+    expect(getRes.status).toBe(403);
 
-    // Participant writes user identity
     const putRes = await app.request(
       `/api/server/${SERVER_ID}/sessions/${MAIN_SESSION}/identity`,
       {
@@ -445,34 +499,23 @@ describe('Real-machine test: Shared session participant 3-level session identity
         }),
       },
     );
-    expect(putRes.status).toBe(200);
-    const body = (await putRes.json()) as { profile: { scope: string; content: string } };
-    expect(body.profile.scope).toBe(SESSION_IDENTITY_SCOPES.USER);
-    expect(body.profile.content).toBe('Owner user prompt customized by participant');
+    expect(putRes.status).toBe(403);
 
-    // Verify row written to PostgreSQL under OWNER_ID
     const dbRow = await db.queryOne<{ user_id: string; content: string }>(
       'SELECT user_id, content FROM session_identity_profiles WHERE user_id = $1 AND scope = $2',
       [OWNER_ID, SESSION_IDENTITY_SCOPES.USER],
     );
-    expect(dbRow?.user_id).toBe(OWNER_ID);
-    expect(dbRow?.content).toBe('Owner user prompt customized by participant');
+    expect(dbRow).toBeNull();
   });
 
-  it('2. PROJECT scope: allows a covered participant to read and update project identity via canonical key', async () => {
-    // Participant reads project identity
-    const getRes = await app.request(
+  it('2. PROJECT scope: denies concrete session shares while allowing whole-server participants via canonical key', async () => {
+    const deniedGet = await app.request(
       `/api/server/${SERVER_ID}/sessions/${MAIN_SESSION}/identity?scope=${SESSION_IDENTITY_SCOPES.PROJECT}`,
       { headers: { Authorization: bearer(PARTICIPANT_ID) } },
     );
-    expect(getRes.status).toBe(200);
-    const getBody = (await getRes.json()) as { profile: { scope: string; scopeKey: string; content: string } };
-    expect(getBody.profile.scope).toBe(SESSION_IDENTITY_SCOPES.PROJECT);
-    expect(getBody.profile.scopeKey).toBe('canonical-realdeck-key');
-    expect(getBody.profile.content).toBe('Daemon stored content for project');
+    expect(deniedGet.status).toBe(403);
 
-    // Participant writes project identity
-    const putRes = await app.request(
+    const deniedPut = await app.request(
       `/api/server/${SERVER_ID}/sessions/${MAIN_SESSION}/identity`,
       {
         method: 'PUT',
@@ -482,23 +525,21 @@ describe('Real-machine test: Shared session participant 3-level session identity
         },
         body: JSON.stringify({
           scope: SESSION_IDENTITY_SCOPES.PROJECT,
-          content: 'Project prompt customized by participant',
+          content: 'Project prompt customized by concrete session participant',
         }),
       },
     );
-    expect(putRes.status).toBe(200);
-    const putBody = (await putRes.json()) as { profile: { scope: string; scopeKey: string; content: string } };
-    expect(putBody.profile.scope).toBe(SESSION_IDENTITY_SCOPES.PROJECT);
-    expect(putBody.profile.scopeKey).toBe('canonical-realdeck-key');
-    expect(putBody.profile.content).toBe('Project prompt customized by participant');
+    expect(deniedPut.status).toBe(403);
 
-    // Verify metadata projected in real DB under OWNER_ID
-    const metaRow = await db.queryOne<{ user_id: string; scope: string; scope_key: string }>(
-      'SELECT user_id, scope, scope_key FROM session_identity_metadata WHERE user_id = $1 AND scope = $2',
-      [OWNER_ID, SESSION_IDENTITY_SCOPES.PROJECT],
+    // Owner still retains full PROJECT identity access via canonical key
+    const ownerGet = await app.request(
+      `/api/server/${SERVER_ID}/sessions/${MAIN_SESSION}/identity?scope=${SESSION_IDENTITY_SCOPES.PROJECT}`,
+      { headers: { Authorization: bearer(OWNER_ID) } },
     );
-    expect(metaRow?.user_id).toBe(OWNER_ID);
-    expect(metaRow?.scope_key).toBe('canonical-realdeck-key');
+    expect(ownerGet.status).toBe(200);
+    const getBody = (await ownerGet.json()) as { profile: { scope: string; scopeKey: string; content: string } };
+    expect(getBody.profile.scope).toBe(SESSION_IDENTITY_SCOPES.PROJECT);
+    expect(getBody.profile.scopeKey).toBe('canonical-realdeck-key');
   });
 
   it('3. SESSION scope: allows a covered participant to read and update session identity pinned to the session', async () => {

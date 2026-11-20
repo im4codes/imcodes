@@ -10,6 +10,7 @@ const mockDaemonUpgradeStatus = vi.fn();
 const mockDeleteServer = vi.fn();
 const mockResolveServerRole = vi.fn();
 const mockGetServerById = vi.fn();
+const mockResolveControlledMachineManagementAccess = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -18,6 +19,10 @@ vi.mock('../src/security/authorization.js', () => ({
     await next();
   },
   resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args),
+}));
+
+vi.mock('../src/share/machine-access.js', () => ({
+  resolveControlledMachineManagementAccess: (...args: unknown[]) => mockResolveControlledMachineManagementAccess(...args),
 }));
 
 vi.mock('../src/db/queries.js', () => ({
@@ -89,7 +94,8 @@ describe('server routes', () => {
     });
     mockDeleteServer.mockResolvedValue(true);
     mockResolveServerRole.mockResolvedValue('owner');
-    mockGetServerById.mockResolvedValue({ id: 'srv-1', user_id: 'owner-user', name: 'Alpha' });
+    mockGetServerById.mockResolvedValue({ id: 'srv-1', user_id: 'user-1', name: 'Alpha' });
+    mockResolveControlledMachineManagementAccess.mockResolvedValue(null);
     delete process.env.APP_VERSION;
   });
 
@@ -313,12 +319,12 @@ describe('server routes', () => {
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: 'not_found' });
-    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'owner-user');
+    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'user-1');
     expect(mockSendToDaemon).not.toHaveBeenCalled();
   });
 
   it('deletes an offline server even when its daemon cannot be notified', async () => {
-    mockGetServerById.mockResolvedValueOnce({ id: 'srv-1', user_id: 'owner-user', status: 'offline' });
+    mockGetServerById.mockResolvedValueOnce({ id: 'srv-1', user_id: 'user-1', status: 'offline' });
     mockSendToDaemon.mockImplementationOnce(() => { throw new Error('offline'); });
     const app = await buildTestApp();
     const res = await app.request('/api/server/srv-1', { method: 'DELETE' });
@@ -336,6 +342,41 @@ describe('server routes', () => {
     expect(mockSendToDaemon).not.toHaveBeenCalled();
   });
 
+  it('rejects whole-server participant rename and delete even when resolveServerRole returns owner', async () => {
+    mockResolveServerRole.mockResolvedValue('owner');
+    mockGetServerById.mockResolvedValue({ id: 'srv-1', user_id: 'owner-user', name: 'Alpha' });
+    const app = await buildTestApp();
+
+    const renameRes = await app.request('/api/server/srv-1/name', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Hijacked' }),
+    });
+    expect(renameRes.status).toBe(404);
+
+    const delRes = await app.request('/api/server/srv-1', { method: 'DELETE' });
+    expect(delRes.status).toBe(404);
+    expect(mockDeleteServer).not.toHaveBeenCalled();
+    expect(mockSendToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('enforces owner-only controlled-node access on POST /:id/upgrade even without IMCODES_NODE_EXE_DIR', async () => {
+    delete process.env.IMCODES_NODE_EXE_DIR;
+    mockResolveServerRole.mockResolvedValue('owner');
+    mockGetServerById.mockResolvedValue({ id: 'srv-1', user_id: 'owner-user', node_role: 'controlled' });
+    mockResolveControlledMachineManagementAccess.mockResolvedValueOnce(null);
+    const app = await buildTestApp();
+
+    const denied = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
+    expect(denied.status).toBe(404);
+    expect(mockRequestDaemonUpgrade).not.toHaveBeenCalled();
+
+    mockResolveControlledMachineManagementAccess.mockResolvedValueOnce({ access_role: 'owner' });
+    const allowed = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
+    expect(allowed.status).toBe(200);
+    expect(mockRequestDaemonUpgrade).toHaveBeenCalledTimes(1);
+  });
+
   it('notifies daemon only after an authorized server delete succeeds', async () => {
     mockDeleteServer.mockResolvedValueOnce(true);
     const app = await buildTestApp();
@@ -344,7 +385,7 @@ describe('server routes', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
-    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'owner-user');
+    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'user-1');
     expect(mockSendToDaemon).toHaveBeenCalledWith(JSON.stringify({ type: 'server.delete' }));
   });
 });

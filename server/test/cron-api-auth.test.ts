@@ -30,6 +30,7 @@ function normalize(sql: string): string {
 /** Servers, their token hashes and the cron tables; every write is recorded so "touched nothing" can be asserted. */
 function makeDb(servers: ServerRow[]) {
   const cronJobs = new Map<string, MockRow>();
+  const cronProvenance = new Map<string, MockRow>();
   const writes: string[] = [];
   const find = (id: unknown) => servers.find((server) => server.id === id);
   const db = {
@@ -45,6 +46,9 @@ function makeDb(servers: ServerRow[]) {
         return (server ? { user_id: server.user_id, owner_status: 'active', actor_status: 'active' } : null) as T | null;
       }
       if (s.includes('exists (select 1 from servers')) return { exists: Boolean(find(params[0])) } as T;
+      if (s.includes('from cron_job_provenance where job_id')) {
+        return (cronProvenance.get(params[0] as string) ?? null) as T | null;
+      }
       if (s.includes('from cron_jobs where id')) {
         const job = cronJobs.get(params[0] as string);
         return (job && (!s.includes('user_id') || job.user_id === params[1]) ? job : null) as T | null;
@@ -67,13 +71,22 @@ function makeDb(servers: ServerRow[]) {
           next_run_at: params[11], expires_at: params[12], completion_policy: params[13], created_at: params[14], updated_at: params[14], last_run_at: null,
         });
       }
+      if (s.includes('insert into cron_job_provenance')) {
+        cronProvenance.set(params[0] as string, {
+          job_id: params[0],
+          creator_user_id: params[1],
+          server_id: params[2],
+          project_name: params[3],
+          shared: s.includes('true') ? true : Boolean(params[4]),
+        });
+      }
       if (s.includes('delete from cron_jobs')) cronJobs.delete(params[0] as string);
       return { changes: 1 };
     },
     exec: async () => {},
     close: async () => {},
   } as unknown as Database;
-  return { db, cronJobs, writes };
+  return { db, cronJobs, cronProvenance, writes };
 }
 
 const OWNER = 'user-owner';
@@ -179,7 +192,13 @@ describe('cron API authentication (real auth middleware)', () => {
     const list = await app.request(`/api/cron?serverId=${VICTIM_SERVER}`, { headers });
     expect(list.status).toBe(200);
     expect((await list.json() as { jobs: MockRow[] }).jobs.map(j => j.id).sort()).toEqual(['job-1', 'other-project']);
-    const update = await app.request('/api/cron/job-1', { method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'updated' }) });
+    // Unshared owner job cannot be hijacked via PUT by a non-owner/shared participant
+    const hijack = await app.request('/api/cron/job-1', { method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'hijacked' }) });
+    expect(hijack.status).toBe(403);
+    // Shared-provenance job can be updated by participant and stays viewer-read-only
+    state.cronJobs.set('job-shared', { ...state.cronJobs.get('job-1'), id: 'job-shared' });
+    state.cronProvenance.set('job-shared', { job_id: 'job-shared', creator_user_id: ATTACKER, server_id: VICTIM_SERVER, project_name: 'proj', shared: true });
+    const update = await app.request('/api/cron/job-shared', { method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'updated' }) });
     expect(update.status).toBe(role === 'participant' ? 200 : 403);
     const denied = await app.request(`/api/cron?serverId=${CONTROLLED_SERVER}`, { headers });
     expect(denied.status).toBe(403);

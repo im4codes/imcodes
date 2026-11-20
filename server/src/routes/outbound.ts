@@ -73,6 +73,9 @@ outboundRoutes.post('/', async (c) => {
   if (authority.kind === 'invalid') {
     return c.json({ error: 'forbidden', reason: 'shared_machine_authority_invalid' }, 403);
   }
+  if (authority.kind === 'participant') {
+    return c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403);
+  }
   if (authority.kind === 'absent' && await isSharedOrContributedServer(c.env.DB, serverRow.serverId)) {
     return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
   }
@@ -94,8 +97,8 @@ outboundRoutes.post('/', async (c) => {
     return c.json({ error: 'bot_not_found' }, 404);
   }
 
-  // Only allow sending via bots owned by the server's user
-  if (botConfig.userId !== serverRow.userId) {
+  // Only allow sending via bots owned by the server's user and matching the requested platform
+  if (botConfig.userId !== serverRow.userId || botConfig.platform !== msg.platform) {
     return c.json({ error: 'forbidden' }, 403);
   }
 

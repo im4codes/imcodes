@@ -116,7 +116,7 @@ describe('participant owner-parity vs share-invite denial', () => {
     expect(await res.json()).toEqual({ serverId: 'srv-shared' });
   });
 
-  it('serverRoutes allows whole-server participant rename/delete and participant_daemon runtime-config read', async () => {
+  it('serverRoutes blocks whole-server participant rename/delete and blocks participant_daemon on daemon config/binding routes while keeping runtime-config read', async () => {
     const { serverRoutes } = await import('../src/routes/server.js');
     const app = new Hono();
     app.use('*', async (c, next) => {
@@ -135,17 +135,36 @@ describe('participant owner-parity vs share-invite denial', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'New Shared Name' }),
     });
-    expect(renameRes.status).toBe(200);
-    expect(mockUpdateServerName).toHaveBeenCalledWith(expect.anything(), 'srv-shared', 'owner-user', 'New Shared Name');
+    expect(renameRes.status).toBe(404);
+    expect(mockUpdateServerName).not.toHaveBeenCalled();
 
     const delRes = await app.request('/api/server/srv-shared', { method: 'DELETE' });
-    expect(delRes.status).toBe(200);
-    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-shared', 'owner-user');
+    expect(delRes.status).toBe(404);
+    expect(mockDeleteServer).not.toHaveBeenCalled();
 
     const daemonCfgRes = await app.request('/api/server/srv-shared/shared-context/runtime-config/daemon', {
       headers: { [SHARED_MACHINE_AUTHORITY_HEADER]: 'part-jwt' },
     });
     expect(daemonCfgRes.status).toBe(200);
+
+    for (const [method, path, body] of [
+      ['GET', '/api/server/srv-shared/supervision/user-defaults/daemon', undefined],
+      ['PUT', '/api/server/srv-shared/supervision/user-defaults/daemon', { defaults: {} }],
+      ['GET', '/api/server/srv-shared/repo-callbacks/daemon', undefined],
+      ['POST', '/api/server/srv-shared/bindings', { platform: 'telegram', channelId: '1', botId: 'b1', bindingType: 'session', target: 'brain' }],
+      ['DELETE', '/api/server/srv-shared/bindings', { platform: 'telegram', channelId: '1', botId: 'b1' }],
+    ] as const) {
+      const res = await app.request(path, {
+        method,
+        headers: {
+          [SHARED_MACHINE_AUTHORITY_HEADER]: 'part-jwt',
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      expect(res.status, `${method} ${path}`).toBe(403);
+      expect(await res.json()).toMatchObject({ reason: 'shared_participant_forbidden' });
+    }
 
     mockResolveSharedMachineAuthority.mockResolvedValueOnce({ kind: 'invalid', reason: 'bad_sig' });
     const invalidCfgRes = await app.request('/api/server/srv-shared/shared-context/runtime-config/daemon', {
@@ -154,14 +173,15 @@ describe('participant owner-parity vs share-invite denial', () => {
     expect(invalidCfgRes.status).toBe(403);
   });
 
-  it('outboundRoutes allows participant_daemon to reply via owner bot while rejecting foreign bots and invalid tokens', async () => {
+  it('outboundRoutes rejects participant_daemon and platform mismatch while allowing owner_daemon', async () => {
     const { outboundRoutes } = await import('../src/routes/outbound.js');
     let botOwner = 'owner-user';
+    let botPlatform = 'telegram';
     const app = new Hono();
     app.use('*', async (c, next) => {
       c.env = {
         DB: {
-          queryOne: vi.fn(async () => ({ id: 'bot-1', user_id: botOwner, platform: 'telegram', config_encrypted: 'enc' })),
+          queryOne: vi.fn(async () => ({ id: 'bot-1', user_id: botOwner, platform: botPlatform, config_encrypted: 'enc' })),
         } as never,
         JWT_SIGNING_KEY: 'secret-key-at-least-32-chars-long!',
         BOT_ENCRYPTION_KEY: '0123456789abcdef0123456789abcdef',
@@ -170,18 +190,39 @@ describe('participant owner-parity vs share-invite denial', () => {
     });
     app.route('/api/outbound', outboundRoutes);
 
-    const okRes = await app.request('/api/outbound', {
+    const partRes = await app.request('/api/outbound', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'part-jwt' },
+      body: JSON.stringify({ platform: 'telegram', botId: 'bot-1', channelId: 'ch-1', content: 'hello' }),
+    });
+    expect(partRes.status).toBe(403);
+    expect(await partRes.json()).toMatchObject({ reason: 'shared_participant_forbidden' });
+    expect(mockSendOutbound).not.toHaveBeenCalled();
+
+    mockResolveSharedMachineAuthority.mockResolvedValueOnce({ kind: 'owner', actorUserId: 'owner-user' });
+    const okRes = await app.request('/api/outbound', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'owner-jwt' },
       body: JSON.stringify({ platform: 'telegram', botId: 'bot-1', channelId: 'ch-1', content: 'hello' }),
     });
     expect(okRes.status).toBe(200);
     expect(mockSendOutbound).toHaveBeenCalledTimes(1);
 
+    botPlatform = 'discord';
+    mockResolveSharedMachineAuthority.mockResolvedValueOnce({ kind: 'owner', actorUserId: 'owner-user' });
+    const platformMismatchRes = await app.request('/api/outbound', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'owner-jwt' },
+      body: JSON.stringify({ platform: 'telegram', botId: 'bot-1', channelId: 'ch-1', content: 'hello' }),
+    });
+    expect(platformMismatchRes.status).toBe(403);
+    botPlatform = 'telegram';
+
     botOwner = 'foreign-user';
+    mockResolveSharedMachineAuthority.mockResolvedValueOnce({ kind: 'owner', actorUserId: 'owner-user' });
     const foreignRes = await app.request('/api/outbound', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'part-jwt' },
+      headers: { 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'owner-jwt' },
       body: JSON.stringify({ platform: 'telegram', botId: 'bot-1', channelId: 'ch-1', content: 'hello' }),
     });
     expect(foreignRes.status).toBe(403);

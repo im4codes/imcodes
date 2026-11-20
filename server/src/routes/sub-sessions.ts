@@ -36,7 +36,7 @@ subSessionRoutes.use('/*', requireAuth());
 subSessionRoutes.use('/:id/*', async (c, next) => {
   if (c.get('authServerId' as never)) {
     const authority = await resolveDaemonCallerAuthority(c, {
-      denyParticipant: false,
+      denyParticipant: true,
       denySharedHostAbsentAuthority: false,
       targetServerId: c.req.param('id')!,
       allowOwnerCrossServer: false,
@@ -117,6 +117,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   const member = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   const memberMayCreate = member.ok && (member.role === 'owner' || member.role === 'admin');
   let mayCreate = memberMayCreate;
+  let wholeServerShare = false;
   let shareReason: string | undefined;
   let effectiveParentSession = parentSession;
 
@@ -164,24 +165,25 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
       if (serverAccess.actor.kind === 'share') {
         if (serverAccess.actor.effectiveActorRole === 'participant') {
           mayCreate = true;
+          wholeServerShare = true;
         } else if (!shareReason) {
           shareReason = 'share-role-denied';
         }
       }
     }
 
-    // 3. If parentSession is omitted or not yet permitted, check user's active shares on this server
-    if (!mayCreate && typeof (c.env.DB as any)?.query === 'function') {
+    // 3. Only when parent_session is omitted, fall back to user's active shares on this server
+    if (!mayCreate && !parentSession && typeof (c.env.DB as any)?.query === 'function') {
       const shares = await listActiveSharesForUser(c.env.DB, userId, Date.now());
       const participantShare = shares.find((s) => s.serverId === serverId && s.role === 'participant');
       if (participantShare) {
         mayCreate = true;
-        if (!effectiveParentSession) {
-          if (participantShare.target.kind === 'main' && participantShare.target.sessionName) {
-            effectiveParentSession = participantShare.target.sessionName;
-          } else if (participantShare.target.kind === 'subsession' && participantShare.target.subSessionId) {
-            effectiveParentSession = `deck_sub_${participantShare.target.subSessionId}`;
-          }
+        if (participantShare.target.kind === 'server') {
+          wholeServerShare = true;
+        } else if (participantShare.target.kind === 'main' && participantShare.target.sessionName) {
+          effectiveParentSession = participantShare.target.sessionName;
+        } else if (participantShare.target.kind === 'subsession' && participantShare.target.subSessionId) {
+          effectiveParentSession = `deck_sub_${participantShare.target.subSessionId}`;
         }
       } else if (!shareReason) {
         const viewerShare = shares.find((s) => s.serverId === serverId && s.role === 'viewer');
@@ -193,6 +195,9 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   if (!mayCreate) {
     const reason = shareReason ?? (member.ok ? 'share-role-denied' : member.reason);
     return c.json({ error: 'forbidden', reason }, 403);
+  }
+  if (!member.ok && !wholeServerShare && Object.prototype.hasOwnProperty.call(body, 'transport_config')) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
   // Generate 8-char id
   const id = Array.from(crypto.getRandomValues(new Uint8Array(6)))
@@ -323,7 +328,15 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   // authority. Reject every shape (including null/empty/partial) before a DB
   // write or daemon relay, using the server-resolved share capability rather
   // than any client/projected session role.
-  if (access?.actor.kind === 'share' && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
+  const isWholeServerShare = access?.actor.kind === 'share'
+    && (access.shareProvenance === 'server'
+      || (access.shareProvenance === undefined && access.actor.coverage?.target?.kind === 'server'));
+  if (access?.actor.kind === 'share'
+    && (Object.prototype.hasOwnProperty.call(body, 'transportConfig')
+      || (!isWholeServerShare
+        && (Object.prototype.hasOwnProperty.call(body, 'cwd')
+          || body.type === 'shell'
+          || body.type === 'script')))) {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 

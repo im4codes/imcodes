@@ -22,6 +22,7 @@ import {
   SHARE_BROWSER_COMMANDS,
   type ShareAuthorizationSnapshot,
   SHARE_DISCUSSION_EVENTS,
+  shareTargetKey,
 } from '../../shared/tab-sharing.js';
 
 const JWT_KEY = 'test-signing-key-discussions-share';
@@ -153,7 +154,7 @@ function makeRun(params: {
 }
 
 describe('share-scoped discussion comments', () => {
-  it('allows a viewer to create a non-dispatch comment with server-authored actor metadata', async () => {
+  it('denies a viewer from posting discussion comments and audits the rejection', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(2_000);
     const app = makeApp();
@@ -173,55 +174,108 @@ describe('share-scoped discussion comments', () => {
       headers: authHeaders(recipientId),
       body: JSON.stringify({
         type: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT,
-        requestId: 'comment-request-1',
+        requestId: 'comment-request-viewer-1',
         threadId,
+        body: 'Viewer comment should be blocked.',
+      }),
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+
+    const persisted = await db.query<{ count: number }>(
+      'SELECT COUNT(*)::int AS count FROM discussion_comments WHERE server_id = $1',
+      [serverId],
+    );
+    expect(persisted[0]?.count).toBe(0);
+    const audit = await db.queryOne<{ decision: string; reason: string | null; idempotency_key: string }>(
+      `SELECT decision, reason, idempotency_key
+         FROM share_audit_events
+        WHERE server_id = $1 AND action_type = $2
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [serverId, SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT],
+    );
+    expect(audit).toMatchObject({
+      decision: 'rejected',
+      reason: 'share-role-denied',
+    });
+    expect(audit?.idempotency_key).toContain(share.id);
+  });
+
+  it('allows a participant to create a non-dispatch comment with pinned threadId and server-authored actor metadata', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(2_000);
+    const app = makeApp();
+    const { ownerId, recipientId, serverId, sessionName } = await seedServer();
+    const target = { kind: 'main', serverId, sessionName } as const;
+    const share = await createOrUpdateShare(db, {
+      id: id('share'),
+      target,
+      targetUserId: recipientId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: 1_000,
+    });
+    const injectedThreadId = id('injected-thread');
+
+    const res = await app.request(`/api/server/${serverId}/discussions/comments`, {
+      method: 'POST',
+      headers: authHeaders(recipientId),
+      body: JSON.stringify({
+        type: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT,
+        requestId: 'comment-request-1',
+        scope: target,
+        threadId: injectedThreadId,
         body: 'Looks good from here.',
         actorEnvelope: { actorUserId: 'spoofed' },
       }),
     });
 
     expect(res.status).toBe(201);
-    const payload = await res.json() as { type: string; comment: { id: string; actor_envelope: unknown; actorEnvelope?: Record<string, unknown>; createdByUserId?: string; createdAt?: number } };
+    const payload = await res.json() as { type: string; comment: { id: string; thread_id?: string; actor_envelope: unknown; actorEnvelope?: Record<string, unknown>; createdByUserId?: string; createdAt?: number } };
     expect(payload.type).toBe(SHARE_DISCUSSION_EVENTS.COMMENT_CREATED);
     expect(payload.comment.createdByUserId).toBe(recipientId);
     expect(payload.comment.createdAt).toBe(2_000);
+    expect(payload.comment.thread_id).toBe(shareTargetKey(target));
     expect(payload.comment.actorEnvelope).toMatchObject({
       actorUserId: recipientId,
       actorDisplayName: 'Shared Recipient',
-      effectiveActorRole: 'viewer',
+      effectiveActorRole: 'participant',
       actionId: 'comment-request-1',
-      origin: 'shared-server',
+      origin: 'shared-tab',
       primaryShareId: share.id,
     });
 
-    const row = await db.queryOne<{ actor_envelope: unknown; created_by_user_id: string }>(
-      'SELECT actor_envelope, created_by_user_id FROM discussion_comments WHERE id = $1',
+    const row = await db.queryOne<{ thread_id: string; actor_envelope: unknown; created_by_user_id: string }>(
+      'SELECT thread_id, actor_envelope, created_by_user_id FROM discussion_comments WHERE id = $1',
       [payload.comment.id],
     );
     const envelope = parseJsonField<Record<string, unknown>>(row!.actor_envelope as Record<string, unknown> | string);
     expect(row?.created_by_user_id).toBe(recipientId);
+    expect(row?.thread_id).toBe(shareTargetKey(target));
     expect(envelope).toMatchObject({
       actorUserId: recipientId,
       actorDisplayName: 'Shared Recipient',
-      effectiveActorRole: 'viewer',
+      effectiveActorRole: 'participant',
       actionId: 'comment-request-1',
-      origin: 'shared-server',
+      origin: 'shared-tab',
       primaryShareId: share.id,
     });
     expect(envelope.actorUserId).not.toBe('spoofed');
 
     const rounds = await db.query<{ count: number }>(
       'SELECT COUNT(*)::int AS count FROM discussion_rounds WHERE discussion_id = $1',
-      [threadId],
+      [injectedThreadId],
     );
     expect(rounds[0]?.count).toBe(0);
 
-    const readRes = await app.request(`/api/server/${serverId}/discussions/comments?kind=server`, {
+    const readRes = await app.request(`/api/server/${serverId}/discussions/comments?kind=main&sessionName=${encodeURIComponent(sessionName)}`, {
       headers: authHeaders(recipientId),
     });
     expect(readRes.status).toBe(200);
     const readPayload = await readRes.json() as { comments: Array<{ id: string; body: string; actorEnvelope?: Record<string, unknown>; createdAt?: number }>; targetRef: string };
-    expect(readPayload.targetRef).toBe(serverId);
+    expect(readPayload.targetRef).toBe(sessionName);
     expect(readPayload.comments).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: payload.comment.id,
@@ -230,7 +284,7 @@ describe('share-scoped discussion comments', () => {
         actorEnvelope: expect.objectContaining({
           actorUserId: recipientId,
           actorDisplayName: 'Shared Recipient',
-          effectiveActorRole: 'viewer',
+          effectiveActorRole: 'participant',
         }),
       }),
     ]));
@@ -240,12 +294,13 @@ describe('share-scoped discussion comments', () => {
     vi.useFakeTimers();
     vi.setSystemTime(2_500);
     const app = makeApp();
-    const { ownerId, recipientId, serverId } = await seedServer();
+    const { ownerId, recipientId, serverId, sessionName } = await seedServer();
+    const target = { kind: 'main', serverId, sessionName } as const;
     const share = await createOrUpdateShare(db, {
       id: id('share'),
-      target: { kind: 'server', serverId },
+      target,
       targetUserId: recipientId,
-      role: 'viewer',
+      role: 'participant',
       createdBy: ownerId,
       now: 1_000,
     });
@@ -256,6 +311,7 @@ describe('share-scoped discussion comments', () => {
       body: JSON.stringify({
         type: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT,
         requestId: 'invalid-comment-1',
+        scope: target,
         body: '   ',
       }),
     });

@@ -394,15 +394,14 @@ describe('Vector A: Participant authority on M_shared is strictly scoped to User
       [`proj-shared-part-${tag}`],
     );
     expect(sharedPartRow?.user_id).toBe(USER_B);
-    // Outbound no longer blocks participant turns with shared_participant_forbidden, while still refusing foreign bots
+    // Outbound and session/sub-session management daemon routes block participant_daemon turns (403 shared_participant_forbidden)
     expect((await app.request('/api/outbound', {
       method: 'POST',
       headers: { ...partHdrs, 'Content-Type': 'application/json' },
       body: JSON.stringify({ platform: 'telegram', botId: 'b-nonexistent', channelId: 'c1', content: 'hi' }),
-    })).status).toBe(404);
-    // Session/sub-session management on M_SHARED matches owner parity, while cross-server M_PRIV1 stays 403
-    expect((await app.request(`/api/server/${M_SHARED}/sessions`, { headers: partHdrs })).status).toBe(200);
-    expect((await app.request(`/api/server/${M_SHARED}/sub-sessions`, { headers: partHdrs })).status).toBe(200);
+    })).status).toBe(403);
+    expect((await app.request(`/api/server/${M_SHARED}/sessions`, { headers: partHdrs })).status).toBe(403);
+    expect((await app.request(`/api/server/${M_SHARED}/sub-sessions`, { headers: partHdrs })).status).toBe(403);
     expect((await app.request(`/api/server/${M_PRIV1}/sessions`, { headers: partHdrs })).status).toBe(403);
     expect((await app.request(`/api/server/${M_PRIV1}/sub-sessions`, { headers: partHdrs })).status).toBe(403);
     expect((await app.request(`/api/machine/exec?serverId=${M_PRIV2}`, {
@@ -486,14 +485,14 @@ describe('Vector A: Participant authority on M_shared is strictly scoped to User
 });
 
 describe('Share revocation and whole-server share boundaries', () => {
-  it('grants whole-server share participants owner parity on server rename and delete while strictly denying share management (inviting/updating/revoking participants or observers)', async () => {
-    // Whole-server share participant USER_B CAN rename M_whole
+  it('blocks whole-server share participants from renaming/deleting owner server and share management while preserving owner control', async () => {
+    // Whole-server share participant USER_B CANNOT rename M_whole
     const patchRes = await app.request(`/api/server/${M_WHOLE}/name`, {
       method: 'PATCH',
       headers: { Authorization: userBearer(USER_B), 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Participant Renamed Server' }),
     });
-    expect(patchRes.status).toBe(200);
+    expect(patchRes.status).toBe(404);
 
     const ownerPatch = await app.request(`/api/server/${M_WHOLE}/name`, {
       method: 'PATCH',
@@ -524,7 +523,7 @@ describe('Share revocation and whole-server share boundaries', () => {
       headers: { Authorization: userBearer(USER_B) },
     })).status).toBe(403);
 
-    // Whole-server participant USER_B CAN delete a server shared with them (test on disposable server so M_WHOLE remains for downstream assertions)
+    // Whole-server participant USER_B CANNOT delete owner's server; only OWNER_A can
     const delSrvId = `srv-whole-del-${tag}`;
     await createServer(db, delSrvId, OWNER_A, 'Disposable Whole Server', sha256(`tok-del-${tag}`));
     await createOrUpdateShare(db, {
@@ -535,11 +534,16 @@ describe('Share revocation and whole-server share boundaries', () => {
       createdBy: OWNER_A,
       now: Date.now(),
     });
-    const delRes = await app.request(`/api/server/${delSrvId}`, {
+    const partDelRes = await app.request(`/api/server/${delSrvId}`, {
       method: 'DELETE',
       headers: { Authorization: userBearer(USER_B) },
     });
-    expect(delRes.status).toBe(200);
+    expect(partDelRes.status).toBe(404);
+    const ownerDelRes = await app.request(`/api/server/${delSrvId}`, {
+      method: 'DELETE',
+      headers: { Authorization: userBearer(OWNER_A) },
+    });
+    expect(ownerDelRes.status).toBe(200);
   });
 
   it('immediately pauses participant crons when the tab share or team membership is revoked', async () => {
