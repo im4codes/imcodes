@@ -407,6 +407,13 @@ import {
   SUBSESSION_NAME_PREFIX,
   isAutoCreatedSubSessionName,
 } from '../../../shared/task-pair.js';
+import { GLOBAL_TASK_FLEET_SNAPSHOT_MSG } from '../../../shared/global-task-mode.js';
+import {
+  upsertGlobalTaskSummariesBatch,
+  upsertGlobalTaskSummary,
+  type GlobalTaskSummaryUpsertInput,
+} from '../db/global-task-summaries.js';
+import { globalTaskHub } from '../services/global-task-hub.js';
 import { isServerLinkResyncStatePayload } from '../../../shared/session-activity-types.js';
 import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
@@ -6621,6 +6628,11 @@ export class WsBridge {
           return;
         }
         this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_ONLINE }));
+        if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) {
+          void globalTaskHub.notifyServerState(db, this.serverId, true).catch((err) =>
+            logger.warn({ err, serverId: this.serverId }, 'Global task server online notify failed'),
+          );
+        }
         this.startAckHousekeepingIfNeeded();
 
         // Audit fix (78-server reconnect-storm) — release waiters now
@@ -6963,6 +6975,15 @@ export class WsBridge {
         });
       }
 
+      if (msg.type === GLOBAL_TASK_FLEET_SNAPSHOT_MSG) {
+        if (db) {
+          void this.ingestGlobalTaskFleetSnapshot(db, msg).catch((err) =>
+            logger.warn({ err, serverId: this.serverId }, 'Global task fleet snapshot ingest failed'),
+          );
+        }
+        return;
+      }
+
       if (msg.type === 'session.error') {
         this.rollbackIncognitoSubSessionsOnDaemonError(msg);
       }
@@ -6975,6 +6996,11 @@ export class WsBridge {
         ?? (typeof msg.id === 'string' && msg.id ? `deck_sub_${msg.id}` : undefined);
       const privateSession = isIncognitoSession(eventForPrivacy?.payload)
         || (sessionHint ? this.incognitoSessions.has(String(sessionHint)) : false);
+      if (db && !privateSession) {
+        void this.ingestGlobalTaskFrame(db, msg).catch((err) =>
+          logger.warn({ err, serverId: this.serverId }, 'Global task frame ingest failed'),
+        );
+      }
       if (env && !privateSession) {
         const pushType = msg.type as string;
         if (pushType === 'session.idle') {
@@ -7043,6 +7069,7 @@ export class WsBridge {
     ws.on('close', () => {
       if (this.daemonWs === ws) {
         const disconnectedOwnerUserId = this.daemonOwnerUserId;
+        const wasControlled = this.daemonNodeRole === NODE_ROLE.CONTROLLED;
         this.daemonWs = null;
         this.authenticated = false;
         // Audit fix (78-server reconnect-storm) — drop the auth promise
@@ -7107,6 +7134,11 @@ export class WsBridge {
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
           logger.error({ err }, 'Failed to mark server offline'),
         );
+        if (!wasControlled) {
+          void globalTaskHub.notifyServerState(db, this.serverId, false).catch((err) =>
+            logger.warn({ err, serverId: this.serverId }, 'Global task server offline notify failed'),
+          );
+        }
 
         // ── Ack reliability: start grace window, don't yet announce offline ──
         // If daemon reconnects within RECONNECT_GRACE_MS, we replay inflight
@@ -9443,6 +9475,7 @@ export class WsBridge {
    */
   private relayToBrowsers(msg: Record<string, unknown>): void {
     const type = msg.type as string;
+    if (type === GLOBAL_TASK_FLEET_SNAPSHOT_MSG) return;
 
     if (type === SESSION_GROUP_CLONE_MSG.EVENT) {
       const event = sanitizeSessionGroupCloneEvent(msg);
@@ -15641,5 +15674,209 @@ export class WsBridge {
 
   getOpenSpecAutoDeliverListRowsForTests(sessionName: string): OpenSpecAutoDeliverListRow[] {
     return this.openspecAutoDeliverProjectionCache.getListRowsForSession(sessionName);
+  }
+
+  private async ingestGlobalTaskFleetSnapshot(db: Database, msg: Record<string, unknown>): Promise<void> {
+    const rawPairs = Array.isArray(msg.pairs) ? msg.pairs : [];
+    const inputs: GlobalTaskSummaryUpsertInput[] = [];
+    for (const raw of rawPairs) {
+      if (!raw || typeof raw !== 'object') continue;
+      const item = raw as Record<string, unknown>;
+      const taskId = typeof item.taskId === 'string' ? item.taskId.trim() : '';
+      const status = typeof item.status === 'string' ? item.status.trim() : '';
+      if (!taskId || !status) continue;
+      const checklistObj = item.checklist && typeof item.checklist === 'object'
+        ? (item.checklist as Record<string, unknown>)
+        : null;
+      inputs.push({
+        serverId: this.serverId,
+        taskId,
+        projectName: typeof item.projectName === 'string' ? item.projectName : '',
+        brainSession: typeof item.brain === 'string' ? item.brain : '',
+        title: typeof item.title === 'string' ? item.title : '',
+        status,
+        flags: Array.isArray(item.flags) ? item.flags.filter((f): f is string => typeof f === 'string') : [],
+        round: typeof item.round === 'number' ? item.round : 0,
+        checklist: checklistObj ? {
+          total: Number(checklistObj.total ?? 0),
+          implemented: Number(checklistObj.implemented ?? 0),
+          audited: Number(checklistObj.audited ?? 0),
+        } : undefined,
+        executorLabel: typeof item.executorLabel === 'string' ? item.executorLabel : undefined,
+        auditorLabel: typeof item.auditorLabel === 'string' ? item.auditorLabel : undefined,
+        auditor: typeof item.auditor === 'string' ? item.auditor : undefined,
+        liveSummary: typeof item.liveSummary === 'string' ? item.liveSummary : undefined,
+        createdAt: typeof item.createdAt === 'number' ? item.createdAt : undefined,
+        updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : undefined,
+      });
+    }
+    if (inputs.length === 0) return;
+    const saved = await upsertGlobalTaskSummariesBatch(db, this.serverId, inputs);
+    for (const row of saved) {
+      await globalTaskHub.notifyTaskUpdated(db, this.serverId, row.taskId, row);
+    }
+  }
+
+  private extractSummaryInputFromConsoleTask(
+    task: Record<string, unknown>,
+    scope: Record<string, unknown> | undefined,
+  ): GlobalTaskSummaryUpsertInput | null {
+    const taskId = typeof task.taskId === 'string' ? task.taskId.trim() : '';
+    const pair = task.pair && typeof task.pair === 'object' ? (task.pair as Record<string, unknown>) : null;
+    if (!taskId || !pair) return null;
+    const status = typeof pair.status === 'string' ? pair.status.trim() : '';
+    if (!status) return null;
+    const checklistObj = pair.checklist && typeof pair.checklist === 'object'
+      ? (pair.checklist as Record<string, unknown>)
+      : null;
+    const projectName = typeof scope?.projectName === 'string' ? scope.projectName : '';
+    const brainSession = typeof pair.brain === 'string' && pair.brain.trim()
+      ? pair.brain.trim()
+      : (typeof scope?.coordinatorSessionName === 'string' ? scope.coordinatorSessionName : '');
+    const liveSummary = typeof task.currentAction === 'string' && task.currentAction.trim()
+      ? task.currentAction.trim()
+      : (typeof pair.blockedNote === 'string' && pair.blockedNote.trim() ? pair.blockedNote.trim() : undefined);
+    return {
+      serverId: this.serverId,
+      taskId,
+      projectName,
+      brainSession,
+      title: typeof task.title === 'string' ? task.title : '',
+      status,
+      flags: Array.isArray(pair.flags) ? pair.flags.filter((f): f is string => typeof f === 'string') : [],
+      round: typeof pair.round === 'number' ? pair.round : 0,
+      checklist: checklistObj ? {
+        total: Number(checklistObj.total ?? 0),
+        implemented: Number(checklistObj.implemented ?? 0),
+        audited: Number(checklistObj.audited ?? 0),
+      } : undefined,
+      executorLabel: typeof pair.executorLabel === 'string' ? pair.executorLabel : undefined,
+      auditorLabel: typeof pair.auditorLabel === 'string' ? pair.auditorLabel : undefined,
+      auditor: typeof pair.auditor === 'string' ? pair.auditor : undefined,
+      liveSummary,
+      createdAt: typeof pair.createdAt === 'number' ? pair.createdAt : undefined,
+      updatedAt: typeof pair.updatedAt === 'number'
+        ? pair.updatedAt
+        : (typeof task.updatedAt === 'number' ? task.updatedAt : undefined),
+    };
+  }
+
+  private async ingestGlobalTaskFrame(db: Database, msg: Record<string, unknown>): Promise<void> {
+    const type = msg.type;
+    if (type === TIMELINE_MESSAGES.EVENT) {
+      const event = msg.event && typeof msg.event === 'object' ? (msg.event as Record<string, unknown>) : null;
+      if (!event) return;
+      const eventType = event.type;
+      const sessionId = typeof event.sessionId === 'string' ? event.sessionId.trim() : '';
+      const payload = event.payload && typeof event.payload === 'object'
+        ? (event.payload as Record<string, unknown>)
+        : {};
+      const eventTs = typeof event.ts === 'number' && Number.isFinite(event.ts) ? event.ts : Date.now();
+
+      if (eventType === TASK_PAIR_TIMELINE_EVENT || eventType === 'task_pair.event') {
+        const taskId = typeof payload.taskId === 'string' ? payload.taskId.trim() : '';
+        const statusRaw = typeof payload.toStatus === 'string'
+          ? payload.toStatus
+          : (typeof payload.status === 'string' ? payload.status : payload.fromStatus);
+        const status = typeof statusRaw === 'string' ? statusRaw.trim() : '';
+        if (!taskId || !status) return;
+        const brainSession = typeof payload.brain === 'string' && payload.brain.trim()
+          ? payload.brain.trim()
+          : (typeof payload.brainSession === 'string' && payload.brainSession.trim()
+            ? payload.brainSession.trim()
+            : (sessionId && !sessionId.startsWith(SUBSESSION_NAME_PREFIX) ? sessionId : ''));
+        const checklistObj = payload.checklist && typeof payload.checklist === 'object'
+          ? (payload.checklist as Record<string, unknown>)
+          : null;
+        const liveSummary = typeof payload.blockedNote === 'string' && payload.blockedNote.trim()
+          ? payload.blockedNote.trim()
+          : (typeof payload.noticeText === 'string' && payload.noticeText.trim()
+            ? payload.noticeText.trim().slice(0, 240)
+            : undefined);
+        const saved = await upsertGlobalTaskSummary(db, {
+          serverId: this.serverId,
+          taskId,
+          projectName: typeof payload.projectName === 'string' ? payload.projectName : undefined,
+          brainSession: brainSession || undefined,
+          title: typeof payload.title === 'string' ? payload.title : undefined,
+          status,
+          flags: Array.isArray(payload.flags)
+            ? payload.flags.filter((f): f is string => typeof f === 'string')
+            : undefined,
+          round: typeof payload.round === 'number' ? payload.round : undefined,
+          checklist: checklistObj ? {
+            total: Number(checklistObj.total ?? 0),
+            implemented: Number(checklistObj.implemented ?? 0),
+            audited: Number(checklistObj.audited ?? 0),
+          } : undefined,
+          executorLabel: typeof payload.executorLabel === 'string' ? payload.executorLabel : undefined,
+          auditorLabel: typeof payload.auditorLabel === 'string' ? payload.auditorLabel : undefined,
+          auditor: typeof payload.auditor === 'string' ? payload.auditor : undefined,
+          liveSummary,
+          updatedAt: eventTs,
+        });
+        if (saved) {
+          await globalTaskHub.notifyTaskUpdated(db, this.serverId, saved.taskId, saved);
+        }
+        return;
+      }
+
+      if (eventType === 'assistant.text') {
+        if (!sessionId || sessionId.startsWith(SUBSESSION_NAME_PREFIX)) return;
+        if (payload.streaming === true || payload.automation === true) return;
+        const rawText = typeof payload.text === 'string' ? payload.text : '';
+        if (!rawText.trim()) return;
+        const eventId = typeof event.eventId === 'string' && event.eventId.trim()
+          ? event.eventId.trim()
+          : `${sessionId}:${eventTs}`;
+        const projectName = typeof payload.projectName === 'string' && payload.projectName.trim()
+          ? payload.projectName.trim()
+          : undefined;
+        await globalTaskHub.notifyBrainText(db, {
+          serverId: this.serverId,
+          sessionName: sessionId,
+          ...(projectName ? { projectName } : {}),
+          eventId,
+          text: rawText,
+          ts: eventTs,
+        });
+      }
+      return;
+    }
+
+    if (type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) {
+      const scope = msg.scope && typeof msg.scope === 'object' ? (msg.scope as Record<string, unknown>) : undefined;
+      const tasks = Array.isArray(msg.tasks) ? msg.tasks : [];
+      const inputs: GlobalTaskSummaryUpsertInput[] = [];
+      for (const task of tasks) {
+        if (!task || typeof task !== 'object') continue;
+        const input = this.extractSummaryInputFromConsoleTask(task as Record<string, unknown>, scope);
+        if (input) inputs.push(input);
+      }
+      if (inputs.length === 0) return;
+      const saved = await upsertGlobalTaskSummariesBatch(db, this.serverId, inputs);
+      for (const row of saved) {
+        await globalTaskHub.notifyTaskUpdated(db, this.serverId, row.taskId, row);
+      }
+      return;
+    }
+
+    if (type === SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA) {
+      const scope = msg.scope && typeof msg.scope === 'object' ? (msg.scope as Record<string, unknown>) : undefined;
+      const upserts = Array.isArray(msg.upserts) ? msg.upserts : [];
+      const inputs: GlobalTaskSummaryUpsertInput[] = [];
+      for (const item of upserts) {
+        if (!item || typeof item !== 'object') continue;
+        const task = (item as Record<string, unknown>).task;
+        if (!task || typeof task !== 'object') continue;
+        const input = this.extractSummaryInputFromConsoleTask(task as Record<string, unknown>, scope);
+        if (input) inputs.push(input);
+      }
+      if (inputs.length === 0) return;
+      const saved = await upsertGlobalTaskSummariesBatch(db, this.serverId, inputs);
+      for (const row of saved) {
+        await globalTaskHub.notifyTaskUpdated(db, this.serverId, row.taskId, row);
+      }
+    }
   }
 }

@@ -608,6 +608,16 @@ export class TaskPairStore {
     return rows.map((row) => this.#hydrate(row));
   }
 
+  /** Recent terminal (done/cancelled) pairs since `sinceMs`, newest first, for global fleet hydration. */
+  listRecentTerminalPairs(sinceMs: number, limit: number): StoredTaskPair[] {
+    const terminal = TASK_PAIR_TERMINAL_STATUSES.map(() => '?').join(',');
+    const rows = this.#db.prepare(
+      `SELECT * FROM task_pairs WHERE status IN (${terminal}) AND updated_at >= ?
+       ORDER BY updated_at DESC LIMIT ?`,
+    ).all(...TASK_PAIR_TERMINAL_STATUSES, sinceMs, limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.#hydrate(row));
+  }
+
   /** Non-terminal pairs in which a session takes part. */
   pairsForSession(sessionName: string): StoredTaskPair[] {
     // Served from memory. The returned pairs are shared with the cache: read

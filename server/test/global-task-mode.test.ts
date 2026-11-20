@@ -1,0 +1,826 @@
+import { serve } from '@hono/node-server';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { WebSocket } from 'ws';
+import {
+  GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
+  GLOBAL_TASK_MODE_MSG,
+  GLOBAL_TASK_NOTIFY_CHANNEL,
+  GLOBAL_TASK_PG_NOTIFY_MAX_BYTES,
+  GLOBAL_TASK_SNAPSHOT_PATH,
+  GLOBAL_TASK_TICKET_PATH,
+  GLOBAL_TASK_WS_PATH,
+  type GlobalTaskServerFrame,
+} from '../../shared/global-task-mode.js';
+import { COOKIE_CSRF, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
+import { ACCOUNT_SESSION_JWT_TYPE } from '../../shared/auth-token-types.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
+import type { Database } from '../src/db/client.js';
+import {
+  getGlobalTaskSummaryForServerTask,
+  listGlobalTaskSnapshotForUser,
+  upsertGlobalTaskSummariesBatch,
+  upsertGlobalTaskSummary,
+} from '../src/db/global-task-summaries.js';
+import type { Env } from '../src/env.js';
+import { buildApp, setupWebSocketUpgrade } from '../src/index.js';
+import { signJwt } from '../src/security/crypto.js';
+import { globalTaskHub, GlobalTaskHub } from '../src/services/global-task-hub.js';
+import { WsBridge } from '../src/ws/bridge.js';
+
+interface MemServerRow {
+  id: string;
+  user_id: string;
+  team_id: string | null;
+  name: string;
+  token_hash: string;
+  last_heartbeat_at: number | null;
+  status: string;
+  daemon_version: string | null;
+  bound_with_key_id: string | null;
+  created_at: number;
+  node_role?: string | null;
+  revoked_at?: number | null;
+}
+
+interface MemSessionRow {
+  id: string;
+  server_id: string;
+  name: string;
+  project_name: string;
+  role: string;
+  agent_type: string;
+  agent_version: string | null;
+  project_dir: string;
+  state: string;
+  label: string | null;
+  runtime_type: string | null;
+  provider_id: string | null;
+  provider_session_id: string | null;
+  description: string | null;
+  created_at: number;
+}
+
+interface MemSummaryRow {
+  server_id: string;
+  task_id: string;
+  project_name: string;
+  brain_session: string;
+  brain_label: string;
+  title: string;
+  status: string;
+  flags_json: string;
+  round: number;
+  checklist_total: number;
+  checklist_implemented: number;
+  checklist_audited: number;
+  executor_label: string | null;
+  auditor_label: string | null;
+  auditor: string | null;
+  live_summary: string | null;
+  is_terminal: boolean;
+  needs_attention: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+class InMemoryGlobalTaskDb {
+  users = new Map<string, { id: string; status: string; sessions_invalid_before: number | null }>([
+    ['user-a', { id: 'user-a', status: 'active', sessions_invalid_before: null }],
+    ['user-b', { id: 'user-b', status: 'active', sessions_invalid_before: null }],
+  ]);
+  servers = new Map<string, MemServerRow>();
+  machineGroups: Array<{ server_id: string; team_id: string }> = [];
+  teamMembers: Array<{ team_id: string; user_id: string; role: string }> = [];
+  sessions: MemSessionRow[] = [];
+  summaries = new Map<string, MemSummaryRow>();
+  pgNotifies: Array<{ channel: string; payload: string }> = [];
+  throwOnPgNotify = false;
+
+  private summaryKey(serverId: string, taskId: string): string {
+    return `${serverId}\u0000${taskId}`;
+  }
+
+  asDatabase(): Database {
+    const db: Database = {
+      query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => {
+        const norm = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+
+        if (norm.startsWith('select * from servers where user_id = $1')) {
+          const userId = String(params[0]);
+          return [...this.servers.values()]
+            .filter((s) => s.user_id === userId)
+            .sort((a, b) => b.created_at - a.created_at) as unknown as T[];
+        }
+
+        if (norm.includes('from servers s join machine_groups mg') && norm.includes('join team_members tm')) {
+          const userId = String(params[0]);
+          const excludeOwner = String(params[1]);
+          const teamIds = new Set(this.teamMembers.filter((tm) => tm.user_id === userId).map((tm) => tm.team_id));
+          const serverIds = new Set(this.machineGroups.filter((mg) => teamIds.has(mg.team_id)).map((mg) => mg.server_id));
+          return [...this.servers.values()]
+            .filter((s) => serverIds.has(s.id) && s.user_id !== excludeOwner)
+            .sort((a, b) => b.created_at - a.created_at) as unknown as T[];
+        }
+
+        if (norm.includes('from sessions where server_id in')) {
+          const serverIds = new Set(params.map(String));
+          return this.sessions
+            .filter((s) => serverIds.has(s.server_id))
+            .sort((a, b) => a.created_at - b.created_at) as unknown as T[];
+        }
+
+        if (norm.includes('from global_task_pair_summaries') && norm.includes('is_terminal = false')) {
+          const serverIds = new Set(params.map(String));
+          return [...this.summaries.values()]
+            .filter((r) => serverIds.has(r.server_id) && !r.is_terminal)
+            .sort((a, b) => b.updated_at - a.updated_at) as unknown as T[];
+        }
+
+        if (norm.includes('from global_task_pair_summaries') && norm.includes('is_terminal = true')) {
+          const limit = Number(params.at(-1) ?? 50);
+          const serverIds = new Set(params.slice(0, -1).map(String));
+          return [...this.summaries.values()]
+            .filter((r) => serverIds.has(r.server_id) && r.is_terminal)
+            .sort((a, b) => b.updated_at - a.updated_at)
+            .slice(0, limit) as unknown as T[];
+        }
+
+        return [] as T[];
+      },
+
+      queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+        const norm = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+
+        if (norm.includes('from users where id = $1')) {
+          return (this.users.get(String(params[0])) ?? null) as unknown as T | null;
+        }
+
+        if (norm.startsWith('select * from global_task_pair_summaries where server_id = $1 and task_id = $2')) {
+          return (this.summaries.get(this.summaryKey(String(params[0]), String(params[1]))) ?? null) as unknown as T | null;
+        }
+
+        if (norm.startsWith('select id, name, status, node_role, revoked_at from servers where id = $1')) {
+          return (this.servers.get(String(params[0])) ?? null) as unknown as T | null;
+        }
+
+        if (norm.startsWith('select * from servers where id = $1')) {
+          return (this.servers.get(String(params[0])) ?? null) as unknown as T | null;
+        }
+
+        if (norm.startsWith('select label from sessions where server_id = $1 and name = $2')) {
+          const found = this.sessions.find((s) => s.server_id === String(params[0]) && s.name === String(params[1]));
+          return (found ? { label: found.label } : null) as unknown as T | null;
+        }
+
+        return null;
+      },
+
+      execute: async (sql: string, params: unknown[] = []) => {
+        const norm = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+
+        if (norm.startsWith('select pg_notify($1, $2)')) {
+          if (this.throwOnPgNotify) throw new Error('pg_notify unavailable in sqlite/mock');
+          this.pgNotifies.push({ channel: String(params[0]), payload: String(params[1]) });
+          return { changes: 1 };
+        }
+
+        if (norm.startsWith('insert into global_task_pair_summaries')) {
+          const [
+            serverId,
+            taskId,
+            projectName,
+            brainSession,
+            brainLabel,
+            title,
+            status,
+            flagsJson,
+            round,
+            checklistTotal,
+            checklistImplemented,
+            checklistAudited,
+            executorLabel,
+            auditorLabel,
+            auditor,
+            liveSummary,
+            isTerminal,
+            needsAttention,
+            createdAt,
+            updatedAt,
+          ] = params;
+
+          const key = this.summaryKey(String(serverId), String(taskId));
+          const existing = this.summaries.get(key);
+          const sName = String(projectName ?? '');
+          const sBrain = String(brainSession ?? '');
+          const sBrainLabel = String(brainLabel ?? '');
+          const sTitle = String(title ?? '');
+          const sFlags = String(flagsJson ?? '');
+          const nRound = Number(round ?? 0);
+          const nTotal = Number(checklistTotal ?? 0);
+          const nImpl = Number(checklistImplemented ?? 0);
+          const nAudit = Number(checklistAudited ?? 0);
+          const sExecLabel = String(executorLabel ?? '') || null;
+          const sAuditLabel = String(auditorLabel ?? '') || null;
+          const sAuditor = String(auditor ?? '') || null;
+          const sLive = String(liveSummary ?? '') || null;
+          const bTerminal = Boolean(isTerminal);
+          const bAttention = Boolean(needsAttention);
+          const nCreated = Number(createdAt ?? 0);
+          const nUpdated = Number(updatedAt ?? 0);
+
+          if (!existing) {
+            this.summaries.set(key, {
+              server_id: String(serverId),
+              task_id: String(taskId),
+              project_name: sName,
+              brain_session: sBrain,
+              brain_label: sBrainLabel,
+              title: sTitle,
+              status: String(status),
+              flags_json: sFlags === '' ? '[]' : sFlags,
+              round: nRound,
+              checklist_total: nTotal,
+              checklist_implemented: nImpl,
+              checklist_audited: nAudit,
+              executor_label: sExecLabel,
+              auditor_label: sAuditLabel,
+              auditor: sAuditor,
+              live_summary: sLive,
+              is_terminal: bTerminal,
+              needs_attention: bAttention,
+              created_at: nCreated,
+              updated_at: nUpdated,
+            });
+          } else {
+            this.summaries.set(key, {
+              server_id: String(serverId),
+              task_id: String(taskId),
+              project_name: sName !== '' ? sName : existing.project_name,
+              brain_session: sBrain !== '' ? sBrain : existing.brain_session,
+              brain_label: sBrainLabel !== '' ? sBrainLabel : existing.brain_label,
+              title: sTitle !== '' ? sTitle : existing.title,
+              status: String(status),
+              flags_json: sFlags !== '' ? sFlags : existing.flags_json,
+              round: nRound > 0 || existing.round === 0 ? nRound : existing.round,
+              checklist_total: nTotal > 0 ? nTotal : existing.checklist_total,
+              checklist_implemented: nTotal > 0 ? nImpl : existing.checklist_implemented,
+              checklist_audited: nTotal > 0 ? nAudit : existing.checklist_audited,
+              executor_label: sExecLabel ?? existing.executor_label,
+              auditor_label: sAuditLabel ?? existing.auditor_label,
+              auditor: sAuditor ?? existing.auditor,
+              live_summary: sLive ?? existing.live_summary,
+              is_terminal: bTerminal,
+              needs_attention: sFlags !== ''
+                ? bAttention
+                : (bTerminal ? false : (bAttention ? true : existing.needs_attention)),
+              created_at: existing.created_at > 0 && nCreated > 0
+                ? Math.min(existing.created_at, nCreated)
+                : (nCreated > 0 ? nCreated : existing.created_at),
+              updated_at: Math.max(existing.updated_at, nUpdated),
+            });
+          }
+          return { changes: 1 };
+        }
+
+        if (norm.startsWith('update servers set status = $1')) {
+          const srv = this.servers.get(String(params[params.length - 1]));
+          if (srv) srv.status = String(params[0]);
+          return { changes: srv ? 1 : 0 };
+        }
+
+        return { changes: 0 };
+      },
+
+      exec: async () => {},
+      transaction: async <T>(fn: (tx: Database) => Promise<T>) => fn(db),
+      close: async () => {},
+    };
+    return db;
+  }
+}
+
+async function nextWsMessage(ws: WebSocket, predicate?: (frame: any) => boolean): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.off('message', onMsg);
+      reject(new Error('Timed out waiting for WS message'));
+    }, 3000);
+    const onMsg = (raw: any) => {
+      const parsed = JSON.parse(String(raw));
+      if (!predicate || predicate(parsed)) {
+        clearTimeout(timer);
+        ws.off('message', onMsg);
+        resolve(parsed);
+      }
+    };
+    ws.on('message', onMsg);
+  });
+}
+
+describe('global-task-mode server engine', () => {
+  let memDb: InMemoryGlobalTaskDb;
+  let db: Database;
+
+  beforeEach(() => {
+    memDb = new InMemoryGlobalTaskDb();
+    db = memDb.asDatabase();
+    memDb.servers.set('srv-a', {
+      id: 'srv-a',
+      user_id: 'user-a',
+      team_id: null,
+      name: 'Alpha Box',
+      token_hash: 'hash-a',
+      last_heartbeat_at: Date.now(),
+      status: 'online',
+      daemon_version: '1.0.0',
+      bound_with_key_id: null,
+      created_at: 200,
+      node_role: 'full',
+      revoked_at: null,
+    });
+    memDb.servers.set('srv-b', {
+      id: 'srv-b',
+      user_id: 'user-b',
+      team_id: null,
+      name: 'Beta Box',
+      token_hash: 'hash-b',
+      last_heartbeat_at: Date.now(),
+      status: 'online',
+      daemon_version: '1.0.0',
+      bound_with_key_id: null,
+      created_at: 100,
+      node_role: 'full',
+      revoked_at: null,
+    });
+    memDb.servers.set('srv-controlled', {
+      id: 'srv-controlled',
+      user_id: 'user-a',
+      team_id: null,
+      name: 'Controlled Node',
+      token_hash: 'hash-c',
+      last_heartbeat_at: Date.now(),
+      status: 'online',
+      daemon_version: '1.0.0',
+      bound_with_key_id: null,
+      created_at: 50,
+      node_role: 'controlled',
+      revoked_at: null,
+    });
+    memDb.sessions.push(
+      {
+        id: 's1',
+        server_id: 'srv-a',
+        name: 'deck_proj_brain',
+        project_name: 'imcodes',
+        role: 'brain',
+        agent_type: 'claude-code',
+        agent_version: null,
+        project_dir: '/repo',
+        state: 'idle',
+        label: 'Alpha Brain',
+        runtime_type: 'transport',
+        provider_id: null,
+        provider_session_id: null,
+        description: null,
+        created_at: 10,
+      },
+      {
+        id: 's2',
+        server_id: 'srv-a',
+        name: 'deck_sub_worker1',
+        project_name: 'imcodes',
+        role: 'sub',
+        agent_type: 'codex',
+        agent_version: null,
+        project_dir: '/repo',
+        state: 'running',
+        label: 'Worker 1',
+        runtime_type: 'transport',
+        provider_id: null,
+        provider_session_id: null,
+        description: null,
+        created_at: 20,
+      },
+      {
+        id: 's3',
+        server_id: 'srv-b',
+        name: 'deck_other_brain',
+        project_name: 'secret',
+        role: 'brain',
+        agent_type: 'claude-code',
+        agent_version: null,
+        project_dir: '/secret',
+        state: 'idle',
+        label: 'Beta Brain',
+        runtime_type: 'transport',
+        provider_id: null,
+        provider_session_id: null,
+        description: null,
+        created_at: 30,
+      },
+    );
+  });
+
+  afterEach(async () => {
+    await globalTaskHub.stop();
+  });
+
+  it('preserves existing title, flags, and checklist counts across partial upserts and isolates same taskId by serverId', async () => {
+    const initial = await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_same',
+      projectName: 'imcodes',
+      brainSession: 'deck_proj_brain',
+      title: 'Keep existing title',
+      status: 'working',
+      flags: ['blocked'],
+      round: 2,
+      checklist: { total: 5, implemented: 3, audited: 1 },
+      createdAt: 1000,
+      updatedAt: 2000,
+    });
+    expect(initial?.title).toBe('Keep existing title');
+    expect(initial?.checklist).toEqual({ total: 5, implemented: 3, audited: 1 });
+    expect(initial?.needsAttention).toBe(true);
+
+    // Partial event missing title, flags, and checklist
+    const partial = await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_same',
+      status: 'in_audit',
+      updatedAt: 3000,
+    });
+    expect(partial?.title).toBe('Keep existing title');
+    expect(partial?.checklist).toEqual({ total: 5, implemented: 3, audited: 1 });
+    expect(partial?.flags).toEqual(['blocked']);
+    expect(partial?.status).toBe('in_audit');
+    expect(partial?.round).toBe(2);
+
+    // Same taskId on srv-b stays completely isolated
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-b',
+      taskId: 'tsk_same',
+      projectName: 'secret',
+      brainSession: 'deck_other_brain',
+      title: 'Beta task',
+      status: 'done',
+      flags: [],
+      checklist: { total: 2, implemented: 2, audited: 2 },
+      updatedAt: 4000,
+    });
+
+    const rowA = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_same');
+    const rowB = await getGlobalTaskSummaryForServerTask(db, 'srv-b', 'tsk_same');
+    expect(rowA?.title).toBe('Keep existing title');
+    expect(rowB?.title).toBe('Beta task');
+    expect(rowB?.isTerminal).toBe(true);
+  });
+
+  it('enforces multi-tenant isolation, excludes controlled nodes & deck_sub_ sessions, and respects mutedServerIds', async () => {
+    await upsertGlobalTaskSummariesBatch(db, 'srv-a', [
+      { serverId: 'srv-a', taskId: 'tsk_a', projectName: 'imcodes', brainSession: 'deck_proj_brain', title: 'Alpha task', status: 'working', flags: [], updatedAt: 5000 },
+    ]);
+    await upsertGlobalTaskSummariesBatch(db, 'srv-b', [
+      { serverId: 'srv-b', taskId: 'tsk_b', projectName: 'secret', brainSession: 'deck_other_brain', title: 'Beta secret', status: 'working', flags: [], updatedAt: 6000 },
+    ]);
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-controlled',
+      taskId: 'tsk_c',
+      title: 'Controlled',
+      status: 'working',
+      updatedAt: 7000,
+    });
+
+    const snapA = await listGlobalTaskSnapshotForUser(db, 'user-a');
+    expect(snapA.servers.map((s) => s.id)).toEqual(['srv-a']);
+    expect(snapA.tasks.map((t) => t.taskId)).toEqual(['tsk_a']);
+    expect(snapA.brains.map((b) => b.sessionName)).toEqual(['deck_proj_brain']);
+
+    const snapAMuted = await listGlobalTaskSnapshotForUser(db, 'user-a', ['srv-a']);
+    expect(snapAMuted.servers.map((s) => s.id)).toEqual(['srv-a']);
+    expect(snapAMuted.tasks).toEqual([]);
+    expect(snapAMuted.brains).toEqual([]);
+  });
+
+  it('serves HTTP routes, enforces Origin and single-use jti ws-ticket, isolates tenants, filters muted servers, and truncates brain_text <= 4000 bytes', async () => {
+    const jwtSecret = 'test-signing-key-that-is-plenty-long-12345';
+    const env = {
+      DATABASE_URL: undefined,
+      JWT_SIGNING_KEY: jwtSecret,
+      DB: db,
+      BOT_ENCRYPTION_KEY: jwtSecret,
+      SERVER_URL: 'http://127.0.0.1',
+      ALLOWED_ORIGINS: 'http://127.0.0.1',
+      NODE_ENV: 'test',
+    } as unknown as Env;
+
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_live',
+      projectName: 'imcodes',
+      brainSession: 'deck_proj_brain',
+      title: 'Live Task',
+      status: 'working',
+      checklist: { total: 3, implemented: 1, audited: 0 },
+      updatedAt: 10_000,
+    });
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-b',
+      taskId: 'tsk_secret_b',
+      projectName: 'secret',
+      brainSession: 'deck_other_brain',
+      title: 'Secret B Task',
+      status: 'working',
+      updatedAt: 10_000,
+    });
+
+    const app = buildApp(env);
+    const httpServer = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 }) as unknown as import('node:http').Server;
+    setupWebSocketUpgrade(httpServer, env);
+    if (!httpServer.listening) {
+      await new Promise<void>((resolve) => httpServer.once('listening', resolve));
+    }
+
+    try {
+      const addr = httpServer.address() as { port: number };
+      const baseHttp = `http://127.0.0.1:${addr.port}`;
+      const baseWs = `ws://127.0.0.1:${addr.port}`;
+
+      const cookieA = signJwt({ sub: 'user-a', type: ACCOUNT_SESSION_JWT_TYPE }, jwtSecret, 3600);
+      const cookieB = signJwt({ sub: 'user-b', type: ACCOUNT_SESSION_JWT_TYPE }, jwtSecret, 3600);
+      const csrf = 'csrf-token-123';
+
+      // GET /api/global-tasks authorization
+      const resSnapA = await fetch(`${baseHttp}${GLOBAL_TASK_SNAPSHOT_PATH}`, {
+        headers: { Cookie: `${COOKIE_SESSION}=${cookieA}` },
+      });
+      expect(resSnapA.status).toBe(200);
+      const bodySnapA = await resSnapA.json() as { tasks: Array<{ taskId: string }> };
+      expect(bodySnapA.tasks.map((t) => t.taskId)).toEqual(['tsk_live']);
+
+      // Issue ticket for user-a and user-b
+      const resTicketA = await fetch(`${baseHttp}${GLOBAL_TASK_TICKET_PATH}`, {
+        method: 'POST',
+        headers: {
+          Origin: 'http://127.0.0.1',
+          Cookie: `${COOKIE_SESSION}=${cookieA}; ${COOKIE_CSRF}=${csrf}`,
+          [HEADER_CSRF]: csrf,
+        },
+      });
+      expect(resTicketA.status).toBe(200);
+      const { ticket: ticketA } = await resTicketA.json() as { ticket: string };
+
+      const resTicketB = await fetch(`${baseHttp}${GLOBAL_TASK_TICKET_PATH}`, {
+        method: 'POST',
+        headers: {
+          Origin: 'http://127.0.0.1',
+          Cookie: `${COOKIE_SESSION}=${cookieB}; ${COOKIE_CSRF}=${csrf}`,
+          [HEADER_CSRF]: csrf,
+        },
+      });
+      expect(resTicketB.status).toBe(200);
+      const { ticket: ticketB } = await resTicketB.json() as { ticket: string };
+
+      // Bad Origin -> 403
+      const badOriginCode = await new Promise<number>((resolve) => {
+        const ws = new WebSocket(`${baseWs}${GLOBAL_TASK_WS_PATH}?ticket=${encodeURIComponent(ticketA)}`, {
+          origin: 'https://evil.example.com',
+        });
+        ws.on('error', () => {});
+        ws.on('unexpected-response', (_req, res) => {
+          resolve(res.statusCode ?? 0);
+          ws.terminate();
+        });
+      });
+      expect(badOriginCode).toBe(403);
+
+      // Connect user-a WS and expect snapshot
+      const wsA = new WebSocket(`${baseWs}${GLOBAL_TASK_WS_PATH}?ticket=${encodeURIComponent(ticketA)}`, {
+        origin: 'http://127.0.0.1',
+      });
+      const snapMsgA = await nextWsMessage(wsA, (m) => m.type === GLOBAL_TASK_MODE_MSG.SNAPSHOT);
+      expect(snapMsgA.tasks.map((t: { taskId: string }) => t.taskId)).toEqual(['tsk_live']);
+
+      // Replaying ticketA jti -> 401
+      const replayCode = await new Promise<number>((resolve) => {
+        const ws = new WebSocket(`${baseWs}${GLOBAL_TASK_WS_PATH}?ticket=${encodeURIComponent(ticketA)}`, {
+          origin: 'http://127.0.0.1',
+        });
+        ws.on('error', () => {});
+        ws.on('unexpected-response', (_req, res) => {
+          resolve(res.statusCode ?? 0);
+          ws.terminate();
+        });
+      });
+      expect(replayCode).toBe(401);
+
+      // Connect user-b WS
+      const wsB = new WebSocket(`${baseWs}${GLOBAL_TASK_WS_PATH}?ticket=${encodeURIComponent(ticketB)}`, {
+        origin: 'http://127.0.0.1',
+      });
+      await nextWsMessage(wsB, (m) => m.type === GLOBAL_TASK_MODE_MSG.SNAPSHOT);
+
+      const receivedByB: GlobalTaskServerFrame[] = [];
+      wsB.on('message', (raw) => receivedByB.push(JSON.parse(String(raw))));
+
+      // Real-time task upsert & brain_text on srv-a reaches user-a, NEVER user-b
+      memDb.throwOnPgNotify = true; // Verify graceful non-PG fallback
+      const upsertWait = nextWsMessage(wsA, (m) => m.type === GLOBAL_TASK_MODE_MSG.UPSERT);
+      await upsertGlobalTaskSummary(db, {
+        serverId: 'srv-a',
+        taskId: 'tsk_live',
+        status: 'in_audit',
+        checklist: { total: 3, implemented: 3, audited: 1 },
+        updatedAt: 11_000,
+      });
+      await globalTaskHub.notifyTaskUpdated(db, 'srv-a', 'tsk_live');
+      const upsertFrame = await upsertWait;
+      expect(upsertFrame.task.status).toBe('in_audit');
+      expect(upsertFrame.task.checklist).toEqual({ total: 3, implemented: 3, audited: 1 });
+
+      // Multibyte long text truncation <= 1200 chars and <= 4000 bytes
+      memDb.throwOnPgNotify = false;
+      const longChineseEmoji = '你好🚀'.repeat(900); // > 2700 code points, > 7000 bytes
+      const brainWait = nextWsMessage(wsA, (m) => m.type === GLOBAL_TASK_MODE_MSG.BRAIN_TEXT);
+      await globalTaskHub.notifyBrainText(db, {
+        serverId: 'srv-a',
+        sessionName: 'deck_proj_brain',
+        projectName: 'imcodes',
+        eventId: 'evt-long-1',
+        text: longChineseEmoji,
+        ts: 12_000,
+      });
+      const brainFrame = await brainWait;
+      expect(Array.from(brainFrame.event.text).length).toBeLessThanOrEqual(1200);
+      const notifyEntry = memDb.pgNotifies.find((n) => n.channel === GLOBAL_TASK_NOTIFY_CHANNEL && n.payload.includes('evt-long-1'));
+      expect(notifyEntry).toBeDefined();
+      expect(Buffer.byteLength(notifyEntry!.payload, 'utf8')).toBeLessThanOrEqual(GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
+
+      expect(receivedByB).toEqual([]);
+
+      // Mute srv-a dynamically via set_filter -> blocks upsert & brain_text until unmuted
+      const filteredSnapWait = nextWsMessage(wsA, (m) => m.type === GLOBAL_TASK_MODE_MSG.SNAPSHOT);
+      wsA.send(JSON.stringify({ type: GLOBAL_TASK_MODE_MSG.SET_FILTER, mutedServerIds: ['srv-a'] }));
+      const filteredSnap = await filteredSnapWait;
+      expect(filteredSnap.tasks).toEqual([]);
+
+      const receivedWhileMuted: GlobalTaskServerFrame[] = [];
+      const captureMuted = (raw: any) => receivedWhileMuted.push(JSON.parse(String(raw)));
+      wsA.on('message', captureMuted);
+      await globalTaskHub.notifyTaskUpdated(db, 'srv-a', 'tsk_live');
+      await globalTaskHub.notifyBrainText(db, {
+        serverId: 'srv-a',
+        sessionName: 'deck_proj_brain',
+        eventId: 'evt-muted-1',
+        text: 'Should not arrive while muted',
+        ts: 13_000,
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      wsA.off('message', captureMuted);
+      expect(receivedWhileMuted).toEqual([]);
+
+      wsA.close();
+      wsB.close();
+    } finally {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+  });
+
+  it('ingests fleet_snapshot, task_pair.event, task_console frames, and filtered assistant.text via WsBridge without leaking fleet_snapshot to terminal browsers', async () => {
+    const hub = globalTaskHub;
+    const browserReceived: string[] = [];
+    const terminalBrowserWs = {
+      readyState: WebSocket.OPEN,
+      send: vi.fn((data: string) => { browserReceived.push(data); }),
+      on: vi.fn(),
+      once: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    const globalSubscriberFrames: GlobalTaskServerFrame[] = [];
+    const globalSubscriberWs = {
+      readyState: WebSocket.OPEN,
+      send: vi.fn((data: string) => { globalSubscriberFrames.push(JSON.parse(data)); }),
+      on: vi.fn(),
+      once: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    await hub.handleConnection(globalSubscriberWs, 'user-a', db);
+
+    const bridge = WsBridge.get('srv-a') as unknown as {
+      db: Database | null;
+      browserSockets: Set<WebSocket>;
+      ingestGlobalTaskFleetSnapshot(db: Database, msg: Record<string, unknown>): Promise<void>;
+      ingestGlobalTaskFrame(db: Database, msg: Record<string, unknown>): Promise<void>;
+      relayToBrowsers(msg: Record<string, unknown>): void;
+    };
+    bridge.db = db;
+    bridge.browserSockets.add(terminalBrowserWs);
+
+    // fleet_snapshot never broadcasts to regular terminal browsers
+    const fleetMsg = {
+      type: GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
+      pairs: [
+        {
+          taskId: 'tsk_fleet',
+          brain: 'deck_proj_brain',
+          projectName: 'imcodes',
+          title: 'Fleet Pair',
+          status: 'working',
+          flags: [],
+          round: 1,
+          checklist: { total: 4, implemented: 2, audited: 1 },
+          createdAt: 1000,
+          updatedAt: 2000,
+        },
+      ],
+    };
+    bridge.relayToBrowsers(fleetMsg);
+    expect(browserReceived).toEqual([]);
+
+    await bridge.ingestGlobalTaskFleetSnapshot(db, fleetMsg);
+    expect(globalSubscriberFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.UPSERT && f.task.taskId === 'tsk_fleet')).toBe(true);
+
+    // Old daemon fallback: task_pair.event
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 3000,
+        payload: {
+          taskId: 'tsk_fleet',
+          toStatus: 'in_audit',
+          round: 2,
+          flags: [],
+        },
+      },
+    });
+    const updatedRow = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_fleet');
+    expect(updatedRow?.status).toBe('in_audit');
+    expect(updatedRow?.checklist).toEqual({ total: 4, implemented: 2, audited: 1 });
+
+    // assistant.text filtering: ignore streaming: true, automation: true, deck_sub_*, empty
+    globalSubscriberFrames.length = 0;
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'assistant.text',
+        sessionId: 'deck_proj_brain',
+        eventId: 'evt-stream',
+        ts: 3100,
+        payload: { text: 'streaming chunk', streaming: true },
+      },
+    });
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'assistant.text',
+        sessionId: 'deck_proj_brain',
+        eventId: 'evt-auto',
+        ts: 3101,
+        payload: { text: 'automation', automation: true },
+      },
+    });
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'assistant.text',
+        sessionId: 'deck_sub_worker1',
+        eventId: 'evt-sub',
+        ts: 3102,
+        payload: { text: 'subsession noise' },
+      },
+    });
+    expect(globalSubscriberFrames).toEqual([]);
+
+    // Valid completed Brain assistant.text pushes global_tasks.brain_text
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'assistant.text',
+        sessionId: 'deck_proj_brain',
+        eventId: 'evt-real-1',
+        ts: 3200,
+        payload: { text: 'All tests are passing.', streaming: false },
+      },
+    });
+    expect(globalSubscriberFrames).toContainEqual({
+      type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
+      event: {
+        serverId: 'srv-a',
+        serverName: 'Alpha Box',
+        sessionName: 'deck_proj_brain',
+        eventId: 'evt-real-1',
+        text: 'All tests are passing.',
+        ts: 3200,
+      },
+    });
+
+    // Ensure separate Hub instance works too
+    const standalone = new GlobalTaskHub();
+    expect(standalone.isPgListening()).toBe(false);
+    await standalone.stop();
+  });
+});

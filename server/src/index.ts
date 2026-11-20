@@ -3,6 +3,13 @@ import { taskPairTitleAuthorityRoutes } from './routes/task-pair-title-authority
 import { TASK_PAIR_TITLE_AUTHORITY_PATH } from '../../shared/task-pair-title-access.js';
 import { MachineGroupInvalidationRuntime } from './services/machine-group-invalidation.js';
 import { applyMachineGroupInvalidation, failClosedMachineGroupConnections } from './ws/machine-group-revalidation.js';
+import { globalTaskHub } from './services/global-task-hub.js';
+import { globalTasksRoutes } from './routes/global-tasks.js';
+import {
+  GLOBAL_TASK_SNAPSHOT_PATH,
+  GLOBAL_TASK_WS_PATH,
+  GLOBAL_TASK_WS_TICKET_TYPE,
+} from '../../shared/global-task-mode.js';
 /**
  * IM.codes Node.js server entry point.
  * Replaces the Cloudflare Workers deployment.
@@ -781,6 +788,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.route('/api/auth/remote-desktop', remoteDesktopAccountAuthRoutes);
   app.route('/api/auth/remote-desktop', remoteDesktopShellLaunchContextRoutes);
   app.route('/api/admin', adminRoutes);
+  app.route(GLOBAL_TASK_SNAPSHOT_PATH, globalTasksRoutes);
 
   app.get('/health', (c) => c.json({ ok: true, ts: Date.now() }));
 
@@ -924,6 +932,53 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
     const previewWsMatch = url.pathname.match(/^\/api\/server\/([^/]+)\/local-web\/([^/]+)(\/.*)?$/);
     if (previewWsMatch) {
       await handlePreviewWsUpgrade(previewWsMatch[1]!, previewWsMatch[2]!, previewWsMatch[3] ?? '/', req, socket, head, url, wss, env);
+      return;
+    }
+
+    if (url.pathname === GLOBAL_TASK_WS_PATH) {
+      const origin = req.headers['origin'] ?? '';
+      if (!validateOrigin(origin, env)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const ticket = url.searchParams.get('ticket');
+      if (!ticket) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const payload = verifyJwt(ticket, env.JWT_SIGNING_KEY);
+      if (!payload || payload.type !== GLOBAL_TASK_WS_TICKET_TYPE || typeof payload.sub !== 'string' || !payload.sub) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const jti = typeof payload.jti === 'string' ? payload.jti : '';
+      if (!jti || !rateLimiter.consumeJti(jti, 30_000)) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      try {
+        const decision = evaluateUserAccess(
+          await loadUserAccess(env.DB, payload.sub),
+          typeof payload.iat === 'number' ? payload.iat : undefined,
+        );
+        if (!decision.ok) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+      } catch {
+        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const userId = payload.sub;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        void globalTaskHub.handleConnection(ws, userId, env.DB);
+      });
       return;
     }
 
@@ -1360,6 +1415,7 @@ async function main() {
     envConfig.DATABASE_URL, (error) => logger.error({ error }, 'Machine group invalidation failed closed'),
   );
   await machineGroupInvalidation.start();
+  await globalTaskHub.start(envConfig.DATABASE_URL, db);
 
   const podId = getPodIdentity();
   const guestOutboxAdapter = new PostgresRemoteDesktopGuestOutboxDeliveryAdapter(
@@ -1438,6 +1494,7 @@ async function main() {
     setRemoteDesktopManagementPrivacyDispatcher(null);
     setRemoteDesktopShellLaunchContextDispatcher(null);
     stopAccountWatch();
+    await globalTaskHub.stop();
     await machineGroupInvalidation.stop();
     await managementPrivacyWorker.stop();
     try {

@@ -2,6 +2,7 @@ import { isIncognitoSession } from '../../shared/session-incognito-types.js';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-compaction.js';
 import { taskPairService } from './task-pairs/service.js';
+import { buildGlobalTaskFleetSnapshotPayload } from './task-pairs/fleet-snapshot.js';
 import { evaluatePairMainCheckoutGitWrite, mainCheckoutWriteRefusal } from './task-pairs/main-checkout-write-guard.js';
 import { setTransportToolExecutionEvaluator } from './transport-relay.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
@@ -1174,6 +1175,9 @@ export async function startup(): Promise<DaemonContext> {
             });
           } catch { /* ignore */ }
         }
+        try {
+          serverLink.send(buildGlobalTaskFleetSnapshotPayload());
+        } catch { /* ignore */ }
       }, 3_000); // delay to ensure WS auth handshake completes first
       restoreBroadcastTimer = timer;
       timer.unref?.();
