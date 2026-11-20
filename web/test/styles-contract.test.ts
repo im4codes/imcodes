@@ -2007,4 +2007,17 @@ describe('styles.css regression contracts', () => {
     const originUserPreviewRule = extractDirectStyleRule(topLevelCss, /\.chat-user\.chat-user-origin-user\s+\.chat-local-image-preview\s*/) ?? '';
     expect(originUserPreviewRule).toMatch(/border:\s*1px solid rgba\(186,\s*230,\s*253,\s*0\.36\)/);
   });
+
+  it('positions the floating chat history loading overlay at the top below .chat-titlebar rather than at bottom: 10px', () => {
+    const topLevelCss = `{\n${cssWithoutComments}\n}`;
+    const overlayRule = extractDirectStyleRule(topLevelCss, /\.chat-history-overlay\s*/) ?? '';
+    expect(overlayRule).toBeTruthy();
+    const topPx = Number(overlayRule.match(/top:\s*(\d+)px/)?.[1] ?? NaN);
+    expect(Number.isFinite(topPx)).toBe(true);
+    expect(topPx).toBeGreaterThanOrEqual(38);
+    expect(overlayRule).not.toMatch(/bottom\s*:/);
+    expect(overlayRule).toMatch(/left:\s*50%/);
+    expect(overlayRule).toMatch(/transform:\s*translateX\(-50%\)/);
+    expect(overlayRule).toMatch(/pointer-events:\s*none/);
+  });
 });
