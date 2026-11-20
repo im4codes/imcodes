@@ -152,15 +152,34 @@ export function getTaskPairWaitKind(payload: Record<string, unknown>) {
   });
 }
 
-function recentRowTimestamp(row: TaskPairPanelRow): number {
+export function recentTaskPairTimestamp(
+  input: {
+    endedAt?: unknown;
+    finishedAt?: unknown;
+    updatedAt?: unknown;
+    startedAt?: unknown;
+    createdAt?: unknown;
+  },
+  fallbackUpdatedAt?: unknown,
+): number {
   return (
-    finiteTimestamp(row.payload.endedAt)
-    ?? finiteTimestamp(row.payload.finishedAt)
-    ?? finiteTimestamp(row.payload.updatedAt)
-    ?? finiteTimestamp(row.updatedAt)
-    ?? finiteTimestamp(row.payload.startedAt)
-    ?? finiteTimestamp(row.startedAt)
+    finiteTimestamp(input.endedAt)
+    ?? finiteTimestamp(input.finishedAt)
+    ?? finiteTimestamp(input.updatedAt)
+    ?? finiteTimestamp(fallbackUpdatedAt)
+    ?? finiteTimestamp(input.startedAt)
+    ?? finiteTimestamp(input.createdAt)
     ?? 0
+  );
+}
+
+function recentRowTimestamp(row: TaskPairPanelRow): number {
+  return recentTaskPairTimestamp(
+    {
+      ...row.payload,
+      startedAt: row.payload.startedAt ?? row.startedAt,
+    },
+    row.updatedAt,
   );
 }
 

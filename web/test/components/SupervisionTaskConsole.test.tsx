@@ -1356,7 +1356,8 @@ describe('SupervisionTaskConsole', () => {
     });
 
     const snapshot = taskConsoleStateToPairSnapshot(depsState);
-    expect(snapshot?.tasks.map((row) => row.taskId)).toEqual(['tsk_dep_active', 'tsk_child']);
+    expect(snapshot?.tasks.map((row) => row.taskId)).toEqual(['tsk_dep_active', 'tsk_child', 'tsk_dep_done']);
+    expect(snapshot?.tasks.find((row) => row.taskId === 'tsk_dep_done')?.pair.status).toBe('done');
     expect(snapshot?.taskTitles).toEqual({
       tsk_child: 'Display dependency titles',
       tsk_dep_active: 'Fix auth retry',

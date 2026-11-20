@@ -637,12 +637,15 @@ describe('TaskPairStatusPanel', () => {
       },
       assignments: {},
     } as never);
-    expect(snapshot.tasks).toHaveLength(1);
-    expect(snapshot.tasks[0].pair.status).toBe('awaiting_brain_decision');
-    expect(snapshot.tasks[0].pair.startedAt).toBe(123);
-    expect(snapshot.tasks[0].brief).toBe('Keep this brief');
+    expect(snapshot.tasks).toHaveLength(2);
+    const blockedRow = snapshot.tasks.find((t) => t.taskId === 'blocked');
+    const doneRow = snapshot.tasks.find((t) => t.taskId === 'done');
+    expect(blockedRow?.pair.status).toBe('awaiting_brain_decision');
+    expect(blockedRow?.pair.startedAt).toBe(123);
+    expect(blockedRow?.brief).toBe('Keep this brief');
+    expect(doneRow?.pair.status).toBe('done');
   });
-  it('does not resurrect terminal rows whose historical flags still request Brain attention', () => {
+  it('does not resurrect terminal rows whose historical flags still request Brain attention and caps recent terminal rows at 20 while keeping all open rows', () => {
     const snapshot = taskConsoleStateToPairSnapshot({
       tasks: Object.fromEntries(TASK_PAIR_TERMINAL_STATUSES.map((status, index) => [status, {
         taskId: status,
@@ -661,7 +664,69 @@ describe('TaskPairStatusPanel', () => {
       }])),
       assignments: {},
     } as never);
-    expect(snapshot.tasks).toEqual([]);
+    expect(snapshot.tasks.map((t) => [t.taskId, t.pair.status])).toEqual([
+      ['cancelled', 'cancelled'],
+      ['done', 'done'],
+    ]);
+
+    // Stale blocked/needs_input flags on terminal rows never inflate active counts, and panel starts with Recent collapsed
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { ...snapshot, serverId: 'terminal-flags' };
+    try {
+      const { container } = render(<TaskPairStatusPanel events={[]} serverId="terminal-flags" />);
+      expect(container.querySelector('.task-pair-status-panel')).toBeTruthy();
+      expect(container.querySelector('.task-pair-chip--awaiting_brain_decision')?.textContent).toContain('(0)');
+      const recentDetails = container.querySelector('details.task-pair-status-group-recent') as HTMLDetailsElement | null;
+      expect(recentDetails).toBeTruthy();
+      expect(recentDetails!.open).toBe(false);
+      expect(recentDetails!.querySelector('summary h4')?.textContent).toContain('(2)');
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      cleanup();
+    }
+
+    // 25 terminal rows + 3 open rows -> keeps all 3 open rows + newest 20 terminal rows
+    const manyTasks: Record<string, unknown> = {};
+    for (let i = 1; i <= 3; i += 1) {
+      manyTasks[`open-${i}`] = {
+        taskId: `open-${i}`,
+        title: `Open ${i}`,
+        phase: 'active',
+        updatedAt: 100 + i,
+        pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], createdAt: 100, startedAt: 100, updatedAt: 100 + i, executor: 'deck_exec_s1', auditor: 'deck_aud_s1' },
+      };
+    }
+    for (let i = 1; i <= 25; i += 1) {
+      manyTasks[`term-${i}`] = {
+        taskId: `term-${i}`,
+        title: `Term ${i}`,
+        phase: 'final',
+        updatedAt: 1000 + i * 10,
+        pair: { status: i % 2 === 0 ? 'cancelled' : 'done', flags: ['blocked'], round: 1, blocking: ['P0'], createdAt: 500, startedAt: 500, updatedAt: 1000 + i * 10, endedAt: 1000 + i * 10, executor: 'deck_exec_s1', auditor: 'none' },
+      };
+    }
+    const capped = taskConsoleStateToPairSnapshot({ tasks: manyTasks, assignments: {} } as never);
+    expect(capped.tasks.slice(0, 3).map((t) => t.taskId)).toEqual(['open-1', 'open-2', 'open-3']);
+    const recentIds = capped.tasks.slice(3).map((t) => t.taskId);
+    expect(recentIds).toHaveLength(20);
+    expect(recentIds[0]).toBe('term-25');
+    expect(recentIds[19]).toBe('term-6');
+    expect(recentIds).not.toContain('term-5');
+
+    // scopeSessionId filtering still displays up to 20 scoped recent rows collapsed by default
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { ...capped, serverId: 'scoped-20' };
+    try {
+      const { container } = render(<TaskPairStatusPanel events={[]} serverId="scoped-20" scopeSessionId="deck_exec_s1" />);
+      const recentDetails = container.querySelector('details.task-pair-status-group-recent') as HTMLDetailsElement | null;
+      expect(recentDetails).toBeTruthy();
+      expect(recentDetails!.open).toBe(false);
+      expect(recentDetails!.querySelector('summary h4')?.textContent).toContain('(20)');
+      expect(recentDetails!.querySelectorAll('.task-pair-status-row')).toHaveLength(20);
+      recentDetails!.open = true;
+      expect(recentDetails!.open).toBe(true);
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      cleanup();
+    }
   });
   it('clears the prior scope snapshot before the next authoritative sync', async () => {
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { tasks: [{ taskId: 'old-scope', title: 'Old scope', pair: { status: 'working' } }] };

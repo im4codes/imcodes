@@ -43,6 +43,7 @@ import {
 } from '../supervision-task-console-visibility.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import { TASK_PAIR_OPEN_STATUSES, TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION, TASK_PAIR_TERMINAL_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
+import { recentTaskPairTimestamp, TASK_PAIR_PANEL_MAX_RECENT_ROWS } from '../task-pair-panel-order.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
 
 const DESKTOP_MIN_WIDTH = 720;
@@ -72,7 +73,16 @@ function legacyPairStatus(task: SupervisionTaskConsoleTaskRow): TaskPairStatus {
 
 /** Adapt the authoritative console projection for the compact chat panel. */
 export function taskConsoleStateToPairSnapshot(state: SupervisionTaskConsoleReducerState) {
-  const tasks = Object.values(state.tasks).flatMap((task) => {
+  type SnapshotTaskEntry = {
+    taskId: string;
+    title: string;
+    brief?: string;
+    updatedAt: number;
+    pair: Omit<SupervisionConsolePairInfo, 'brief'>;
+  };
+  const openTasks: SnapshotTaskEntry[] = [];
+  const terminalTasks: Array<{ entry: SnapshotTaskEntry; recencyTs: number }> = [];
+  for (const task of Object.values(state.tasks)) {
     const pair = task.pair ?? {
       status: legacyPairStatus(task),
       flags: [],
@@ -82,32 +92,41 @@ export function taskConsoleStateToPairSnapshot(state: SupervisionTaskConsoleRedu
       startedAt: task.updatedAt,
       updatedAt: task.updatedAt,
     };
+    const isTerminal = TASK_PAIR_TERMINAL_STATUSES.includes(pair.status);
+    const flags = [...(pair.flags ?? [])];
     // Historical terminal rows may retain the flags from the last open
     // transition (for example `blocked`/`needs_input`).  Those flags are
-    // metadata, not a new lifecycle transition: applying them before the
-    // visibility check would resurrect a completed pair as
-    // `awaiting_brain_decision` in the compact panel.  The engine's lifecycle
-    // status is authoritative for whether a row can be shown as active.
-    if (TASK_PAIR_TERMINAL_STATUSES.includes(pair.status)) return [];
-    const flags = [...(pair.flags ?? [])];
-    const waitingForBrain = flags.some((flag) => BRAIN_DECISION_FLAGS.has(flag));
-    const normalizedPair = {
+    // metadata, not a new lifecycle transition: never apply them to
+    // resurrect a terminal pair as `awaiting_brain_decision`.
+    const waitingForBrain = !isTerminal && flags.some((flag) => BRAIN_DECISION_FLAGS.has(flag));
+    const normalizedPair: SupervisionConsolePairInfo = {
       ...pair,
       status: waitingForBrain ? TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION : pair.status,
       flags,
     };
-    // The supervision projection can retain completed history.  The compact
-    // panel is an open-pair indicator, so do not reintroduce terminal rows.
-    if (!TASK_PAIR_PANEL_VISIBLE_STATUSES.includes(normalizedPair.status)) return [];
+    if (!isTerminal && !TASK_PAIR_PANEL_VISIBLE_STATUSES.includes(normalizedPair.status)) continue;
     const { brief, ...snapshotPair } = normalizedPair;
-    return [{
+    const entry: SnapshotTaskEntry = {
       taskId: task.taskId,
       title: task.title,
       ...(typeof brief === 'string' && brief.trim() ? { brief } : {}),
       updatedAt: task.updatedAt,
       pair: snapshotPair,
-    }];
-  });
+    };
+    if (isTerminal) {
+      terminalTasks.push({
+        entry,
+        recencyTs: recentTaskPairTimestamp(pair, task.updatedAt),
+      });
+    } else {
+      openTasks.push(entry);
+    }
+  }
+  terminalTasks.sort((a, b) => (b.recencyTs - a.recencyTs) || a.entry.taskId.localeCompare(b.entry.taskId));
+  const tasks = [
+    ...openTasks,
+    ...terminalTasks.slice(0, TASK_PAIR_PANEL_MAX_RECENT_ROWS).map((item) => item.entry),
+  ];
   const taskTitles: Record<string, string> = {};
   for (const taskId of Object.keys(state.tasks).sort()) {
     const task = state.tasks[taskId];

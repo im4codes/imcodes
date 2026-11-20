@@ -132,7 +132,10 @@ describe('the cancelled pairs that stayed "running" after a daemon restart', () 
     const state = controller.getState();
     expect(state.tasks.tsk_5?.pair?.status).toBe('cancelled');
     expect(state.tasks.tsk_b?.pair?.status).toBe('cancelled');
-    expect(taskConsoleStateToPairSnapshot(state).tasks.map((task) => task.taskId)).toEqual(['live']);
+    const snapshotTasks = taskConsoleStateToPairSnapshot(state).tasks;
+    expect(snapshotTasks.filter((task) => !task.pair || (task.pair.status !== 'done' && task.pair.status !== 'cancelled')).map((task) => task.taskId)).toEqual(['live']);
+    expect(snapshotTasks.find((task) => task.taskId === 'tsk_5')?.pair?.status).toBe('cancelled');
+    expect(snapshotTasks.find((task) => task.taskId === 'tsk_b')?.pair?.status).toBe('cancelled');
     expect(daemon.frames.filter((frame) => frame.type === SUPERVISION_TASK_CONSOLE_MSG.DELTA)).toEqual([]);
     controller.stop();
   });
@@ -396,7 +399,9 @@ describe('every state change a user can see reaches the viewer as a delta, ident
     expect(taskConsoleStateToPairSnapshot(controller.getState()).tasks.map((task) => task.taskId).sort()).toEqual(['keep', 'victim']);
     save('victim', { status: 'cancelled' });
     daemon.registry.pairsChanged(PROJECT, ['victim'], 'task_pair_changed');
-    expect(taskConsoleStateToPairSnapshot(controller.getState()).tasks.map((task) => task.taskId)).toEqual(['keep']);
+    const afterCancelTasks = taskConsoleStateToPairSnapshot(controller.getState()).tasks;
+    expect(afterCancelTasks.filter((task) => task.pair?.status !== 'done' && task.pair?.status !== 'cancelled').map((task) => task.taskId)).toEqual(['keep']);
+    expect(afterCancelTasks.find((task) => task.taskId === 'victim')?.pair?.status).toBe('cancelled');
     controller.stop();
   });
 });
