@@ -1972,20 +1972,20 @@ describe('styles.css regression contracts', () => {
     expect(mobile350).toMatch(/\.chat-titlebar:has\([^)]*\.task-pair-status-panel\.is-mobile\.is-collapsed\)\s+\.chat-tts-settings-btn\s*\{[^}]*width:\s*15px/);
   });
 
-  it('gives outgoing human user bubbles a distinct dark-emerald palette separated from assistant/agent/system and failed bubbles', () => {
+  it('gives outgoing human user bubbles a distinct soft pale-blue palette separated from assistant/agent/system and failed bubbles', () => {
     const topLevelCss = `{\n${cssWithoutComments}\n}`;
 
     const baseUserRule = extractDirectStyleRule(topLevelCss, /\.chat-user\s*/) ?? '';
-    expect(baseUserRule).toMatch(/background:\s*#145338/);
-    expect(baseUserRule).toMatch(/color:\s*#ecfdf5/);
+    expect(baseUserRule).toMatch(/background:\s*#234b76/);
+    expect(baseUserRule).toMatch(/color:\s*#f0f9ff/);
 
     const originUserRule = extractDirectStyleRule(topLevelCss, /\.chat-user\.chat-user-origin-user\s*/) ?? '';
-    expect(originUserRule).toMatch(/rgba\(22,\s*92,\s*60,\s*0\.96\)/);
-    expect(originUserRule).toMatch(/rgba\(15,\s*68,\s*44,\s*0\.97\)/);
-    expect(originUserRule).toMatch(/border:\s*1px solid rgba\(52,\s*211,\s*153,\s*0\.36\)/);
-    expect(originUserRule).toMatch(/border-right:\s*2px solid rgba\(52,\s*211,\s*153,\s*0\.78\)/);
-    expect(originUserRule).toMatch(/color:\s*#ecfdf5/);
-    expect(originUserRule).not.toMatch(/16,\s*35,\s*62|#1e3a5f/);
+    expect(originUserRule).toMatch(/rgba\(46,\s*108,\s*172,\s*0\.94\)/);
+    expect(originUserRule).toMatch(/rgba\(34,\s*86,\s*142,\s*0\.96\)/);
+    expect(originUserRule).toMatch(/border:\s*1px solid rgba\(125,\s*211,\s*252,\s*0\.45\)/);
+    expect(originUserRule).toMatch(/border-right:\s*2px solid rgba\(125,\s*211,\s*252,\s*0\.85\)/);
+    expect(originUserRule).toMatch(/color:\s*#f0f9ff/);
+    expect(originUserRule).not.toMatch(/16,\s*35,\s*62|#1e3a5f|#145338|22,\s*92,\s*60/);
 
     const originAgentRule = extractDirectStyleRule(topLevelCss, /\.chat-user\.chat-user-origin-agent,\s*\.chat-user\.chat-user-origin-system\s*/) ?? '';
     expect(originAgentRule).toMatch(/background:\s*#161b22/);
@@ -1994,17 +1994,17 @@ describe('styles.css regression contracts', () => {
     expect(failedUserRule).toMatch(/background:\s*#3a1a1a/);
 
     const pendingOriginUserRule = extractDirectStyleRule(topLevelCss, /\.chat-user\.chat-user-origin-user\.chat-pending\s*/) ?? '';
-    expect(pendingOriginUserRule).toMatch(/rgba\(18,\s*76,\s*50,\s*0\.56\)/);
+    expect(pendingOriginUserRule).toMatch(/rgba\(40,\s*96,\s*154,\s*0\.56\)/);
 
     const originUserFoldRule = extractDirectStyleRule(topLevelCss, /\.chat-user\.chat-user-origin-user\s+\.chat-user-message-fold\.is-folded::after\s*/) ?? '';
-    expect(originUserFoldRule).toMatch(/rgba\(19,\s*80,\s*52,\s*0\.96\)/);
-    expect(originUserFoldRule).not.toMatch(/15,\s*41,\s*70|#1e3a5f/);
+    expect(originUserFoldRule).toMatch(/rgba\(42,\s*102,\s*164,\s*0\.96\)/);
+    expect(originUserFoldRule).not.toMatch(/15,\s*41,\s*70|#1e3a5f|19,\s*80,\s*52|#145338/);
 
     const originUserToggleRule = extractDirectStyleRule(topLevelCss, /\.chat-user\.chat-user-origin-user\s+\.chat-user-message-fold-toggle\s*/) ?? '';
-    expect(originUserToggleRule).toMatch(/border-color:\s*rgba\(110,\s*231,\s*183,\s*0\.4\)/);
-    expect(originUserToggleRule).toMatch(/color:\s*#d1fae5/);
+    expect(originUserToggleRule).toMatch(/border-color:\s*rgba\(186,\s*230,\s*253,\s*0\.42\)/);
+    expect(originUserToggleRule).toMatch(/color:\s*#e0f2fe/);
 
     const originUserPreviewRule = extractDirectStyleRule(topLevelCss, /\.chat-user\.chat-user-origin-user\s+\.chat-local-image-preview\s*/) ?? '';
-    expect(originUserPreviewRule).toMatch(/border:\s*1px solid rgba\(52,\s*211,\s*153,\s*0\.34\)/);
+    expect(originUserPreviewRule).toMatch(/border:\s*1px solid rgba\(186,\s*230,\s*253,\s*0\.36\)/);
   });
 });
