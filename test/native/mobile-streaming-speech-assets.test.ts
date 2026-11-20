@@ -332,6 +332,9 @@ describe('Qwen3-ASR mobile assets', () => {
       expect(android).toContain(`public void ${methodName}(PluginCall call)`);
     }
     expect(ios).toContain('CAPPluginMethod(name: "getTtsVoiceQuality", returnType: CAPPluginReturnPromise)');
+    expect(ios).toContain('enum TtsVoiceSelector');
+    expect(ios).toContain('"voiceName": voice.name');
+    expect(ios).toContain('"voiceIdentifier": voice.identifier');
     expect(ios).toContain('AVSpeechSynthesizerDelegate');
     expect(ios).toContain('AVSpeechUtteranceDefaultSpeechRate');
     expect(ios).toContain('utterance.postUtteranceDelay = 0.12');
@@ -2253,6 +2256,54 @@ print("OTA_RECONCILE:PASS")
   await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { timeout: 120000 });
   expect((await runNativeOrThrow(binFile, [root], { timeout: 90000 })).trim()).toBe('OTA_RECONCILE:PASS');
 }, 240_000);
+
+it.skipIf(!swiftCompiler)('executes the actual Swift TtsVoiceSelector priority, Siri/novelty handling, fallback, and locale rules', async () => {
+  await setup();
+  const plugin = await readFile(new URL('../../web/plugins/streaming-speech/ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', import.meta.url), 'utf8');
+  const start = plugin.indexOf('struct TtsVoiceCandidate: Equatable {');
+  const end = plugin.indexOf('/// Pure Foundation/Dispatch session coordinator');
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const voiceSelectorSlice = plugin.slice(start, end);
+  const swiftFile = join(root, 'TtsVoiceSelectorTest.swift');
+  const binFile = join(root, 'tts-voice-selector-test');
+  await writeFile(swiftFile, `import Foundation
+${voiceSelectorSlice}
+func require(_ cond: @autoclosure () -> Bool, _ msg: String) {
+    if !cond() { FileHandle.standardError.write(Data(("FAIL: " + msg + "\\n").utf8)); exit(1) }
+}
+func voice(_ id: String, _ name: String, _ lang: String = "zh-CN", _ q: TtsVoiceCandidate.QualityTier = .standard, novelty: Bool = false) -> TtsVoiceCandidate {
+    TtsVoiceCandidate(identifier: id, name: name, language: lang, quality: q, isNoveltyVoice: novelty)
+}
+let eddy = voice("com.apple.eloquence.zh-CN.Eddy", "Eddy")
+let legacy = voice("com.apple.speech.synthesis.voice.Albert", "Albert")
+let novelty = voice("com.apple.voice.compact.zh-CN.Weird", "Weird", "zh-CN", .standard, novelty: true)
+let genericDefault = voice("com.apple.ttsbundle.custom.zh-CN", "Generic")
+let superCompact = voice("com.apple.voice.super-compact.zh-CN.Tingting", "Tingting")
+let compact = voice("com.apple.voice.compact.zh-CN.Tingting", "Tingting")
+let siriDefault = voice("com.apple.ttsbundle.siri_yu-shu_zh-CN_compact", "Yushu")
+let enhanced = voice("com.apple.voice.enhanced.zh-CN.Tingting", "Tingting (Enhanced)", "zh-CN", .enhanced)
+let siriEnhanced = voice("com.apple.ttsbundle.siri_yu-shu_zh-CN_compact", "Yushu (Enhanced)", "zh-CN", .enhanced)
+let premium = voice("com.apple.voice.premium.zh-CN.Lili", "Lili (Premium)", "zh-CN", .premium)
+
+require(TtsVoiceSelector.selectCandidate(for: "zh-CN", from: [eddy, legacy, novelty, compact]) == compact, "compact must beat eloquence/legacy/novelty")
+require(TtsVoiceSelector.selectCandidate(for: "zh-CN", from: [genericDefault, superCompact, compact]) == compact, "compact must beat super-compact and generic default")
+require(TtsVoiceSelector.selectCandidate(for: "zh-CN", from: [genericDefault, superCompact]) == superCompact, "super-compact must beat generic default")
+require(TtsVoiceSelector.selectCandidate(for: "zh-CN", from: [eddy, compact, siriDefault]) == siriDefault, "Siri neural voice must beat compact and eloquence")
+require(TtsVoiceSelector.selectCandidate(for: "zh-CN", from: [eddy, compact, siriDefault, enhanced]) == enhanced, "enhanced must beat default Siri and compact")
+require(TtsVoiceSelector.selectCandidate(for: "zh-CN", from: [enhanced, siriEnhanced]) == siriEnhanced, "Siri enhanced must beat plain enhanced")
+require(TtsVoiceSelector.selectCandidate(for: "zh-CN", from: [eddy, compact, siriDefault, enhanced, siriEnhanced, premium]) == premium, "premium must beat all tiers")
+require(TtsVoiceSelector.selectCandidate(for: "zh-CN", from: [eddy]) == eddy, "eloquence must still be selected as last fallback")
+require(TtsVoiceSelector.selectCandidate(for: "zh-CN", from: []) == nil, "empty voices returns nil for AVSpeechSynthesisVoice(language:) fallback")
+
+let twEnhanced = voice("com.apple.voice.enhanced.zh-TW.Meijia", "Meijia", "zh-TW", .enhanced)
+require(TtsVoiceSelector.selectCandidate(for: "zh_CN", from: [twEnhanced, compact]) == compact, "exact zh-CN match must beat cross-region zh-TW enhanced")
+require(TtsVoiceSelector.selectCandidate(for: "zh-HK", from: [twEnhanced, compact]) == twEnhanced, "primary subtag fallback picks best zh candidate")
+print("TTS_VOICE_SELECTOR:PASS")
+`);
+  await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { timeout: 120000 });
+  expect((await runNativeOrThrow(binFile, [], { timeout: 30000 })).trim()).toBe('TTS_VOICE_SELECTOR:PASS');
+}, 180_000);
 
 const swiftWindowCases = `
 func check(_ condition: @autoclosure () throws -> Bool, _ message: String) {

@@ -21,6 +21,20 @@ export interface NativeTtsStateEvent {
 export interface NativeTtsVoiceQualityInfo {
   quality: StreamingSpeechTtsVoiceQuality;
   language?: string;
+  voiceName?: string;
+  voiceIdentifier?: string;
+}
+
+export function isSiriNativeVoiceIdentifier(identifier?: string | null): boolean {
+  const lower = identifier?.trim().toLowerCase() ?? '';
+  if (!lower) return false;
+  return lower.includes('.siri') || lower.includes('ttsbundle.siri');
+}
+
+export function isHighQualityNativeTtsVoice(info?: NativeTtsVoiceQualityInfo | null): boolean {
+  if (!info) return false;
+  if (info.quality === 'premium' || info.quality === 'enhanced') return true;
+  return isSiriNativeVoiceIdentifier(info.voiceIdentifier);
 }
 
 export interface NativeSystemTts {

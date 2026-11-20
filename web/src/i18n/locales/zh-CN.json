@@ -2396,7 +2396,12 @@
     "tts_rate": "播报语速",
     "tts_rate_desc": "调节系统内置 TTS 语音朗读倍速。",
     "tts_voice_hint": "IM.codes 会自动优先选用设备本地最高音质的离线系统语音；可在系统辅助功能或文字转语音设置中下载高清/增强语音包以获得更自然的音色。",
-    "tts_ios_enhanced_hint": "当前语言仅检测到系统默认音色，可在 iOS「设置 -> 辅助功能 -> 朗读内容 -> 声音」中下载「增强型 / 优质」语音包以显著提升自然度。"
+    "tts_ios_enhanced_hint": "当前语言仅检测到系统默认音色，可在 iOS「设置 -> 辅助功能 -> 朗读内容 -> 声音」中下载「增强型 / 优质」语音包以显著提升自然度。",
+    "tts_current_voice": "当前音色：{{name}}（{{quality}}）",
+    "tts_quality_premium": "优质",
+    "tts_quality_enhanced": "增强型",
+    "tts_quality_siri": "Siri 语音",
+    "tts_quality_default": "默认"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

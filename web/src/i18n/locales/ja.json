@@ -2395,7 +2395,12 @@
     "tts_rate": "読み上げ速度",
     "tts_rate_desc": "システム音声合成の再生速度を調整します。",
     "tts_voice_hint": "IM.codes は端末内の最も高音質なオフライン音声を優先して使用します。OS のアクセシビリティまたは音声合成設定から拡張音声をダウンロードするとより自然に聞こえます。",
-    "tts_ios_enhanced_hint": "現在は標準 iOS 音声が使用されています。iOS「設定 -> アクセシビリティ -> 読み上げコンテンツ -> 声」から拡張またはプレミアム音声をダウンロードできます。"
+    "tts_ios_enhanced_hint": "現在は標準 iOS 音声が使用されています。iOS「設定 -> アクセシビリティ -> 読み上げコンテンツ -> 声」から拡張またはプレミアム音声をダウンロードできます。",
+    "tts_current_voice": "現在の音声：{{name}}（{{quality}}）",
+    "tts_quality_premium": "プレミアム",
+    "tts_quality_enhanced": "拡張",
+    "tts_quality_siri": "Siri",
+    "tts_quality_default": "標準"
   },
   "capabilities": {
     "eyebrow": "ポータブル AI 機能",

@@ -327,10 +327,36 @@ describe('tts service', () => {
     mocks.streamingPlugin = {
       speak: vi.fn().mockResolvedValue(undefined),
       stopSpeaking: vi.fn().mockResolvedValue(undefined),
-      getTtsVoiceQuality: vi.fn().mockResolvedValue({ quality: 'enhanced', language: 'zh-CN' }),
+      getTtsVoiceQuality: vi.fn().mockResolvedValue({
+        quality: 'enhanced',
+        language: 'zh-CN',
+        voiceName: 'Tingting (Enhanced)',
+        voiceIdentifier: 'com.apple.voice.enhanced.zh-CN.Tingting',
+      }),
     };
     const nativeTts = await import('../src/tts.js');
-    expect(await nativeTts.getNativeTtsVoiceQuality('zh-CN')).toEqual({ quality: 'enhanced', language: 'zh-CN' });
+    expect(await nativeTts.getNativeTtsVoiceQuality('zh-CN')).toEqual({
+      quality: 'enhanced',
+      language: 'zh-CN',
+      voiceName: 'Tingting (Enhanced)',
+      voiceIdentifier: 'com.apple.voice.enhanced.zh-CN.Tingting',
+    });
+
+    const backend = await import('../src/voice-recognition-backend.js');
+    expect(backend.isSiriNativeVoiceIdentifier('com.apple.ttsbundle.siri_yu-shu_zh-CN_compact')).toBe(true);
+    expect(backend.isSiriNativeVoiceIdentifier('com.apple.voice.compact.zh-CN.Tingting')).toBe(false);
+    expect(backend.isHighQualityNativeTtsVoice({ quality: 'premium', language: 'zh-CN' })).toBe(true);
+    expect(backend.isHighQualityNativeTtsVoice({ quality: 'enhanced', language: 'zh-CN' })).toBe(true);
+    expect(backend.isHighQualityNativeTtsVoice({
+      quality: 'default',
+      language: 'zh-CN',
+      voiceIdentifier: 'com.apple.ttsbundle.siri_yu-shu_zh-CN_compact',
+    })).toBe(true);
+    expect(backend.isHighQualityNativeTtsVoice({
+      quality: 'default',
+      language: 'zh-CN',
+      voiceIdentifier: 'com.apple.voice.compact.zh-CN.Tingting',
+    })).toBe(false);
   });
 
   it('queues auto-read items FIFO on web/native, caps queue size, and clears on manual interrupt or stop', async () => {

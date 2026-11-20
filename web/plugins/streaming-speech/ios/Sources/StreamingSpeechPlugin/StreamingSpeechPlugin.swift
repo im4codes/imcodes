@@ -6,6 +6,105 @@ import MLXCommon
 import Qwen3ASR
 import UIKit
 
+// MARK: - System TTS Voice Selection
+
+struct TtsVoiceCandidate: Equatable {
+    enum QualityTier: Int, Comparable {
+        case standard = 0
+        case enhanced = 1
+        case premium = 2
+
+        static func < (lhs: QualityTier, rhs: QualityTier) -> Bool {
+            lhs.rawValue < rhs.rawValue
+        }
+    }
+
+    let identifier: String
+    let name: String
+    let language: String
+    let quality: QualityTier
+    let isNoveltyVoice: Bool
+}
+
+enum TtsVoiceSelector {
+    static func normalizeBcp47LanguageTag(_ lang: String?) -> String? {
+        guard let raw = lang?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        return raw.replacingOccurrences(of: "_", with: "-")
+    }
+
+    static func isSiriVoiceIdentifier(_ identifier: String) -> Bool {
+        let lower = identifier.lowercased()
+        return lower.contains(".siri") || lower.contains("ttsbundle.siri")
+    }
+
+    static func isMechanicalOrNovelty(_ candidate: TtsVoiceCandidate) -> Bool {
+        if candidate.isNoveltyVoice {
+            return true
+        }
+        let lower = candidate.identifier.lowercased()
+        return lower.contains("com.apple.eloquence.")
+            || lower.contains("com.apple.speech.synthesis.voice.")
+    }
+
+    static func score(_ candidate: TtsVoiceCandidate) -> Int {
+        if isMechanicalOrNovelty(candidate) {
+            return candidate.quality.rawValue
+        }
+        let lower = candidate.identifier.lowercased()
+        let isSiri = isSiriVoiceIdentifier(lower)
+        let isPremium = candidate.quality == .premium
+            || lower.contains(".premium.")
+            || lower.hasSuffix(".premium")
+        if isPremium {
+            return 600 + (isSiri ? 10 : 0)
+        }
+        let isEnhanced = candidate.quality == .enhanced
+            || lower.contains(".enhanced.")
+            || lower.hasSuffix(".enhanced")
+        if isEnhanced {
+            return 500 + (isSiri ? 10 : 0)
+        }
+        if isSiri {
+            return 450
+        }
+        if lower.contains("super-compact") {
+            return 200
+        }
+        if lower.contains(".compact") || lower.contains("-compact") || lower.contains("_compact") {
+            return 300
+        }
+        return 100
+    }
+
+    static func selectIndex(for lang: String?, from candidates: [TtsVoiceCandidate]) -> Int? {
+        guard let normalized = normalizeBcp47LanguageTag(lang) else {
+            return nil
+        }
+        let lower = normalized.lowercased()
+        let exactIndices = candidates.indices.filter { candidates[$0].language.lowercased() == lower }
+        if let bestExact = exactIndices.max(by: { score(candidates[$0]) < score(candidates[$1]) }) {
+            return bestExact
+        }
+        let primarySubtag = lower.split(separator: "-").first.map(String.init) ?? lower
+        let primaryIndices = candidates.indices.filter {
+            candidates[$0].language.lowercased().split(separator: "-").first.map(String.init) == primarySubtag
+        }
+        if let bestPrimary = primaryIndices.max(by: { score(candidates[$0]) < score(candidates[$1]) }) {
+            return bestPrimary
+        }
+        return nil
+    }
+
+    static func selectCandidate(for lang: String?, from candidates: [TtsVoiceCandidate]) -> TtsVoiceCandidate? {
+        guard let index = selectIndex(for: lang, from: candidates) else {
+            return nil
+        }
+        return candidates[index]
+    }
+}
+
 /// Pure Foundation/Dispatch session coordinator managing capture ownership, foreground Metal
 /// gating, serial inbox draining, and lossless background/stop error reporting.
 final class SpeechCoordinator {
@@ -1200,10 +1299,31 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
     }
 
     static func normalizeBcp47LanguageTag(_ lang: String?) -> String? {
-        guard let raw = lang?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-            return nil
+        TtsVoiceSelector.normalizeBcp47LanguageTag(lang)
+    }
+
+    private static func makeVoiceCandidate(_ voice: AVSpeechSynthesisVoice) -> TtsVoiceCandidate {
+        let tier: TtsVoiceCandidate.QualityTier
+        if #available(iOS 16.0, macOS 13.0, *), voice.quality == .premium {
+            tier = .premium
+        } else if voice.quality == .enhanced {
+            tier = .enhanced
+        } else {
+            tier = .standard
         }
-        return raw.replacingOccurrences(of: "_", with: "-")
+        let isNovelty: Bool
+        if #available(iOS 17.0, macOS 14.0, *) {
+            isNovelty = voice.voiceTraits.contains(.isNoveltyVoice)
+        } else {
+            isNovelty = false
+        }
+        return TtsVoiceCandidate(
+            identifier: voice.identifier,
+            name: voice.name,
+            language: voice.language,
+            quality: tier,
+            isNoveltyVoice: isNovelty
+        )
     }
 
     static func selectTtsVoice(
@@ -1213,17 +1333,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         guard let normalized = normalizeBcp47LanguageTag(lang) else {
             return nil
         }
-        let lower = normalized.lowercased()
-        let exactMatches = voices.filter { $0.language.lowercased() == lower }
-        if let bestExact = exactMatches.max(by: { $0.quality.rawValue < $1.quality.rawValue }) {
-            return bestExact
-        }
-        let primarySubtag = lower.split(separator: "-").first.map(String.init) ?? lower
-        let primaryMatches = voices.filter {
-            $0.language.lowercased().split(separator: "-").first.map(String.init) == primarySubtag
-        }
-        if let bestPrimary = primaryMatches.max(by: { $0.quality.rawValue < $1.quality.rawValue }) {
-            return bestPrimary
+        let candidates = voices.map(makeVoiceCandidate)
+        if let index = TtsVoiceSelector.selectIndex(for: normalized, from: candidates) {
+            return voices[index]
         }
         return AVSpeechSynthesisVoice(language: normalized)
     }
@@ -1379,7 +1491,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         }
         call.resolve([
             "quality": Self.ttsVoiceQualityLabel(voice.quality),
-            "language": voice.language
+            "language": voice.language,
+            "voiceName": voice.name,
+            "voiceIdentifier": voice.identifier,
         ])
     }
 

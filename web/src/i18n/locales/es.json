@@ -2396,7 +2396,12 @@
     "tts_rate": "Velocidad de voz",
     "tts_rate_desc": "Multiplicador de velocidad para la síntesis de voz del sistema.",
     "tts_voice_hint": "IM.codes prioriza la voz sin conexión de mayor calidad instalada en tu dispositivo. Puedes descargar voces mejoradas o neuronales en los ajustes de accesibilidad o TTS del sistema.",
-    "tts_ios_enhanced_hint": "Actualmente usas una voz estándar de iOS. Para mayor naturalidad, descarga una voz mejorada o prémium en Ajustes -> Accesibilidad -> Contenido leído -> Voces."
+    "tts_ios_enhanced_hint": "Actualmente usas una voz estándar de iOS. Para mayor naturalidad, descarga una voz mejorada o prémium en Ajustes -> Accesibilidad -> Contenido leído -> Voces.",
+    "tts_current_voice": "Voz actual: {{name}} ({{quality}})",
+    "tts_quality_premium": "Prémium",
+    "tts_quality_enhanced": "Mejorada",
+    "tts_quality_siri": "Siri",
+    "tts_quality_default": "Estándar"
   },
   "capabilities": {
     "eyebrow": "Capacidades de IA portátiles",

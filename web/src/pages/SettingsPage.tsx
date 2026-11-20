@@ -54,7 +54,9 @@ import {
   TTS_RATE_OPTIONS,
 } from '../tts.js';
 import {
+  isHighQualityNativeTtsVoice,
   isIosNativePlatform,
+  isSiriNativeVoiceIdentifier,
   type NativeTtsVoiceQualityInfo,
 } from '../voice-recognition-backend.js';
 
@@ -772,11 +774,29 @@ export function SettingsPage({
                     }}
                   >
                     <div>{t('settings.tts_voice_hint')}</div>
+                    {isIosNativePlatform() && nativeVoiceQuality?.voiceName?.trim() && (() => {
+                      const voiceName = nativeVoiceQuality.voiceName.trim();
+                      const qualityLabel = nativeVoiceQuality.quality === 'premium'
+                        ? t('settings.tts_quality_premium')
+                        : nativeVoiceQuality.quality === 'enhanced'
+                          ? t('settings.tts_quality_enhanced')
+                          : isSiriNativeVoiceIdentifier(nativeVoiceQuality.voiceIdentifier)
+                            ? t('settings.tts_quality_siri')
+                            : nativeVoiceQuality.quality === 'default'
+                              ? t('settings.tts_quality_default')
+                              : '';
+                      return (
+                        <div data-testid="settings-tts-current-voice" style={{ marginTop: 4, color: '#cbd5e1' }}>
+                          {qualityLabel
+                            ? t('settings.tts_current_voice', { name: voiceName, quality: qualityLabel })
+                            : voiceName}
+                        </div>
+                      );
+                    })()}
                     {isIosNativePlatform()
                       && nativeVoiceQuality
-                      && nativeVoiceQuality.quality !== 'premium'
-                      && nativeVoiceQuality.quality !== 'enhanced' && (
-                        <div style={{ marginTop: 4, color: '#cbd5e1' }}>
+                      && !isHighQualityNativeTtsVoice(nativeVoiceQuality) && (
+                        <div data-testid="settings-tts-ios-enhanced-hint" style={{ marginTop: 4, color: '#cbd5e1' }}>
                           {t('settings.tts_ios_enhanced_hint')}
                         </div>
                     )}
