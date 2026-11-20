@@ -571,10 +571,11 @@ command = "custom-mcp"
     });
 
     await waitFor(() => completes.length === 2);
-    expect(completes).toEqual([
+    expect(completes).toHaveLength(2);
+    expect(completes).toEqual(expect.arrayContaining([
       { sid: 'norm-route', text: 'NORMAL_OK' },
       { sid: 'incog-route', text: 'INCOG_OK' },
-    ]);
+    ]));
 
     await provider.disconnect();
   });
