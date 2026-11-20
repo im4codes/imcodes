@@ -11,6 +11,8 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
+import { WebSocket } from 'ws';
 
 const { verifyRegistrationResponseMock, verifyAuthenticationResponseMock } = vi.hoisted(() => ({
   verifyRegistrationResponseMock: vi.fn(),
@@ -24,7 +26,7 @@ vi.mock('@simplewebauthn/server', () => ({
   verifyAuthenticationResponse: verifyAuthenticationResponseMock,
 }));
 
-import { buildApp } from '../src/index.js';
+import { buildApp, setupWebSocketUpgrade } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { signJwt, sha256Hex, randomHex, hashPassword } from '../src/security/crypto.js';
@@ -35,6 +37,7 @@ import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '../../shared/cookie-na
 import { SERVER_ID_HEADER } from '../../shared/http-header-names.js';
 import { DAEMON_TOKEN_ROUTE_NOT_ALLOWED } from '../../shared/daemon-token-routes.js';
 import { NODE_ROLE, NODE_ROLE_REFUSAL } from '../../shared/remote-exec.js';
+import { GLOBAL_TASK_TICKET_PATH, GLOBAL_TASK_WS_PATH } from '../../shared/global-task-mode.js';
 
 interface MemUser {
   id: string;
@@ -123,44 +126,48 @@ function createHardeningDb() {
   }
 
   const norm = (sql: string) => sql.toLowerCase().replace(/\s+/g, ' ').trim();
+  const sqlLog: Array<{ sql: string; inTx: boolean }> = [];
 
-  const db = {
-    queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
-      const s = norm(sql);
-      if (beforeTxSqlHook) await beforeTxSqlHook(s);
-      checkInjectedFailure(s);
-      if (s.includes('select status, sessions_valid_after from users where id = $1')) {
-        const u = users.get(String(params[0]));
-        return u ? ({ status: u.status, sessions_valid_after: u.sessions_valid_after } as T) : null;
-      }
-      if (s.includes('select sessions_valid_after from users where id = $1')) {
-        const u = users.get(String(params[0]));
-        return u ? ({ sessions_valid_after: u.sessions_valid_after } as T) : null;
-      }
-      if (s.includes('from users where id = $1')) {
-        return (users.get(String(params[0])) ?? null) as T | null;
-      }
-      if (s.includes('from users where username = $1')) {
-        for (const u of users.values()) if (u.username === params[0]) return u as T;
-        return null;
-      }
-      if (s.includes('where id = $1 or lower(username) = lower($1)')) {
-        const key = String(params[0]);
-        const byId = users.get(key);
-        if (byId) return byId as T;
-        for (const u of users.values()) if (u.username?.toLowerCase() === key.toLowerCase()) return u as T;
-        return null;
-      }
-      if (s.includes('from settings where key = $1')) {
-        const val = settings.get(String(params[0]));
-        return val !== undefined ? ({ value: val } as T) : null;
-      }
-      if (s.includes('from platform_identities pi join users u')) {
-        const key = `${String(params[0])}:${String(params[1])}`;
-        const pi = platformIdentities.get(key);
-        const u = pi ? users.get(pi.user_id) : undefined;
-        return u ? (u as T) : null;
-      }
+  function makeRunner(inTx: boolean): Database {
+    const runner = {
+      queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+        const s = norm(sql);
+        sqlLog.push({ sql: s, inTx });
+        if (beforeTxSqlHook) await beforeTxSqlHook(s);
+        checkInjectedFailure(s);
+        if (s.includes('select status, sessions_valid_after from users where id = $1')) {
+          const u = users.get(String(params[0]));
+          return u ? ({ status: u.status, sessions_valid_after: u.sessions_valid_after } as T) : null;
+        }
+        if (s.includes('select sessions_valid_after from users where id = $1')) {
+          const u = users.get(String(params[0]));
+          return u ? ({ sessions_valid_after: u.sessions_valid_after } as T) : null;
+        }
+        if (s.includes('from users where id = $1')) {
+          const u = users.get(String(params[0]));
+          return (u ? { ...u } : null) as T | null;
+        }
+        if (s.includes('from users where username = $1')) {
+          for (const u of users.values()) if (u.username === params[0]) return { ...u } as T;
+          return null;
+        }
+        if (s.includes('where id = $1 or lower(username) = lower($1)')) {
+          const key = String(params[0]);
+          const byId = users.get(key);
+          if (byId) return { ...byId } as T;
+          for (const u of users.values()) if (u.username?.toLowerCase() === key.toLowerCase()) return { ...u } as T;
+          return null;
+        }
+        if (s.includes('from settings where key = $1')) {
+          const val = settings.get(String(params[0]));
+          return val !== undefined ? ({ value: val } as T) : null;
+        }
+        if (s.includes('from platform_identities pi join users u')) {
+          const key = `${String(params[0])}:${String(params[1])}`;
+          const pi = platformIdentities.get(key);
+          const u = pi ? users.get(pi.user_id) : undefined;
+          return u ? ({ ...u } as T) : null;
+        }
       if (s.includes('from api_keys') && s.includes('where key_hash = $1')) {
         for (const k of apiKeys.values()) {
           if (k.key_hash === params[0] && !k.revoked_at) {
@@ -217,6 +224,13 @@ function createHardeningDb() {
       if (s.includes('from passkey_credentials where id = $1')) {
         const row = passkeyCreds.get(String(params[0]));
         return (row ? { ...row } : null) as T | null;
+      }
+      if (s.includes('delete from auth_nonces where nonce = $1 and user_id = $2 and expires_at > $3 and key_id = $4') && s.includes('returning')) {
+        const key = String(params[0]);
+        const row = authNonces.get(key);
+        if (!row || row.user_id !== String(params[1]) || row.expires_at <= Number(params[2]) || row.key_id !== String(params[3])) return null;
+        authNonces.delete(key);
+        return { user_id: row.user_id } as T;
       }
       if (s.includes('delete from auth_nonces where nonce = $1 and expires_at > $2') && s.includes('returning')) {
         const key = String(params[0]);
@@ -305,6 +319,7 @@ function createHardeningDb() {
     query: async <T = unknown>() => [] as T[],
     execute: async (sql: string, params: unknown[] = []): Promise<{ changes: number }> => {
       const s = norm(sql);
+      sqlLog.push({ sql: s, inTx });
       if (beforeTxSqlHook) await beforeTxSqlHook(s);
       checkInjectedFailure(s);
       if (s.startsWith('insert into users')) {
@@ -481,16 +496,21 @@ function createHardeningDb() {
     transaction: async <T>(fn: (tx: Database) => Promise<T>): Promise<T> => withUserLock('global-tx', async () => {
       const snap = snapshotMaps();
       try {
-        return await fn(db);
+        return await fn(makeRunner(true));
       } catch (err) {
         restoreMaps(snap);
         throw err;
       }
     }),
-  } as unknown as Database;
+  };
+    return runner as unknown as Database;
+  }
+
+  const db = makeRunner(false);
 
   return {
     db,
+    sqlLog,
     users,
     settings,
     apiKeys,
@@ -1289,34 +1309,32 @@ describe('security hardening (tsk_3b375f8d07)', () => {
     expect(store.refreshTokens.get('rt-il-1')?.used_at).not.toBeNull();
   });
 
-  it('P0-2c: in-flight /password/login verifying an old password aborts with 401 when password changes before lock', async () => {
+  it('P0-2c: in-flight /password/login verifying an old password aborts with 401 when password changes between verify and FOR UPDATE lock', async () => {
     const store = createHardeningDb();
     const env = makeEnv(store.db);
     const app = buildApp(env);
     const oldHash = await hashPassword('OldLoginPass1!');
+    const newHash = await hashPassword('BrandNewPass2!');
     store.users.set('u-login-race', {
       id: 'u-login-race', username: 'loginrace', display_name: 'LR', password_hash: oldHash, password_must_change: false,
       is_admin: false, status: 'active', sessions_valid_after: 0, created_at: Date.now(),
     });
-    const bearerJwt = signJwt({ sub: 'u-login-race', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
 
-    let sawUsernameLookup = false;
-    let changedDuringVerify = false;
+    let sawUsernameRead = false;
+    let verifyThenLockHookHit = false;
     store.setBeforeSqlHook(async (s) => {
       if (s.includes('from users where username = $1')) {
-        sawUsernameLookup = true;
+        sawUsernameRead = true;
         return;
       }
-      // Runs AFTER getUserByUsername has already read oldHash (on user: lockout check before verifyPassword & FOR UPDATE tx).
-      if (sawUsernameLookup && !changedDuringVerify && s.includes('from auth_lockout') && store.users.get('u-login-race')?.password_hash === oldHash) {
-        changedDuringVerify = true;
+      // Fires AFTER getUserByUsername read oldHash and verifyPassword passed, right before FOR UPDATE returns lockedUser.
+      if (sawUsernameRead && !verifyThenLockHookHit && s.includes('from users where id = $1 for update')) {
+        verifyThenLockHookHit = true;
         store.setBeforeSqlHook(null);
-        const pwRes = await app.request('/api/auth/password/change', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${bearerJwt}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ oldPassword: 'OldLoginPass1!', newPassword: 'BrandNewPass2!' }),
-        });
-        expect(pwRes.status).toBe(200);
+        const committed = store.users.get('u-login-race')!;
+        committed.password_hash = newHash;
+        committed.password_must_change = false;
+        committed.sessions_valid_after = Date.now() + 1;
       }
     });
 
@@ -1325,8 +1343,8 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: 'loginrace', password: 'OldLoginPass1!', native: true }),
     });
-    expect(sawUsernameLookup).toBe(true);
-    expect(changedDuringVerify).toBe(true);
+    expect(sawUsernameRead).toBe(true);
+    expect(verifyThenLockHookHit).toBe(true);
     expect(loginRes.status).toBe(401);
     expect(store.refreshTokens.size).toBe(0);
     expect(store.apiKeys.size).toBe(0);
@@ -1413,6 +1431,164 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(freshCookie)}` },
     });
     expect(freshMe.status).toBe(200);
+  });
+
+  it('P0-2e: /api/global-tasks/ws-ticket aligns epoch with sessions_valid_after, preserves 15s TTL, rejects old tickets after password change or disable/approve, and immediately accepts new-session tickets', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const t0 = new Date('2026-11-20T12:00:00.200Z').getTime();
+    vi.setSystemTime(t0);
+
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const pwHash = await hashPassword('StartPass1!');
+    store.users.set('u-admin-ws', {
+      id: 'u-admin-ws', username: 'adminws', display_name: 'AdminWS', password_hash: null, password_must_change: false,
+      is_admin: true, status: 'active', sessions_valid_after: 0, created_at: t0,
+    });
+    store.users.set('u-ws', {
+      id: 'u-ws', username: 'wsuser', display_name: 'WSUser', password_hash: pwHash, password_must_change: false,
+      is_admin: false, status: 'active', sessions_valid_after: 0, created_at: t0,
+    });
+    const adminJwt = signJwt({ sub: 'u-admin-ws', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
+    const initialJwt = signJwt({ sub: 'u-ws', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
+
+    const app = buildApp(env);
+    const httpServer = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 }) as unknown as import('node:http').Server;
+    setupWebSocketUpgrade(httpServer, env);
+    if (!httpServer.listening) {
+      await new Promise<void>((resolve) => httpServer.once('listening', resolve));
+    }
+
+    const connectWsStatus = async (ticket: string): Promise<'open' | number> => {
+      const addr = httpServer.address() as { port: number };
+      return new Promise<'open' | number>((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${addr.port}${GLOBAL_TASK_WS_PATH}?ticket=${encodeURIComponent(ticket)}`, {
+          origin: 'https://app.im.codes',
+        });
+        ws.on('open', () => {
+          ws.close();
+          resolve('open');
+        });
+        ws.on('unexpected-response', (_req, res) => {
+          ws.terminate();
+          resolve(res.statusCode ?? 0);
+        });
+        ws.on('error', () => {});
+      });
+    };
+
+    try {
+      const addr = httpServer.address() as { port: number };
+      const baseHttp = `http://127.0.0.1:${addr.port}`;
+
+      // 1. Issue ticket before password change
+      const oldTicketRes = await fetch(`${baseHttp}${GLOBAL_TASK_TICKET_PATH}`, {
+        method: 'POST',
+        headers: {
+          Cookie: `${COOKIE_SESSION}=${encodeURIComponent(initialJwt)}; ${COOKIE_CSRF}=csrf1`,
+          [HEADER_CSRF]: 'csrf1',
+          Origin: 'https://app.im.codes',
+        },
+      });
+      expect(oldTicketRes.status).toBe(200);
+      const { ticket: oldTicket } = await oldTicketRes.json() as { ticket: string };
+
+      // 2. Password change in same second -> rotated session cookie
+      vi.setSystemTime(t0 + 50);
+      const chRes = await fetch(`${baseHttp}/api/auth/password/change`, {
+        method: 'POST',
+        headers: {
+          Cookie: `${COOKIE_SESSION}=${encodeURIComponent(initialJwt)}; ${COOKIE_CSRF}=csrf1`,
+          [HEADER_CSRF]: 'csrf1',
+          Origin: 'https://app.im.codes',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ oldPassword: 'StartPass1!', newPassword: 'RotatedPass2!' }),
+      });
+      expect(chRes.status).toBe(200);
+      const rotatedCookie = decodeURIComponent((chRes.headers.get('set-cookie') ?? '').match(/rcc_session=([^;]+)/)![1]);
+
+      // Old pre-change WS ticket MUST fail with 401
+      expect(await connectWsStatus(oldTicket)).toBe(401);
+
+      // 3. Same second (+100ms): rotated cookie mints a fresh WS ticket whose TTL is 15s and WS upgrade succeeds immediately
+      vi.setSystemTime(t0 + 100);
+      const rotatedTicketRes = await fetch(`${baseHttp}${GLOBAL_TASK_TICKET_PATH}`, {
+        method: 'POST',
+        headers: {
+          Cookie: `${COOKIE_SESSION}=${encodeURIComponent(rotatedCookie)}; ${COOKIE_CSRF}=csrf1`,
+          [HEADER_CSRF]: 'csrf1',
+          Origin: 'https://app.im.codes',
+        },
+      });
+      expect(rotatedTicketRes.status).toBe(200);
+      const { ticket: rotatedTicket } = await rotatedTicketRes.json() as { ticket: string };
+      const rotatedTicketPayload = JSON.parse(Buffer.from(rotatedTicket.split('.')[1], 'base64url').toString('utf8')) as { exp: number };
+      expect(rotatedTicketPayload.exp - Math.floor((t0 + 100) / 1000)).toBe(15);
+      expect(await connectWsStatus(rotatedTicket)).toBe('open');
+
+      // 4. Issue another ticket, then admin disables & re-enables in the same second: pre-disable ticket MUST fail (401)
+      vi.setSystemTime(t0 + 150);
+      const preDisableTicketRes = await fetch(`${baseHttp}${GLOBAL_TASK_TICKET_PATH}`, {
+        method: 'POST',
+        headers: {
+          Cookie: `${COOKIE_SESSION}=${encodeURIComponent(rotatedCookie)}; ${COOKIE_CSRF}=csrf1`,
+          [HEADER_CSRF]: 'csrf1',
+          Origin: 'https://app.im.codes',
+        },
+      });
+      expect(preDisableTicketRes.status).toBe(200);
+      const { ticket: preDisableTicket } = await preDisableTicketRes.json() as { ticket: string };
+
+      vi.setSystemTime(t0 + 200);
+      expect((await fetch(`${baseHttp}/api/admin/users/u-ws/disable`, {
+        method: 'POST',
+        headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(adminJwt)}; ${COOKIE_CSRF}=csrfA`, [HEADER_CSRF]: 'csrfA', Origin: 'https://app.im.codes' },
+      })).status).toBe(200);
+      vi.setSystemTime(t0 + 250);
+      expect((await fetch(`${baseHttp}/api/admin/users/u-ws/approve`, {
+        method: 'POST',
+        headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(adminJwt)}; ${COOKIE_CSRF}=csrfA`, [HEADER_CSRF]: 'csrfA', Origin: 'https://app.im.codes' },
+      })).status).toBe(200);
+
+      expect(await connectWsStatus(preDisableTicket)).toBe(401);
+
+      // 5. Fresh login in the same second -> mints valid WS ticket + connects WS immediately; expires after 15s TTL
+      vi.setSystemTime(t0 + 300);
+      const freshLoginRes = await fetch(`${baseHttp}/api/auth/password/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'wsuser', password: 'RotatedPass2!' }),
+      });
+      expect(freshLoginRes.status).toBe(200);
+      const freshCookie = decodeURIComponent((freshLoginRes.headers.get('set-cookie') ?? '').match(/rcc_session=([^;]+)/)![1]);
+
+      const freshTicketRes = await fetch(`${baseHttp}${GLOBAL_TASK_TICKET_PATH}`, {
+        method: 'POST',
+        headers: {
+          Cookie: `${COOKIE_SESSION}=${encodeURIComponent(freshCookie)}; ${COOKIE_CSRF}=csrfF`,
+          [HEADER_CSRF]: 'csrfF',
+          Origin: 'https://app.im.codes',
+        },
+      });
+      expect(freshTicketRes.status).toBe(200);
+      const { ticket: freshTicket } = await freshTicketRes.json() as { ticket: string };
+      expect(await connectWsStatus(freshTicket)).toBe('open');
+
+      const expiredTicketRes = await fetch(`${baseHttp}${GLOBAL_TASK_TICKET_PATH}`, {
+        method: 'POST',
+        headers: {
+          Cookie: `${COOKIE_SESSION}=${encodeURIComponent(freshCookie)}; ${COOKIE_CSRF}=csrfF`,
+          [HEADER_CSRF]: 'csrfF',
+          Origin: 'https://app.im.codes',
+        },
+      });
+      const { ticket: ttlTicket } = await expiredTicketRes.json() as { ticket: string };
+      vi.setSystemTime(t0 + 300 + 16_000);
+      expect(await connectWsStatus(ttlTicket)).toBe(401);
+    } finally {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
   });
 
   it('P0-3a: /refresh returns 429 under user lockout without consuming the refresh token, then succeeds after lockout clears', async () => {
@@ -1780,5 +1956,73 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       headers: { host: 'hk.im.codes' },
     });
     expect(expiredRes.status).toBe(401);
+  });
+
+  it('P0-4d: OAuth relay issuance and redemption follow users -> auth_nonces lock order, keep global cleanup outside user tx, and serialize with disable/replay', async () => {
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === 'https://github.com/login/oauth/access_token') {
+        return new Response(JSON.stringify({ access_token: 'gh-tok' }), { status: 200 });
+      }
+      if (url === 'https://api.github.com/user') {
+        return new Response(JSON.stringify({ id: 882001, login: 'lockorder' }), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    // 1. Relay issuance: global cleanup runs outside tx, and inside tx `users FOR UPDATE` precedes `INSERT INTO auth_nonces`
+    store.sqlLog.length = 0;
+    const state1 = signJwt({ nonce: 'st-lo-1', origin: 'https://hk.im.codes', provider: 'github' }, env.JWT_SIGNING_KEY, 300);
+    const emitRes = await app.request(`https://app.im.codes/api/auth/github/callback?code=c-lo-1&state=${encodeURIComponent(state1)}`, {
+      headers: { host: 'app.im.codes', cookie: 'oauth_state=st-lo-1' },
+    });
+    expect(emitRes.status).toBe(302);
+    const relayToken = new URL(emitRes.headers.get('location')!).searchParams.get('relay_token')!;
+
+    const cleanupIdx = store.sqlLog.findIndex((e) => e.sql.includes('delete from auth_nonces where key_id = $1 and expires_at < $2'));
+    const issueLockIdx = store.sqlLog.findIndex((e) => e.inTx && e.sql.includes('select status, sessions_valid_after from users where id = $1 for update'));
+    const issueInsertIdx = store.sqlLog.findIndex((e) => e.inTx && e.sql.includes('insert into auth_nonces'));
+    expect(cleanupIdx).toBeGreaterThanOrEqual(0);
+    expect(store.sqlLog[cleanupIdx]!.inTx).toBe(false);
+    expect(issueLockIdx).toBeGreaterThanOrEqual(0);
+    expect(issueInsertIdx).toBeGreaterThan(issueLockIdx);
+
+    // 2. Concurrent redemption of the same relay_token: only one succeeds and lock order inside tx is users FOR UPDATE -> DELETE auth_nonces -> INSERT refresh_tokens
+    store.sqlLog.length = 0;
+    const [red1, red2] = await Promise.all([
+      app.request(`https://hk.im.codes/api/auth/github/callback?relay_token=${encodeURIComponent(relayToken)}`, { headers: { host: 'hk.im.codes' } }),
+      app.request(`https://hk.im.codes/api/auth/github/callback?relay_token=${encodeURIComponent(relayToken)}`, { headers: { host: 'hk.im.codes' } }),
+    ]);
+    expect([red1.status, red2.status].sort()).toEqual([302, 401]);
+    expect(store.refreshTokens.size).toBe(1);
+
+    const redeemLockIdx = store.sqlLog.findIndex((e) => e.inTx && e.sql.includes('select status, sessions_valid_after from users where id = $1 for update'));
+    const redeemDelIdx = store.sqlLog.findIndex((e) => e.inTx && e.sql.includes('delete from auth_nonces where nonce = $1 and user_id = $2'));
+    const redeemRtIdx = store.sqlLog.findIndex((e) => e.inTx && e.sql.includes('insert into refresh_tokens'));
+    expect(redeemLockIdx).toBeGreaterThanOrEqual(0);
+    expect(redeemDelIdx).toBeGreaterThan(redeemLockIdx);
+    expect(redeemRtIdx).toBeGreaterThan(redeemDelIdx);
+
+    // 3. If user is disabled just before lock during issuance, no auth_nonces row is written and 403 is returned
+    const issuedNonceCountBefore = store.authNonces.size;
+    let disabledBeforeIssueLock = false;
+    store.setBeforeSqlHook(async (s) => {
+      if (!disabledBeforeIssueLock && s.includes('select status, sessions_valid_after from users where id = $1 for update')) {
+        disabledBeforeIssueLock = true;
+        store.setBeforeSqlHook(null);
+        for (const u of store.users.values()) u.status = 'disabled';
+      }
+    });
+    const state2 = signJwt({ nonce: 'st-lo-2', origin: 'https://hk.im.codes', provider: 'github' }, env.JWT_SIGNING_KEY, 300);
+    const blockedEmit = await app.request(`https://app.im.codes/api/auth/github/callback?code=c-lo-2&state=${encodeURIComponent(state2)}`, {
+      headers: { host: 'app.im.codes', cookie: 'oauth_state=st-lo-2' },
+    });
+    expect(disabledBeforeIssueLock).toBe(true);
+    expect(blockedEmit.status).toBe(403);
+    expect(store.authNonces.size).toBe(issuedNonceCountBefore);
   });
 });

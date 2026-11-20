@@ -6,7 +6,7 @@ import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import type { Env } from '../env.js';
 import { createUser, getSetting, getUserByPlatformId, updateUserStatus, upsertPlatformIdentity, withTransaction } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
-import { alignedSessionIssuedAt, evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
+import { alignedSessionIssuedAt, evaluateUserAccess } from '../security/user-status.js';
 import logger from '../util/logger.js';
 
 export type PrimaryOAuthProvider = 'github' | 'google';
@@ -145,14 +145,7 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
         : null;
 
       const relayResult = await withTransaction(c.env.DB, async (tx) => {
-        const txNow = Date.now();
-        const consumedNonce = await tx.queryOne<{ user_id: string }>(
-          'DELETE FROM auth_nonces WHERE nonce = $1 AND expires_at > $2 AND key_id = $3 RETURNING user_id',
-          [relayNonce, txNow, OAUTH_RELAY_KEY_ID],
-        );
-        if (!consumedNonce || consumedNonce.user_id !== payload.sub) {
-          return { ok: false as const, status: 401 as const, error: 'relay_token_replayed' };
-        }
+        // Acquire users row lock BEFORE touching auth_nonces so lock order matches disableUserEndingSessions.
         const lockedUser = await tx.queryOne<{ status: string; sessions_valid_after: string | number }>(
           'SELECT status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
           [payload.sub],
@@ -163,6 +156,14 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
         const relayDecision = evaluateUserAccess(access);
         if (!relayDecision.ok) {
           return { ok: false as const, status: 403 as const, error: relayDecision.code };
+        }
+        const txNow = Date.now();
+        const consumedNonce = await tx.queryOne<{ user_id: string }>(
+          'DELETE FROM auth_nonces WHERE nonce = $1 AND user_id = $2 AND expires_at > $3 AND key_id = $4 RETURNING user_id',
+          [relayNonce, payload.sub, txNow, OAUTH_RELAY_KEY_ID],
+        );
+        if (!consumedNonce) {
+          return { ok: false as const, status: 401 as const, error: 'relay_token_replayed' };
         }
         await tx.execute(
           'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
@@ -245,36 +246,48 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
       }
       userId = user.id;
 
-      const loginAccess = await loadUserAccess(c.env.DB, userId);
-      const loginDecision = evaluateUserAccess(loginAccess);
-      if (!loginDecision.ok) return c.json({ error: loginDecision.code }, 403);
-
       if (isCrossDomain && targetOrigin) {
         const jti = randomHex(16);
-        const now = Date.now();
-        const issuedSec = Math.floor(now / 1000);
-        const relayExpSec = issuedSec + 120;
         const relayNonce = `${OAUTH_RELAY_KEY_ID}:${jti}`;
-        // Cover the full verifyJwt validity window of the signed exp claim even if the transaction crosses a second boundary.
-        const nonceExpiresAt = (relayExpSec + 1) * 1000;
-        await withTransaction(c.env.DB, async (tx) => {
-          await tx.execute(
-            'DELETE FROM auth_nonces WHERE key_id = $1 AND expires_at < $2',
-            [OAUTH_RELAY_KEY_ID, now],
+        // Global expired-nonce cleanup stays outside the user-locked transaction.
+        await c.env.DB.execute(
+          'DELETE FROM auth_nonces WHERE key_id = $1 AND expires_at < $2',
+          [OAUTH_RELAY_KEY_ID, Date.now()],
+        );
+        const relayIssue = await withTransaction(c.env.DB, async (tx) => {
+          const lockedUser = await tx.queryOne<{ status: string; sessions_valid_after: string | number }>(
+            'SELECT status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+            [userId],
           );
+          const access = lockedUser
+            ? { status: lockedUser.status, sessionsValidAfter: Number(lockedUser.sessions_valid_after ?? 0) || 0 }
+            : null;
+          const decision = evaluateUserAccess(access);
+          if (!decision.ok) {
+            return { ok: false as const, code: decision.code };
+          }
+          const txNow = Date.now();
+          const issuedSec = Math.floor(txNow / 1000);
+          const relayExpSec = issuedSec + 120;
+          // Cover the full verifyJwt validity window of the signed exp claim even if the transaction crosses a second boundary.
+          const nonceExpiresAt = (relayExpSec + 1) * 1000;
           await tx.execute(
             'INSERT INTO auth_nonces (nonce, api_key, user_id, key_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-            [relayNonce, '', userId, OAUTH_RELAY_KEY_ID, nonceExpiresAt, now],
+            [relayNonce, '', userId, OAUTH_RELAY_KEY_ID, nonceExpiresAt, txNow],
           );
+          return { ok: true as const, issuedSec, relayExpSec };
         });
+        if (!relayIssue.ok) {
+          return c.json({ error: relayIssue.code }, 403);
+        }
         const relay = signJwt(
           {
             sub: userId,
             type: 'auth-relay',
             origin: targetOrigin,
             jti,
-            iat: issuedSec,
-            exp: relayExpSec,
+            iat: relayIssue.issuedSec,
+            exp: relayIssue.relayExpSec,
             ...(desktopCallback ? { desktopCallback } : {}),
           },
           c.env.JWT_SIGNING_KEY,

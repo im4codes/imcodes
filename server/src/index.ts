@@ -961,11 +961,13 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
         return;
       }
       try {
+        const access = await loadUserAccess(env.DB, payload.sub);
         const decision = evaluateUserAccess(
-          await loadUserAccess(env.DB, payload.sub),
+          access,
           typeof payload.iat === 'number' ? payload.iat : undefined,
         );
-        if (!decision.ok) {
+        const epochStale = typeof payload.sva === 'number' && access !== null && access.sessionsValidAfter > payload.sva;
+        if (!decision.ok || epochStale) {
           socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
           socket.destroy();
           return;

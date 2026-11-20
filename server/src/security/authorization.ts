@@ -31,6 +31,8 @@ export interface AuthContext {
   userId: string;
   role: Role;
   keyId?: string;
+  /** Set when authenticated from a login JWT; carries its integer-second `iat`. */
+  issuedAt?: number;
   /** Set when the credential is a restricted document-only collaborator session. */
   scope?: 'doc_collaborator';
   /** Set when the credential is a daemon server-token; the machine's node role. */
@@ -186,6 +188,7 @@ async function resolveLoginTokenUser(
     auth: {
       userId: payload.sub,
       role: (payload.role as Role) ?? 'member',
+      ...(typeof payload.iat === 'number' ? { issuedAt: payload.iat } : {}),
       ...(scope ? { scope } : {}),
     },
   };
@@ -357,6 +360,7 @@ export function requireAuth(options: RequireAuthOptions = {}) {
 
     c.set('userId' as never, auth.userId);
     c.set('role' as never, auth.role);
+    if (auth.issuedAt !== undefined) c.set('authIssuedAt' as never, auth.issuedAt);
     if (auth.scope) c.set('authScope' as never, auth.scope);
     if (auth.keyId) c.set('keyId' as never, auth.keyId);
     if (auth.nodeRole) c.set('nodeRole' as never, auth.nodeRole);
@@ -395,6 +399,7 @@ export function requireRole(minRole: Role, options: RequireAuthOptions = {}) {
 
     c.set('userId' as never, auth.userId);
     c.set('role' as never, auth.role);
+    if (auth.issuedAt !== undefined) c.set('authIssuedAt' as never, auth.issuedAt);
     if (auth.scope) c.set('authScope' as never, auth.scope);
     if (auth.keyId) c.set('keyId' as never, auth.keyId);
     if (auth.nodeRole) c.set('nodeRole' as never, auth.nodeRole);

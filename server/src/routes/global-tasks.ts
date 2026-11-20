@@ -4,6 +4,7 @@ import { listGlobalTaskSnapshotForUser } from '../db/global-task-summaries.js';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
 import { randomHex, signJwt } from '../security/crypto.js';
+import { alignedSessionIssuedAt, evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
 
 export const globalTasksRoutes = new Hono<{ Bindings: Env }>();
 
@@ -32,9 +33,24 @@ globalTasksRoutes.get('/', async (c) => {
 // POST /api/global-tasks/ws-ticket — issue a 15-second single-use WebSocket ticket
 globalTasksRoutes.post('/ws-ticket', async (c) => {
   const userId = c.get('userId' as never) as string;
+  const callerIssuedAt = c.get('authIssuedAt' as never) as number | undefined;
+  const access = await loadUserAccess(c.env.DB, userId);
+  const decision = evaluateUserAccess(access, callerIssuedAt);
+  if (!decision.ok) {
+    return c.json({ error: decision.code }, 403);
+  }
+  const nowMs = Date.now();
+  const nowSec = Math.floor(nowMs / 1000);
   const jti = randomHex(16);
   const ticket = signJwt(
-    { sub: userId, type: GLOBAL_TASK_WS_TICKET_TYPE, jti },
+    {
+      sub: userId,
+      type: GLOBAL_TASK_WS_TICKET_TYPE,
+      jti,
+      iat: alignedSessionIssuedAt(access!.sessionsValidAfter, nowMs),
+      exp: nowSec + 15,
+      sva: access!.sessionsValidAfter,
+    },
     c.env.JWT_SIGNING_KEY,
     15,
   );
