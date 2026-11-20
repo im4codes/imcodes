@@ -14,6 +14,7 @@ import {
   resolveLiveOnlyOfficeAccess,
   resolveOnlyOfficeJwtSecret,
   resolveTrustedOnlyOfficeDownloadUrl,
+  verifyOnlyOfficeRequestBearerJwt,
 } from './onlyoffice.js';
 import { buildOnlyOfficeEditorPresentation, parseOnlyOfficeMobileParam } from '../../../shared/onlyoffice-service.js';
 import {
@@ -294,7 +295,10 @@ function validateDocBuilderScriptAndArgument(
         413,
       );
     }
-    argument = rawArgument as Record<string, unknown>;
+    const clonedArgument = { ...(rawArgument as Record<string, unknown>) };
+    delete clonedArgument.inputUrl;
+    delete clonedArgument._imcodesInputUrl;
+    argument = clonedArgument;
   }
   const timeout = validateTimeoutMs(rawTimeoutMs, CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS);
   if (!timeout.ok) {
@@ -1177,18 +1181,18 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       return c.json({ error: 'invalid_doc_token' }, 401);
     }
 
-    const authHeader = c.req.header('Authorization');
-    if (authHeader?.startsWith('Bearer ')) {
-      const ooSecret = resolveOnlyOfficeJwtSecret(c.env);
-      const verified = verifyJwt(authHeader.slice(7), ooSecret);
-      if (!verified) {
-        return c.json({ error: 'invalid_onlyoffice_jwt' }, 401);
-      }
-    }
-
     const access = await resolveCloudDocAccess(c.env.DB, claims.cloudDocId, claims.userId);
     if (!access.allowed) {
       return c.json({ error: access.reason === 'not_found' ? 'not_found' : 'access_denied' }, access.reason === 'not_found' ? 404 : 403);
+    }
+
+    const authHeader = c.req.header('Authorization');
+    if (authHeader?.startsWith('Bearer ')) {
+      if (!verifyOnlyOfficeRequestBearerJwt(authHeader, c.env)) {
+        return c.json({ error: 'invalid_onlyoffice_jwt' }, 401);
+      }
+    } else if (c.env.ONLYOFFICE_JWT_SECRET?.trim() && !access.allowDownload) {
+      return c.json({ error: 'onlyoffice_jwt_required' }, 401);
     }
     const row = access.doc;
 

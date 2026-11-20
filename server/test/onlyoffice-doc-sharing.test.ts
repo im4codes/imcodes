@@ -2756,6 +2756,210 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
       mobileEditBody.config.editorConfig.customization,
     );
   });
+
+  it('rejects spoofed user:<id> deviceToken on device-locked shares while preserving authenticated user device lock and rate-limiting external endpoints', async () => {
+    const createRes = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/team/shared/spec.docx',
+        shareMode: 'external_link',
+        participantLabel: 'Partner Bob',
+        accessCode: '4321',
+        deviceLockEnabled: true,
+        role: 'editor',
+        allowDownload: true,
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    const created = (await createRes.json()) as { share: { id: string }; shareToken: string };
+
+    // 1. Authenticated user user-bob verifies WITHOUT client deviceToken -> binds user:user-bob server-side
+    const verifyBob = await app.request(`/api/doc-shares/external/${created.shareToken}/verify`, {
+      method: 'POST',
+      headers: { Authorization: bearer('user-bob'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accessCode: '4321' }),
+    });
+    expect(verifyBob.status).toBe(200);
+    const verifyJson = (await verifyBob.json()) as { ok: boolean; deviceBound: boolean; deviceToken: string };
+    expect(verifyJson.ok).toBe(true);
+    expect(verifyJson.deviceBound).toBe(true);
+    expect(verifyJson.deviceToken).toBe(''); // Never exposes raw user:user-bob token
+    expect(verifyBob.headers.get('set-cookie') ?? '').not.toContain('user:user-bob');
+
+    // Authenticated user-bob can still browse & open ONLYOFFICE config without passing deviceToken
+    const bobBrowse = await app.request(`/api/doc-shares/external/${created.shareToken}/browse`, {
+      headers: { Authorization: bearer('user-bob') },
+    });
+    expect(bobBrowse.status).toBe(200);
+
+    const bobConfig = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&shareToken=${created.shareToken}`,
+      { headers: { Authorization: bearer('user-bob') } },
+    );
+    expect(bobConfig.status).toBe(200);
+
+    // 2. Unauthenticated attacker supplying deviceToken=user:user-bob (any case) is REJECTED everywhere
+    for (const spoofed of ['user:user-bob', 'USER:user-bob']) {
+      const spoofVerify = await app.request(`/api/doc-shares/external/${created.shareToken}/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accessCode: '4321', deviceToken: spoofed }),
+      });
+      expect(spoofVerify.status).toBe(403);
+
+      const spoofBrowse = await app.request(
+        `/api/doc-shares/external/${created.shareToken}/browse?deviceToken=${encodeURIComponent(spoofed)}`,
+      );
+      expect(spoofBrowse.status).toBe(403);
+
+      const spoofConfig = await app.request(
+        `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&shareToken=${created.shareToken}&deviceToken=${encodeURIComponent(spoofed)}`,
+      );
+      expect(spoofConfig.status).toBe(403);
+    }
+
+    // 3. Rate limiting on verify, browse?accessCode=..., and magic-invite/redeem (20/min per IP+token)
+    const rlVerifyShare = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/team/shared/spec.docx',
+        shareMode: 'external_link',
+        accessCode: '9999',
+        role: 'viewer',
+      }),
+    });
+    const { shareToken: rlToken } = (await rlVerifyShare.json()) as { shareToken: string };
+    for (let i = 0; i < 20; i += 1) {
+      const r = await app.request(`/api/doc-shares/external/${rlToken}/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accessCode: '0000' }),
+      });
+      expect(r.status).toBe(401);
+    }
+    const verifyLimited = await app.request(`/api/doc-shares/external/${rlToken}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accessCode: '9999' }),
+    });
+    expect(verifyLimited.status).toBe(429);
+
+    for (let i = 0; i < 20; i += 1) {
+      const r = await app.request(`/api/doc-shares/external/${rlToken}/browse?accessCode=0000`);
+      expect(r.status).toBe(403);
+    }
+    const browseLimited = await app.request(`/api/doc-shares/external/${rlToken}/browse?accessCode=9999`);
+    expect(browseLimited.status).toBe(429);
+
+    const magicCreate = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/team/shared/spec.docx',
+        shareMode: 'magic_invite',
+        participantLabel: 'Guest',
+        accessCode: '7777',
+        role: 'viewer',
+      }),
+    });
+    const { shareToken: magicToken } = (await magicCreate.json()) as { shareToken: string };
+    for (let i = 0; i < 20; i += 1) {
+      const r = await app.request(`/api/doc-shares/magic-invite/${magicToken}/redeem`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ displayName: 'Guess', accessCode: '0000' }),
+      });
+      expect(r.status).toBe(401);
+    }
+    const redeemLimited = await app.request(`/api/doc-shares/magic-invite/${magicToken}/redeem`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ displayName: 'Guess', accessCode: '7777' }),
+    });
+    expect(redeemLimited.status).toBe(429);
+  });
+
+  it('enforces ONLYOFFICE JWT on /api/onlyoffice/file/:token when allowDownload is false and bounds oversized callback responses', async () => {
+    // Share /team/shared/spec.docx to team-1 as viewer with allowDownload: false
+    const shareRes = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/team/shared/spec.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-1',
+        role: 'viewer',
+        allowDownload: false,
+      }),
+    });
+    expect(shareRes.status).toBe(201);
+
+    // viewer user-bob opens ONLYOFFICE config -> allowDownload: false
+    const cfgRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}`,
+      { headers: { Authorization: bearer('user-bob') } },
+    );
+    expect(cfgRes.status).toBe(200);
+    const cfg = (await cfgRes.json()) as {
+      allowDownload: boolean;
+      token: string;
+      config: { document: { url: string } };
+    };
+    expect(cfg.allowDownload).toBe(false);
+    const fileUrl = new URL(cfg.config.document.url);
+
+    // 1. Direct download without Authorization header -> 401 onlyoffice_jwt_required
+    const unauthFileRes = await app.request(`${fileUrl.pathname}${fileUrl.search}`);
+    expect(unauthFileRes.status).toBe(401);
+
+    // 2. Replaying browser config.token (tokenKind: 'editor_config') -> 401 invalid_onlyoffice_jwt
+    const replayCfgJwtRes = await app.request(`${fileUrl.pathname}${fileUrl.search}`, {
+      headers: { Authorization: `Bearer ${cfg.token}` },
+    });
+    expect(replayCfgJwtRes.status).toBe(401);
+
+    // 3. Valid ONLYOFFICE Document Server JWT (without editor_config marker) -> 200
+    const ooServerJwt = signJwt({ url: cfg.config.document.url }, 'onlyoffice-jwt-secret-key-test!!', 300);
+    const ooFetchRes = await app.request(`${fileUrl.pathname}${fileUrl.search}`, {
+      headers: { Authorization: `Bearer ${ooServerJwt}` },
+    });
+    expect(ooFetchRes.status).toBe(200);
+
+    // 4. Oversized callback download > 50 MiB returns 413 file_too_large instead of unbounded buffering
+    const ownerCfgRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit`,
+      { headers: { Authorization: bearer('owner-1') } },
+    );
+    const ownerCfg = (await ownerCfgRes.json()) as {
+      config: { document: { key: string }; editorConfig: { callbackUrl: string } };
+    };
+    const cbUrl = new URL(ownerCfg.config.editorConfig.callbackUrl);
+    const cbJwt = signJwt(
+      { status: 2, key: ownerCfg.config.document.key, url: 'http://onlyoffice:80/cache/oversized.docx' },
+      'onlyoffice-jwt-secret-key-test!!',
+      300,
+    );
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(new Uint8Array(16), {
+        status: 200,
+        headers: { 'Content-Length': String(50 * 1024 * 1024 + 1) },
+      }),
+    );
+    const hugeCbRes = await app.request(`${cbUrl.pathname}${cbUrl.search}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: cbJwt }),
+    });
+    expect(hugeCbRes.status).toBe(413);
+    expect(await hugeCbRes.json()).toMatchObject({ error: 1, message: 'file_too_large' });
+    fetchSpy.mockRestore();
+  });
 });
 
 describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {

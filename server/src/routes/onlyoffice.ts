@@ -29,9 +29,11 @@ import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from 
 import type { Database } from '../db/client.js';
 import { WsBridge } from '../ws/bridge.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
-import { isInternalUploadTempFilePath, isMarkdownFilePath } from '../../../shared/cloud-docs.js';
+import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
+import { CLOUD_DOCS_MAX_UPLOAD_BYTES, isInternalUploadTempFilePath, isMarkdownFilePath } from '../../../shared/cloud-docs.js';
 import { buildOnlyOfficeEditorPresentation, parseOnlyOfficeMobileParam } from '../../../shared/onlyoffice-service.js';
 import { upsertRecentDocument } from '../db/cloud-docs.js';
+import { PayloadTooLargeError, readResponseBytesBounded } from '../util/bounded-stream.js';
 
 export const onlyofficeRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -158,6 +160,28 @@ export function resolveOnlyOfficeJwtSecret(env: Pick<Env, 'ONLYOFFICE_JWT_SECRET
   const explicit = env.ONLYOFFICE_JWT_SECRET?.trim();
   if (explicit) return explicit;
   return createHmac('sha256', env.JWT_SIGNING_KEY).update('imcodes-onlyoffice-jwt-secret').digest('hex');
+}
+
+export function verifyOnlyOfficeRequestBearerJwt(
+  authHeader: string | undefined,
+  env: Pick<Env, 'ONLYOFFICE_JWT_SECRET' | 'JWT_SIGNING_KEY'>,
+): boolean {
+  if (!authHeader?.startsWith('Bearer ')) return false;
+  const ooSecret = resolveOnlyOfficeJwtSecret(env);
+  const verified = verifyJwt(authHeader.slice(7), ooSecret);
+  if (!verified) return false;
+  const nested =
+    verified.payload && typeof verified.payload === 'object' && !Array.isArray(verified.payload)
+      ? (verified.payload as Record<string, unknown>)
+      : verified;
+  if (
+    nested.tokenKind === 'editor_config' ||
+    nested.editorConfig !== undefined ||
+    nested.document !== undefined
+  ) {
+    return false;
+  }
+  return true;
 }
 
 interface DocumentVersionState {
@@ -1582,7 +1606,7 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
 async function verifyLiveClaimsAccess(
   db: Database,
   claims: OnlyOfficeDocTokenClaims,
-): Promise<{ allowed: boolean; role: DocumentShareRole | null; allowedRoot: string | null }> {
+): Promise<{ allowed: boolean; role: DocumentShareRole | null; allowDownload: boolean; allowedRoot: string | null }> {
   if (claims.userId || claims.externalShareToken || claims.sessionName) {
     const live = await resolveLiveOnlyOfficeAccess(db, {
       serverId: claims.serverId,
@@ -1593,11 +1617,12 @@ async function verifyLiveClaimsAccess(
       filePath: claims.path,
     });
     if (!live.allowed || !live.role) {
-      return { allowed: false, role: null, allowedRoot: null };
+      return { allowed: false, role: null, allowDownload: false, allowedRoot: null };
     }
     return {
       allowed: true,
       role: live.role,
+      allowDownload: live.allowDownload,
       allowedRoot: live.targetPath ?? claims.allowedRoot ?? null,
     };
   }
@@ -1605,11 +1630,12 @@ async function verifyLiveClaimsAccess(
   if (claims.shareId) {
     const share = await getDocumentShareById(db, claims.shareId, claims.serverId);
     if (!share || share.revokedAt !== null || (share.expiresAt !== null && share.expiresAt <= Date.now())) {
-      return { allowed: false, role: null, allowedRoot: null };
+      return { allowed: false, role: null, allowDownload: false, allowedRoot: null };
     }
     return {
       allowed: true,
       role: share.role,
+      allowDownload: share.allowDownload,
       allowedRoot: share.targetPath ?? claims.allowedRoot ?? null,
     };
   }
@@ -1617,6 +1643,7 @@ async function verifyLiveClaimsAccess(
   return {
     allowed: true,
     role: claims.role,
+    allowDownload: claims.allowDownload,
     allowedRoot: claims.allowedRoot ?? null,
   };
 }
@@ -1638,14 +1665,14 @@ async function handleOnlyOfficeFileDownload(c: RouteContext): Promise<Response> 
     return c.json({ error: 'share_revoked_or_expired' }, 403);
   }
 
-  // If ONLYOFFICE_ENABLED is true and ONLYOFFICE sends Authorization JWT header, verify it if present
+  // Verify ONLYOFFICE JWT when present, and require it when ONLYOFFICE_JWT_SECRET is configured and allowDownload is false
   const authHeader = c.req.header('Authorization');
   if (authHeader?.startsWith('Bearer ')) {
-    const ooSecret = resolveOnlyOfficeJwtSecret(c.env);
-    const verified = verifyJwt(authHeader.slice(7), ooSecret);
-    if (!verified) {
+    if (!verifyOnlyOfficeRequestBearerJwt(authHeader, c.env)) {
       return c.json({ error: 'invalid_onlyoffice_jwt' }, 401);
     }
+  } else if (c.env.ONLYOFFICE_JWT_SECRET?.trim() && (!claims.allowDownload || !liveAccess.allowDownload)) {
+    return c.json({ error: 'onlyoffice_jwt_required' }, 401);
   }
 
   const meta = getOnlyOfficeDocumentMeta(claims.path);
@@ -1791,12 +1818,13 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       return c.json({ error: 1, message: 'stale_document_key' }, 409);
     }
 
+    const downloadController = new AbortController();
     let docRes: Response;
     try {
-      docRes = await fetch(trustedUrl.internalFetchUrl, { redirect: 'error' });
+      docRes = await fetch(trustedUrl.internalFetchUrl, { redirect: 'error', signal: downloadController.signal });
     } catch (fetchErr) {
       if (trustedUrl.fallbackPublicUrl && trustedUrl.fallbackPublicUrl !== trustedUrl.internalFetchUrl) {
-        docRes = await fetch(trustedUrl.fallbackPublicUrl, { redirect: 'error' });
+        docRes = await fetch(trustedUrl.fallbackPublicUrl, { redirect: 'error', signal: downloadController.signal });
       } else {
         throw fetchErr;
       }
@@ -1806,8 +1834,15 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       return c.json({ error: 1, message: 'failed_to_download_edited_file' }, 502);
     }
 
-    const arrayBuf = await docRes.arrayBuffer();
-    const bytes = Buffer.from(arrayBuf);
+    let bytes: Buffer;
+    try {
+      bytes = await readResponseBytesBounded(docRes, CLOUD_DOCS_MAX_UPLOAD_BYTES, downloadController);
+    } catch (err) {
+      if (err instanceof PayloadTooLargeError) {
+        return c.json({ error: 1, message: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE }, 413);
+      }
+      return c.json({ error: 1, message: 'failed_to_download_edited_file' }, 502);
+    }
     const meta = getOnlyOfficeDocumentMeta(claims.path);
 
     return await lockDocumentCommit(mapKey, async () => {

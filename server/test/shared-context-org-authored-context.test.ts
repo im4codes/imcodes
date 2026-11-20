@@ -80,11 +80,23 @@ function makeMockDb() {
       ['user-other-admin', { role: 'admin' }],
     ])],
   ]);
+  const workspaces = new Map<string, { id: string; enterprise_id: string }>([
+    ['ws-1', { id: 'ws-1', enterprise_id: 'team-1' }],
+    ['ws-team2', { id: 'ws-team2', enterprise_id: 'team-2' }],
+  ]);
+  const documents = new Map<string, { id: string; enterprise_id: string }>([
+    ['doc-project', { id: 'doc-project', enterprise_id: 'team-1' }],
+    ['doc-workspace', { id: 'doc-workspace', enterprise_id: 'team-1' }],
+    ['doc-org', { id: 'doc-org', enterprise_id: 'team-1' }],
+    ['doc-org-other', { id: 'doc-org-other', enterprise_id: 'team-1' }],
+    ['doc-team2', { id: 'doc-team2', enterprise_id: 'team-2' }],
+  ]);
   const versions = new Map<string, VersionRow>([
     ['ver-project', { id: 'ver-project', document_id: 'doc-project', status: 'active', content: 'Project required rules' }],
     ['ver-workspace', { id: 'ver-workspace', document_id: 'doc-workspace', status: 'active', content: 'Workspace advisory rules' }],
     ['ver-org', { id: 'ver-org', document_id: 'doc-org', status: 'active', content: 'Org required rules' }],
     ['ver-org-other', { id: 'ver-org-other', document_id: 'doc-org-other', status: 'active', content: 'Other repo org rules' }],
+    ['ver-team2', { id: 'ver-team2', document_id: 'doc-team2', status: 'active', content: 'Team 2 secret authored context' }],
   ]);
   const bindings = new Map<string, BindingRow>([
     ['bind-project', {
@@ -149,6 +161,16 @@ function makeMockDb() {
         const member = teamMembers.get(params[0] as string)?.get(params[1] as string);
         return member ? ({ role: member.role } as T) : null;
       }
+      if (s.includes('select id from shared_context_workspaces where id = $1 and enterprise_id = $2')) {
+        const ws = workspaces.get(params[0] as string);
+        return ws && ws.enterprise_id === params[1] ? ({ id: ws.id } as T) : null;
+      }
+      if (s.includes('select v.id from shared_context_document_versions v join shared_context_documents d on d.id = v.document_id where v.id = $1 and d.id = $2 and d.enterprise_id = $3')) {
+        const version = versions.get(params[0] as string);
+        if (!version || version.document_id !== params[1]) return null;
+        const doc = documents.get(version.document_id);
+        return doc && doc.enterprise_id === params[2] ? ({ id: version.id } as T) : null;
+      }
       if (s.includes('select enterprise_id, workspace_id, enrollment_id from shared_context_document_bindings where id = $1')) {
         const binding = bindings.get(params[0] as string);
         return binding ? ({
@@ -168,6 +190,10 @@ function makeMockDb() {
           .map((binding) => {
             const version = versions.get(binding.version_id);
             if (!version || version.status !== 'active') return null;
+            if (s.includes('join shared_context_documents d')) {
+              const doc = documents.get(version.document_id);
+              if (!doc || doc.enterprise_id !== binding.enterprise_id || doc.id !== binding.document_id) return null;
+            }
             return {
               binding_id: binding.id,
               binding_mode: binding.binding_mode,
@@ -364,5 +390,22 @@ describe('org_shared authored context standards', () => {
     expect(otherEnterprise.status).toBe(404);
     expect(await nonMember.json()).toEqual(sameShapeMemoryLookupEnvelope());
     expect(await otherEnterprise.json()).toEqual(sameShapeMemoryLookupEnvelope());
+
+    // Cross-enterprise binding mutation using team-2's document/version or workspace fails 404
+    const crossDocRes = await app.request(...req('/api/shared-context/enterprises/team-1/document-bindings', 'POST', {
+      documentId: 'doc-team2',
+      versionId: 'ver-team2',
+      workspaceId: 'ws-1',
+      mode: 'required',
+    }, 'user-admin'), env);
+    expect(crossDocRes.status).toBe(404);
+
+    const crossWsRes = await app.request(...req('/api/shared-context/enterprises/team-1/document-bindings', 'POST', {
+      documentId: 'doc-workspace',
+      versionId: 'ver-workspace',
+      workspaceId: 'ws-team2',
+      mode: 'advisory',
+    }, 'user-admin'), env);
+    expect(crossWsRes.status).toBe(404);
   });
 });

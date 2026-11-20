@@ -116,6 +116,8 @@ export interface EnvConfig {
 
   // Push relay for self-hosted servers without APNs keys (default: https://app.im.codes)
   PUSH_RELAY_URL?: string;
+  /** Optional shared bearer secret protecting POST /api/push/relay when configured. */
+  PUSH_RELAY_SECRET?: string;
 
   // Password auth
   /** Default admin password when auto-creating admin user. Default: 'imcodes' */
@@ -207,6 +209,7 @@ export function loadEnv(): EnvConfig {
     JPUSH_APP_KEY: process.env.JPUSH_APP_KEY,
     JPUSH_MASTER_SECRET: process.env.JPUSH_MASTER_SECRET,
     PUSH_RELAY_URL: process.env.PUSH_RELAY_URL,
+    PUSH_RELAY_SECRET: process.env.PUSH_RELAY_SECRET,
     DEFAULT_ADMIN_PASSWORD: process.env.DEFAULT_ADMIN_PASSWORD,
     LANDING_HOST: process.env.LANDING_HOST,
     DB_POOL_MAX: process.env.DB_POOL_MAX,

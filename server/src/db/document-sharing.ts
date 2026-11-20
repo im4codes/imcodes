@@ -833,8 +833,8 @@ export async function verifyAndBindExternalShareDevice(
   if (rawSuppliedDevice && share.boundDeviceHash && rawSuppliedDevice === share.boundDeviceHash) {
     return { ok: false, status: 403, error: 'device_locked_to_another_device' };
   }
-  // Reject bare passkey / credential identifiers supplied directly as deviceToken
-  if (rawSuppliedDevice && (rawSuppliedDevice.startsWith('passkey:') || rawSuppliedDevice.startsWith('cred_'))) {
+  // Reject bare passkey / credential / user identifiers supplied directly as deviceToken
+  if (rawSuppliedDevice && /^(?:passkey:|cred_|user:)/i.test(rawSuppliedDevice)) {
     return { ok: false, status: 403, error: 'invalid_device_token' };
   }
 
@@ -1128,13 +1128,15 @@ export async function resolveEffectiveDocumentAccess(
       }
     }
 
-    const suppliedDeviceToken = input.deviceToken?.trim()
-      || (userId ? `user:${userId}` : '');
+    const rawSuppliedDevice = input.deviceToken?.trim() ?? '';
 
-    // Reject bare passkey / credential identifiers supplied directly as deviceToken
-    if (suppliedDeviceToken && (suppliedDeviceToken.startsWith('passkey:') || suppliedDeviceToken.startsWith('cred_'))) {
+    // Reject bare passkey / credential / user identifiers supplied directly as deviceToken
+    if (rawSuppliedDevice && /^(?:passkey:|cred_|user:)/i.test(rawSuppliedDevice)) {
       return denied('device_locked');
     }
+
+    const suppliedDeviceToken = rawSuppliedDevice
+      || (userId ? `user:${userId}` : '');
 
     // Reject attempts to pass the stored bound_device_hash itself as raw deviceToken
     if (suppliedDeviceToken && extRow.bound_device_hash && suppliedDeviceToken === extRow.bound_device_hash) {

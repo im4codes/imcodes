@@ -9,6 +9,7 @@ import type { Env } from '../src/env.js';
 import { sha256Hex, signJwt, verifyJwt } from '../src/security/crypto.js';
 import { LocalCloudDocStorage } from '../src/storage/cloud-doc-storage.js';
 import {
+  OnlyOfficeServiceError,
   clearEphemeralDocBuilderScriptsForTests,
   createDbDocBuilderScriptStore,
   prepareOnlyOfficeDocBuilderScript,
@@ -1242,5 +1243,58 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       'builder.SaveFile("docx", "edited2.docx");',
       'builder.CloseFile();',
     ].join('\n'));
+  });
+
+  it('rejects arbitrary OpenFile/OpenTmpFile SSRF & bypasses while rejecting client-smuggled argument.inputUrl', async () => {
+    const sampleUrl = 'https://docs.example.test/file?tok=abc';
+    const ssrfPayloads = [
+      'builder.OpenFile("http://169.254.169.254/latest/meta-data/");',
+      'builder.OpenFile("/etc/passwd");',
+      'builder.OpenFile("file:///etc/passwd");',
+      'builder.OpenTmpFile("/etc/passwd");',
+      'builder["OpenFile"]("http://127.0.0.1:8080/admin");',
+      "builder['OpenTmpFile']('http://127.0.0.1:8080/');",
+      'builder["Open" + "File"]("http://127.0.0.1:8080/");',
+      'const m = "OpenFile"; builder[m]("http://127.0.0.1:8080/");',
+      'const b = builder; b["OpenFile"]("http://127.0.0.1:8080/");',
+      'builder /*comment*/ . /*c*/ OpenFile("http://127.0.0.1:8080/");',
+      'var s = `${builder.OpenFile("http://127.0.0.1:8080/")}`;',
+      'builder.OpenFile("{{INPUT_URL}}" + "/extra");',
+    ];
+
+    for (const bad of ssrfPayloads) {
+      expect(() => prepareOnlyOfficeDocBuilderScript(bad, { inputUrl: sampleUrl })).toThrowError(OnlyOfficeServiceError);
+    }
+
+    // Zero-arg OpenFile() and CreateFile() are still accepted cleanly
+    expect(prepareOnlyOfficeDocBuilderScript('builder.OpenFile(); builder.CreateFile("docx");')).toBe(
+      'builder.OpenFile();\nbuilder.CreateFile("docx");',
+    );
+
+    // HTTP POST /api/cloud-docs/docbuilder blocks arbitrary OpenFile and strips smuggled argument.inputUrl
+    const createSsrfRes = await app.request('/api/cloud-docs/docbuilder', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'docx',
+        name: 'Evil',
+        script: 'builder.OpenFile("http://169.254.169.254/latest/meta-data/"); builder.SaveFile("docx", "out.docx");',
+      }),
+    });
+    expect(createSsrfRes.status).toBe(400);
+    expect(await createSsrfRes.json()).toMatchObject({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT });
+
+    const smuggledArgRes = await app.request('/api/cloud-docs/docbuilder', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'docx',
+        name: 'EvilSmuggle',
+        script: 'builder.OpenFile(Argument.inputUrl); builder.SaveFile("docx", "out.docx");',
+        argument: { inputUrl: 'http://169.254.169.254/latest/meta-data/' },
+      }),
+    });
+    expect(smuggledArgRes.status).toBe(400);
+    expect(await smuggledArgRes.json()).toMatchObject({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT });
   });
 });

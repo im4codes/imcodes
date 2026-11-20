@@ -1517,8 +1517,9 @@ describe('cloud docs & recent documents', () => {
       role: string;
       allowDownload: boolean;
       mode: string;
+      token: string;
       config: {
-        document: { key: string; permissions: { edit: boolean; download: boolean; print: boolean; copy: boolean } };
+        document: { url: string; key: string; permissions: { edit: boolean; download: boolean; print: boolean; copy: boolean } };
         editorConfig: { callbackUrl: string };
       };
     };
@@ -1528,6 +1529,21 @@ describe('cloud docs & recent documents', () => {
     expect(d2Cfg.config.document.permissions.edit).toBe(false);
     expect(d2Cfg.config.document.permissions.download).toBe(false);
     expect(d2Cfg.config.document.permissions.print).toBe(false);
+
+    // /cloud-docs/onlyoffice/file/:token enforces ONLYOFFICE JWT when allowDownload=false & ONLYOFFICE_JWT_SECRET is set
+    const d2FilePath = new URL(d2Cfg.config.document.url).pathname;
+    expect((await app.request(d2FilePath)).status).toBe(401);
+    expect((await app.request(d2FilePath, {
+      headers: { Authorization: `Bearer ${d2Cfg.token}` },
+    })).status).toBe(401);
+    const d2OoJwt = signJwt(
+      { url: d2Cfg.config.document.url },
+      resolveOnlyOfficeJwtSecret({ ONLYOFFICE_JWT_SECRET: OO_SECRET, JWT_SIGNING_KEY: JWT_KEY }),
+      300,
+    );
+    expect((await app.request(d2FilePath, {
+      headers: { Authorization: `Bearer ${d2OoJwt}` },
+    })).status).toBe(200);
 
     const d2DlForbidden = await app.request(`/api/cloud-docs/${d2.id}/download`, {
       headers: bearerHeader('user-bob'),

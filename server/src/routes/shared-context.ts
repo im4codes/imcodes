@@ -1008,6 +1008,7 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/runtime-authored-context', a
       v.content_md AS content
     FROM shared_context_document_bindings b
     JOIN shared_context_document_versions v ON v.id = b.version_id
+    JOIN shared_context_documents d ON d.id = v.document_id AND d.enterprise_id = b.enterprise_id AND d.id = b.document_id
     WHERE b.enterprise_id = $1 AND b.status = 'active' AND v.status = 'active'
     ORDER BY b.id ASC`,
     [enterpriseId],
@@ -1098,6 +1099,7 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/diagnostics', async (c) => {
       v.content_md AS content
     FROM shared_context_document_bindings b
     JOIN shared_context_document_versions v ON v.id = b.version_id
+    JOIN shared_context_documents d ON d.id = v.document_id AND d.enterprise_id = b.enterprise_id AND d.id = b.document_id
     WHERE b.enterprise_id = $1 AND b.status = 'active' AND v.status = 'active'
     ORDER BY b.id ASC`,
     [enterpriseId],
@@ -1195,6 +1197,17 @@ sharedContextRoutes.post('/enterprises/:enterpriseId/projects/enroll', async (c)
   }>(c);
   const canonicalRepoId = body?.canonicalRepoId?.trim();
   if (!canonicalRepoId) return c.json({ error: 'canonical_repo_id_required' }, 400);
+  if (body?.workspaceId !== undefined && body?.workspaceId !== null && typeof body.workspaceId !== 'string') {
+    return c.json({ error: 'invalid_workspace_id' }, 400);
+  }
+  const workspaceId = typeof body?.workspaceId === 'string' ? body.workspaceId.trim() || null : null;
+  if (workspaceId) {
+    const ownedWorkspace = await c.env.DB.queryOne<{ id: string }>(
+      'SELECT id FROM shared_context_workspaces WHERE id = $1 AND enterprise_id = $2',
+      [workspaceId, enterpriseId],
+    );
+    if (!ownedWorkspace) return sameShapeNotFound(c);
+  }
   const scope = body?.scope ?? 'project_shared';
   if (!isAuthoredContextScope(scope)) return c.json({ error: 'invalid_scope' }, 400);
 
@@ -1202,13 +1215,13 @@ sharedContextRoutes.post('/enterprises/:enterpriseId/projects/enroll', async (c)
   const now = Date.now();
   await c.env.DB.execute(
     'INSERT INTO shared_project_enrollments (id, enterprise_id, workspace_id, canonical_repo_id, display_name, scope, status, auto_enabled_for_members, member_opt_out_allowed, created_by, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, FALSE, $8, $9, $9)',
-    [enrollmentId, enterpriseId, body?.workspaceId ?? null, canonicalRepoId, body?.displayName?.trim() ?? null, scope, 'active', auth.userId, now],
+    [enrollmentId, enterpriseId, workspaceId, canonicalRepoId, body?.displayName?.trim() ?? null, scope, 'active', auth.userId, now],
   );
   await logAudit({ userId: auth.userId, action: 'shared_context.project_enrolled', details: { enterpriseId, enrollmentId, canonicalRepoId, scope } }, c.env.DB);
   return c.json({
     id: enrollmentId,
     enterpriseId,
-    workspaceId: body?.workspaceId ?? null,
+    workspaceId,
     canonicalRepoId,
     displayName: body?.displayName?.trim() ?? null,
     scope,
@@ -1493,29 +1506,60 @@ sharedContextRoutes.post('/enterprises/:enterpriseId/document-bindings', async (
     applicabilityPathPattern?: string | null;
   }>(c);
   if (!body?.documentId || !body?.versionId || !isBindingMode(body?.mode)) return c.json({ error: 'invalid_binding' }, 400);
+  if (
+    (body.workspaceId !== undefined && body.workspaceId !== null && typeof body.workspaceId !== 'string')
+    || (body.enrollmentId !== undefined && body.enrollmentId !== null && typeof body.enrollmentId !== 'string')
+  ) {
+    return c.json({ error: 'invalid_binding' }, 400);
+  }
+  const documentId = body.documentId.trim();
+  const versionId = body.versionId.trim();
+  const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId.trim() || null : null;
+  const enrollmentId = typeof body.enrollmentId === 'string' ? body.enrollmentId.trim() || null : null;
+  if (!documentId || !versionId) return c.json({ error: 'invalid_binding' }, 400);
+
   const bindingScope = authoredContextScopeForBinding({
-    workspaceId: body.workspaceId,
-    enrollmentId: body.enrollmentId,
+    workspaceId,
+    enrollmentId,
   });
   const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
   if (bindingScope === 'org_shared' && !isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags)) {
     return sameShapeNotFound(c);
   }
+  const ownedVersion = await c.env.DB.queryOne<{ id: string }>(
+    'SELECT v.id FROM shared_context_document_versions v JOIN shared_context_documents d ON d.id = v.document_id WHERE v.id = $1 AND d.id = $2 AND d.enterprise_id = $3',
+    [versionId, documentId, enterpriseId],
+  );
+  if (!ownedVersion) return sameShapeNotFound(c);
+  if (workspaceId) {
+    const ownedWorkspace = await c.env.DB.queryOne<{ id: string }>(
+      'SELECT id FROM shared_context_workspaces WHERE id = $1 AND enterprise_id = $2',
+      [workspaceId, enterpriseId],
+    );
+    if (!ownedWorkspace) return sameShapeNotFound(c);
+  }
+  if (enrollmentId) {
+    const ownedEnrollment = await c.env.DB.queryOne<{ id: string }>(
+      'SELECT id FROM shared_project_enrollments WHERE id = $1 AND enterprise_id = $2',
+      [enrollmentId, enterpriseId],
+    );
+    if (!ownedEnrollment) return sameShapeNotFound(c);
+  }
   const bindingId = randomHex(16);
   const now = Date.now();
   await c.env.DB.execute(
     "INSERT INTO shared_context_document_bindings (id, enterprise_id, workspace_id, enrollment_id, document_id, version_id, binding_mode, applicability_repo_id, applicability_language, applicability_path_pattern, status, created_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11, $12)",
-    [bindingId, enterpriseId, body.workspaceId ?? null, body.enrollmentId ?? null, body.documentId, body.versionId, body.mode, body.applicabilityRepoId ?? null, body.applicabilityLanguage ?? null, body.applicabilityPathPattern ?? null, auth.userId, now],
+    [bindingId, enterpriseId, workspaceId, enrollmentId, documentId, versionId, body.mode, body.applicabilityRepoId ?? null, body.applicabilityLanguage ?? null, body.applicabilityPathPattern ?? null, auth.userId, now],
   );
-  await logAudit({ userId: auth.userId, action: 'shared_context.document_binding_created', details: { enterpriseId, bindingId, documentId: body.documentId, versionId: body.versionId } }, c.env.DB);
+  await logAudit({ userId: auth.userId, action: 'shared_context.document_binding_created', details: { enterpriseId, bindingId, documentId, versionId } }, c.env.DB);
   return c.json({
     id: bindingId,
     enterpriseId,
-    workspaceId: body.workspaceId ?? null,
-    enrollmentId: body.enrollmentId ?? null,
+    workspaceId,
+    enrollmentId,
     scope: bindingScope,
-    documentId: body.documentId,
-    versionId: body.versionId,
+    documentId,
+    versionId,
     mode: body.mode,
     status: 'active',
   }, 201);

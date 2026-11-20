@@ -4,6 +4,7 @@ import type { Context } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
+import { MemoryRateLimiter } from '../ws/rate-limiter.js';
 import { requireAuth, resolveAuthOutcome, resolveServerMembershipRole } from '../security/authorization.js';
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { createUser, getUserByPlatformId, upsertPlatformIdentity } from '../db/queries.js';
@@ -41,6 +42,30 @@ import {
 export const documentSharingRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
 type RouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
+
+const externalShareRateLimiter = new MemoryRateLimiter();
+const EXTERNAL_SHARE_RATE_WINDOW_MS = 60_000;
+const EXTERNAL_SHARE_IP_LIMIT = 20;
+const EXTERNAL_SHARE_TOKEN_LIMIT = 60;
+
+function checkExternalShareRateLimit(c: RouteContext, action: string, rawToken: string): Response | null {
+  const clientIp = (c.get('clientIp' as never) as string | undefined) || 'unknown';
+  const tokenHash = sha256Hex(rawToken);
+  const ipOk = externalShareRateLimiter.check(
+    `${action}:ip:${clientIp}:${tokenHash}`,
+    EXTERNAL_SHARE_IP_LIMIT,
+    EXTERNAL_SHARE_RATE_WINDOW_MS,
+  );
+  const tokenOk = externalShareRateLimiter.check(
+    `${action}:tok:${tokenHash}`,
+    EXTERNAL_SHARE_TOKEN_LIMIT,
+    EXTERNAL_SHARE_RATE_WINDOW_MS,
+  );
+  if (!ipOk || !tokenOk) {
+    return c.json({ error: 'rate_limited', retryAfter: 60 }, 429);
+  }
+  return null;
+}
 
 function sanitizeExternalShareView(share: DocumentShareRow) {
   return {
@@ -364,6 +389,8 @@ documentSharingRoutes.delete('/server/:id/doc-shares/:shareId', requireAuth(), a
 // POST /api/doc-shares/external/:token/verify
 documentSharingRoutes.post('/doc-shares/external/:token/verify', async (c): Promise<Response> => {
   const rawToken = c.req.param('token') ?? '';
+  const limited = checkExternalShareRateLimit(c, 'external-verify', rawToken);
+  if (limited) return limited;
   let body: Record<string, unknown> = {};
   try {
     body = (await c.req.json()) as Record<string, unknown>;
@@ -400,18 +427,23 @@ documentSharingRoutes.post('/doc-shares/external/:token/verify', async (c): Prom
     return c.json({ error: result.error }, result.status);
   }
 
-  setCookie(c, DOC_DEVICE_COOKIE, result.deviceToken, {
-    httpOnly: true,
-    secure: isSecure,
-    sameSite: 'Lax',
-    path: '/',
-    maxAge: 30 * 86400,
-  });
+  const isUserBoundToken = result.deviceToken.startsWith('user:');
+  if (isUserBoundToken) {
+    deleteCookie(c, DOC_DEVICE_COOKIE, { path: '/' });
+  } else {
+    setCookie(c, DOC_DEVICE_COOKIE, result.deviceToken, {
+      httpOnly: true,
+      secure: isSecure,
+      sameSite: 'Lax',
+      path: '/',
+      maxAge: 30 * 86400,
+    });
+  }
 
   return c.json({
     ok: true,
     share: sanitizeExternalShareView(result.share),
-    deviceToken: result.deviceToken,
+    deviceToken: isUserBoundToken ? '' : result.deviceToken,
     deviceBound: result.deviceBound,
   });
 });
@@ -419,6 +451,11 @@ documentSharingRoutes.post('/doc-shares/external/:token/verify', async (c): Prom
 // GET /api/doc-shares/external/:token/browse?path=<optionalSubpath>
 documentSharingRoutes.get('/doc-shares/external/:token/browse', async (c): Promise<Response> => {
   const rawToken = c.req.param('token') ?? '';
+  const suppliedCodeParam = c.req.query('accessCode')?.trim() || c.req.header('x-doc-access-code')?.trim() || '';
+  if (suppliedCodeParam) {
+    const limited = checkExternalShareRateLimit(c, 'external-browse-code', rawToken);
+    if (limited) return limited;
+  }
   const share = await getDocumentShareByToken(c.env.DB, rawToken);
   if (!share) {
     return c.json({ error: 'share_not_found' }, 404);
@@ -752,19 +789,11 @@ documentSharingRoutes.get('/doc-shares/auth-relay/callback', async (c): Promise<
 
   // If logging in from an external share link, bind/verify the user's identity as the device credential when unlocked
   if (shareToken) {
-    const userDeviceToken = `user:${userId}`;
     await verifyAndBindExternalShareDevice(c.env.DB, {
       rawToken: shareToken,
-      deviceToken: userDeviceToken,
       userId,
     }).catch(() => {});
-    setCookie(c, DOC_DEVICE_COOKIE, userDeviceToken, {
-      httpOnly: true,
-      secure: c.env.NODE_ENV === 'production',
-      sameSite: 'Lax',
-      path: '/',
-      maxAge: 30 * 86400,
-    });
+    deleteCookie(c, DOC_DEVICE_COOKIE, { path: '/' });
   }
 
   if (c.req.query('format') === 'json' || c.req.header('Accept')?.includes('application/json')) {
@@ -847,6 +876,8 @@ documentSharingRoutes.get('/doc-shares/auth-relay/:provider', async (c): Promise
 // POST /api/doc-shares/magic-invite/:token/redeem
 documentSharingRoutes.post('/doc-shares/magic-invite/:token/redeem', async (c): Promise<Response> => {
   const rawToken = c.req.param('token') ?? '';
+  const limited = checkExternalShareRateLimit(c, 'magic-redeem', rawToken);
+  if (limited) return limited;
   let body: Record<string, unknown> = {};
   try {
     body = (await c.req.json()) as Record<string, unknown>;

@@ -17,6 +17,8 @@ import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { requireAuth } from '../security/authorization.js';
+import { timingSafeEqual } from '../security/crypto.js';
+import { MemoryRateLimiter } from '../ws/rate-limiter.js';
 import { SignJWT, importPKCS8 } from 'jose';
 import logger from '../util/logger.js';
 import {
@@ -41,7 +43,16 @@ import { MACHINE_LIST_MAX_ITEMS } from '../../../shared/remote-exec.js';
 
 export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-// Auth required for register/unregister/preferences but NOT for relay (self-hosted servers call relay without auth)
+const APNS_DEVICE_TOKEN_RE = /^[0-9a-fA-F]{64,200}$/;
+const pushRelayRateLimiter = new MemoryRateLimiter();
+const PUSH_RELAY_RATE_LIMIT = 60;
+const PUSH_RELAY_RATE_WINDOW_MS = 60_000;
+
+export function isValidApnsDeviceToken(token: string): boolean {
+  return APNS_DEVICE_TOKEN_RE.test(token);
+}
+
+// Auth required for register/unregister/preferences; relay is protected by optional PUSH_RELAY_SECRET + rate limit
 pushRoutes.use('/register', requireAuth());
 pushRoutes.use('/unregister', requireAuth());
 pushRoutes.use('/preferences', requireAuth());
@@ -251,6 +262,20 @@ pushRoutes.post('/badge-reset', async (c) => {
 // APNs rejects it and we return the error.
 
 pushRoutes.post('/relay', async (c) => {
+  const relaySecret = c.env.PUSH_RELAY_SECRET?.trim();
+  if (relaySecret) {
+    const authHeader = c.req.header('Authorization');
+    const suppliedSecret = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!suppliedSecret || !timingSafeEqual(suppliedSecret, relaySecret)) {
+      return c.json({ error: 'unauthorized' }, 401);
+    }
+  }
+
+  const clientIp = (c.get('clientIp' as never) as string | undefined) || 'unknown';
+  if (!pushRelayRateLimiter.check(`relay:${clientIp}`, PUSH_RELAY_RATE_LIMIT, PUSH_RELAY_RATE_WINDOW_MS)) {
+    return c.json({ error: 'rate_limited', retryAfter: 60 }, 429);
+  }
+
   const body = await c.req.json<{
     token: string;
     platform: string;
@@ -262,6 +287,9 @@ pushRoutes.post('/relay', async (c) => {
   }>().catch(() => null);
   if (!body?.token || !body?.platform || !body?.title) {
     return c.json({ error: 'token, platform, title, body required' }, 400);
+  }
+  if (body.platform === PUSH_PLATFORM_IOS && !isValidApnsDeviceToken(body.token)) {
+    return c.json({ error: 'invalid_apns_device_token' }, 400);
   }
 
   // This server can serve relay if it has any push credential configured.
@@ -568,6 +596,9 @@ async function getApnsJwt(env: Env): Promise<string> {
 async function sendApnsToHost(
   host: string, deviceToken: string, payload: PushPayload, jwt: string, bundleId: string,
 ): Promise<{ status: number; body: string }> {
+  if (!isValidApnsDeviceToken(deviceToken)) {
+    throw new PushError('Invalid APNs device token', false);
+  }
   const { connect } = await import('node:http2');
   const jsonBody = JSON.stringify({
     aps: {
@@ -606,6 +637,9 @@ async function sendApnsToHost(
 }
 
 async function sendApns(deviceToken: string, payload: PushPayload, env: Env): Promise<void> {
+  if (!isValidApnsDeviceToken(deviceToken)) {
+    throw new PushError('Invalid APNs device token', false);
+  }
   const jwt = await getApnsJwt(env);
   const bundleId = env.APNS_BUNDLE_ID ?? 'app.imcodes';
 

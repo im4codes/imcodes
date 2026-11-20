@@ -840,6 +840,122 @@ describe('push preferences and registration routes', () => {
 
       fetchSpy.mockRestore();
     });
+
+    it('rejects invalid APNs device tokens before constructing HTTP/2 :path', async () => {
+      const secretApp = new Hono();
+      secretApp.use('/*', async (c, next) => {
+        (c as any).env = {
+          DB: mockDb,
+          APNS_KEY: 'dummy-key',
+          APNS_KEY_ID: 'kid-1',
+          APNS_TEAM_ID: 'team-1',
+        };
+        return next();
+      });
+      secretApp.route('/api/push', pushRoutes);
+
+      for (const badToken of ['../../etc/passwd', 'not-hex-token!', 'abcd', 'a'.repeat(201)]) {
+        const res = await secretApp.request('/api/push/relay', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            token: badToken,
+            platform: PUSH_PLATFORM_IOS,
+            title: 'Test',
+            body: 'Hello',
+          }),
+        });
+        expect(res.status).toBe(400);
+        expect(await res.json()).toEqual({ error: 'invalid_apns_device_token' });
+      }
+    });
+
+    it('enforces PUSH_RELAY_SECRET when configured and rate-limits /api/push/relay', async () => {
+      const secretApp = new Hono();
+      secretApp.use('/*', async (c, next) => {
+        (c as any).env = {
+          DB: mockDb,
+          JPUSH_APP_KEY: 'mock-key',
+          JPUSH_MASTER_SECRET: 'mock-secret',
+          PUSH_RELAY_SECRET: 'relay-top-secret-token',
+        };
+        return next();
+      });
+      secretApp.route('/api/push', pushRoutes);
+
+      const unauthRes = await secretApp.request('/api/push/relay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: 'jpush-reg-id',
+          platform: PUSH_PLATFORM_ANDROID_JPUSH,
+          title: 'Alert',
+          body: 'Test',
+        }),
+      });
+      expect(unauthRes.status).toBe(401);
+
+      const wrongSecretRes = await secretApp.request('/api/push/relay', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer wrong-secret',
+        },
+        body: JSON.stringify({
+          token: 'jpush-reg-id',
+          platform: PUSH_PLATFORM_ANDROID_JPUSH,
+          title: 'Alert',
+          body: 'Test',
+        }),
+      });
+      expect(wrongSecretRes.status).toBe(401);
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
+        async () => new Response(JSON.stringify({ sendno: '1', msg_id: '123' }), { status: 200 }),
+      );
+      try {
+        const okRes = await secretApp.request('/api/push/relay', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer relay-top-secret-token',
+          },
+          body: JSON.stringify({
+            token: 'jpush-reg-id',
+            platform: PUSH_PLATFORM_ANDROID_JPUSH,
+            title: 'Alert',
+            body: 'Test',
+          }),
+        });
+        expect(okRes.status).toBe(200);
+
+        // Exhaust remaining per-IP relay rate limit budget -> 429
+        let hitLimit = false;
+        for (let i = 0; i < 65; i += 1) {
+          const r = await secretApp.request('/api/push/relay', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer relay-top-secret-token',
+            },
+            body: JSON.stringify({
+              token: 'jpush-reg-id',
+              platform: PUSH_PLATFORM_ANDROID_JPUSH,
+              title: 'Alert',
+              body: 'Test',
+            }),
+          });
+          if (r.status === 429) {
+            hitLimit = true;
+            break;
+          }
+          expect(r.status).toBe(200);
+        }
+        expect(hitLimit).toBe(true);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
   });
 
   describe('classifyTaskPairNotificationType', () => {
