@@ -62,6 +62,51 @@ interface PressTracker {
 const LONG_PRESS_MS = 260;
 const MOVE_CANCEL_PX = 12;
 
+export const GLOBAL_TASK_TTS_MAX_AGE_MS = 2 * 60 * 1000;
+export const GLOBAL_TASK_TTS_CLOCK_SKEW_MS = 30 * 1000;
+
+export function shouldAutoSpeakTaskUpdate(input: {
+  row: GlobalTaskSummaryRow;
+  prev: GlobalTaskSummaryRow | undefined;
+  now: number;
+  mountAt: number;
+}): boolean {
+  const { row, prev, now, mountAt } = input;
+  const updatedAt = row.updatedAt;
+  if (typeof updatedAt !== 'number' || !Number.isFinite(updatedAt) || updatedAt <= 0) {
+    return false;
+  }
+  if (now - updatedAt > GLOBAL_TASK_TTS_MAX_AGE_MS) {
+    return false;
+  }
+  if (!prev) {
+    return updatedAt >= mountAt - GLOBAL_TASK_TTS_CLOCK_SKEW_MS;
+  }
+  if (updatedAt < (prev.updatedAt || 0)) {
+    return false;
+  }
+  const prevFlags = new Set(prev.flags ?? []);
+  const newBlocked = row.flags.includes('blocked') && !prevFlags.has('blocked');
+  const newNeedsInput = row.flags.includes('needs_input') && !prevFlags.has('needs_input');
+  const statusChanged = prev.status !== row.status || (row.status === 'rework' && row.round !== prev.round);
+  return statusChanged || newBlocked || newNeedsInput;
+}
+
+export function shouldAutoSpeakBrainText(input: {
+  eventTs: number;
+  now: number;
+  mountAt: number;
+}): boolean {
+  const { eventTs, now, mountAt } = input;
+  if (typeof eventTs !== 'number' || !Number.isFinite(eventTs) || eventTs <= 0) {
+    return false;
+  }
+  if (now - eventTs > GLOBAL_TASK_TTS_MAX_AGE_MS) {
+    return false;
+  }
+  return eventTs >= mountAt - GLOBAL_TASK_TTS_CLOCK_SKEW_MS;
+}
+
 export function TaskModeGlyphIcon({ size = 16, className }: { size?: number; className?: string }) {
   return (
     <svg
@@ -227,9 +272,11 @@ export function GlobalTaskModeView({
   translateRef.current = t;
   const taskModeSpokenIdsRef = useRef<Set<string>>(new Set());
   const seenTtsKeysRef = useRef<Set<string>>(new Set());
+  const mountAtRef = useRef<number>(Date.now());
   const entrySnapshotSeqRef = useRef<number>(globalTaskModeStore.getState().snapshotSeq);
   const lastSnapshotSeqRef = useRef<number>(globalTaskModeStore.getState().snapshotSeq);
   const seededLifecycleRef = useRef<boolean>(false);
+  const prevMutedSetRef = useRef<Set<string>>(new Set(globalTaskModeStore.getState().mutedServerIds));
   const prevTasksRef = useRef<Map<string, GlobalTaskSummaryRow>>(new Map());
   const pressTrackersRef = useRef<Map<string, PressTracker>>(new Map());
   const suppressClickKeysRef = useRef<Set<string>>(new Set());
@@ -239,13 +286,18 @@ export function GlobalTaskModeView({
   // Store & TTS subscriptions + single-connection lifecycle
   useEffect(() => {
     const initial = globalTaskModeStore.getState();
+    mountAtRef.current = Date.now();
     entrySnapshotSeqRef.current = initial.snapshotSeq;
     lastSnapshotSeqRef.current = initial.snapshotSeq;
     seededLifecycleRef.current = false;
+    prevMutedSetRef.current = new Set(initial.mutedServerIds);
     prevTasksRef.current = new Map(initial.tasks.map((row) => [taskKey(row.serverId, row.taskId), row]));
 
     const unsubStore = globalTaskModeStore.subscribe((next) => {
       setState(next);
+
+      const mutedSet = new Set(next.mutedServerIds);
+      const prevMutedSet = prevMutedSetRef.current;
 
       if (next.snapshotSeq > lastSnapshotSeqRef.current) {
         // Initial post-mount snapshot or reconnect snapshot: silently re-seed without speaking history.
@@ -253,28 +305,30 @@ export function GlobalTaskModeView({
         if (next.snapshotSeq > entrySnapshotSeqRef.current) {
           seededLifecycleRef.current = true;
         }
+        prevMutedSetRef.current = mutedSet;
         prevTasksRef.current = new Map(next.tasks.map((row) => [taskKey(row.serverId, row.taskId), row]));
         return;
       }
 
       if (!seededLifecycleRef.current) {
+        prevMutedSetRef.current = mutedSet;
         prevTasksRef.current = new Map(next.tasks.map((row) => [taskKey(row.serverId, row.taskId), row]));
         return;
       }
 
-      const mutedSet = new Set(next.mutedServerIds);
+      const now = Date.now();
       const nextMap = new Map<string, GlobalTaskSummaryRow>();
       for (const row of next.tasks) {
         const key = taskKey(row.serverId, row.taskId);
         nextMap.set(key, row);
-        if (mutedSet.has(row.serverId)) continue;
+        if (mutedSet.has(row.serverId) || prevMutedSet.has(row.serverId)) continue;
 
         const prev = prevTasksRef.current.get(key);
+        if (!shouldAutoSpeakTaskUpdate({ row, prev, now, mountAt: mountAtRef.current })) continue;
+
         const prevFlags = new Set(prev?.flags ?? []);
         const newBlocked = row.flags.includes('blocked') && !prevFlags.has('blocked');
         const newNeedsInput = row.flags.includes('needs_input') && !prevFlags.has('needs_input');
-        const statusChanged = !prev || prev.status !== row.status || (row.status === 'rework' && row.round !== prev.round);
-        if (!statusChanged && !newBlocked && !newNeedsInput) continue;
 
         const payload: Record<string, unknown> = {
           taskId: row.taskId,
@@ -301,12 +355,14 @@ export function GlobalTaskModeView({
         taskModeSpokenIdsRef.current.add(msgId);
         void speakText(spoken, { messageId: msgId, lang: localeRef.current, queue: true });
       }
+      prevMutedSetRef.current = mutedSet;
       prevTasksRef.current = nextMap;
     });
 
     const unsubBrainText = globalTaskModeStore.subscribeBrainText((event) => {
       const current = globalTaskModeStore.getState();
       if (current.mutedServerIds.includes(event.serverId)) return;
+      if (!shouldAutoSpeakBrainText({ eventTs: event.ts, now: Date.now(), mountAt: mountAtRef.current })) return;
       const dedupKey = `brain:${event.eventId}`;
       if (seenTtsKeysRef.current.has(dedupKey)) return;
       seenTtsKeysRef.current.add(dedupKey);

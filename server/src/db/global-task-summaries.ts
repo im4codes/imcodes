@@ -143,14 +143,48 @@ export async function getServerMetaForGlobalTask(
   };
 }
 
-export async function upsertGlobalTaskSummary(
+export function hasGlobalTaskSummaryChanged(
+  prev: GlobalTaskSummaryRow | null,
+  next: GlobalTaskSummaryRow,
+): boolean {
+  if (!prev) return true;
+  if (
+    prev.status !== next.status
+    || prev.round !== next.round
+    || prev.title !== next.title
+    || prev.projectName !== next.projectName
+    || prev.brainSession !== next.brainSession
+    || prev.brainLabel !== next.brainLabel
+    || prev.liveSummary !== next.liveSummary
+    || prev.executorLabel !== next.executorLabel
+    || prev.auditorLabel !== next.auditorLabel
+    || prev.auditor !== next.auditor
+    || prev.isTerminal !== next.isTerminal
+    || prev.needsAttention !== next.needsAttention
+    || prev.updatedAt !== next.updatedAt
+    || prev.checklist.total !== next.checklist.total
+    || prev.checklist.implemented !== next.checklist.implemented
+    || prev.checklist.audited !== next.checklist.audited
+  ) {
+    return true;
+  }
+  if (prev.flags.length !== next.flags.length) return true;
+  for (let i = 0; i < prev.flags.length; i += 1) {
+    if (prev.flags[i] !== next.flags[i]) return true;
+  }
+  return false;
+}
+
+export async function upsertGlobalTaskSummaryWithChange(
   db: Database,
   input: GlobalTaskSummaryUpsertInput,
-): Promise<GlobalTaskSummaryRow | null> {
+): Promise<{ row: GlobalTaskSummaryRow | null; changed: boolean }> {
   const serverId = cleanStr(input.serverId);
   const taskId = cleanStr(input.taskId);
   const status = cleanStr(input.status);
-  if (!serverId || !taskId || !status) return null;
+  if (!serverId || !taskId || !status) return { row: null, changed: false };
+
+  const prev = await getGlobalTaskSummaryForServerTask(db, serverId, taskId);
 
   const projectName = cleanStr(input.projectName);
   const brainSession = cleanStr(input.brainSession);
@@ -175,7 +209,10 @@ export async function upsertGlobalTaskSummary(
   const statusNeedsAttention = isGlobalTaskAttentionNeeded(status, cleanFlags);
   const now = Date.now();
   const createdAt = Math.max(0, Math.floor(Number(input.createdAt ?? 0) || 0));
-  const updatedAt = Math.max(0, Math.floor(Number(input.updatedAt ?? now) || now));
+  const hasExplicitUpdatedAt = typeof input.updatedAt === 'number' && Number.isFinite(input.updatedAt) && input.updatedAt > 0;
+  const updatedAt = hasExplicitUpdatedAt
+    ? Math.floor(input.updatedAt as number)
+    : (prev && prev.status === status && prev.updatedAt > 0 ? prev.updatedAt : now);
 
   await db.execute(
     `INSERT INTO global_task_pair_summaries (
@@ -196,18 +233,19 @@ export async function upsertGlobalTaskSummary(
       brain_session = CASE WHEN excluded.brain_session <> '' THEN excluded.brain_session ELSE global_task_pair_summaries.brain_session END,
       brain_label = CASE WHEN excluded.brain_label <> '' THEN excluded.brain_label ELSE global_task_pair_summaries.brain_label END,
       title = CASE WHEN excluded.title <> '' THEN excluded.title ELSE global_task_pair_summaries.title END,
-      status = excluded.status,
-      flags_json = CASE WHEN $8 <> '' THEN excluded.flags_json ELSE global_task_pair_summaries.flags_json END,
-      round = CASE WHEN excluded.round > 0 OR global_task_pair_summaries.round = 0 THEN excluded.round ELSE global_task_pair_summaries.round END,
-      checklist_total = CASE WHEN excluded.checklist_total > 0 THEN excluded.checklist_total ELSE global_task_pair_summaries.checklist_total END,
-      checklist_implemented = CASE WHEN excluded.checklist_total > 0 THEN excluded.checklist_implemented ELSE global_task_pair_summaries.checklist_implemented END,
-      checklist_audited = CASE WHEN excluded.checklist_total > 0 THEN excluded.checklist_audited ELSE global_task_pair_summaries.checklist_audited END,
+      status = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at THEN excluded.status ELSE global_task_pair_summaries.status END,
+      flags_json = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at AND $8 <> '' THEN excluded.flags_json ELSE global_task_pair_summaries.flags_json END,
+      round = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at AND (excluded.round > 0 OR global_task_pair_summaries.round = 0) THEN excluded.round ELSE global_task_pair_summaries.round END,
+      checklist_total = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at AND excluded.checklist_total > 0 THEN excluded.checklist_total ELSE global_task_pair_summaries.checklist_total END,
+      checklist_implemented = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at AND excluded.checklist_total > 0 THEN excluded.checklist_implemented ELSE global_task_pair_summaries.checklist_implemented END,
+      checklist_audited = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at AND excluded.checklist_total > 0 THEN excluded.checklist_audited ELSE global_task_pair_summaries.checklist_audited END,
       executor_label = COALESCE(excluded.executor_label, global_task_pair_summaries.executor_label),
       auditor_label = COALESCE(excluded.auditor_label, global_task_pair_summaries.auditor_label),
       auditor = COALESCE(excluded.auditor, global_task_pair_summaries.auditor),
-      live_summary = COALESCE(excluded.live_summary, global_task_pair_summaries.live_summary),
-      is_terminal = excluded.is_terminal,
+      live_summary = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at THEN COALESCE(excluded.live_summary, global_task_pair_summaries.live_summary) ELSE global_task_pair_summaries.live_summary END,
+      is_terminal = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at THEN excluded.is_terminal ELSE global_task_pair_summaries.is_terminal END,
       needs_attention = CASE
+        WHEN excluded.updated_at < global_task_pair_summaries.updated_at THEN global_task_pair_summaries.needs_attention
         WHEN $8 <> '' THEN excluded.needs_attention
         WHEN excluded.is_terminal THEN FALSE
         WHEN excluded.needs_attention THEN TRUE
@@ -247,7 +285,35 @@ export async function upsertGlobalTaskSummary(
     ],
   );
 
-  return getGlobalTaskSummaryForServerTask(db, serverId, taskId);
+  const next = await getGlobalTaskSummaryForServerTask(db, serverId, taskId);
+  if (!next) return { row: null, changed: false };
+  return { row: next, changed: hasGlobalTaskSummaryChanged(prev, next) };
+}
+
+export async function upsertGlobalTaskSummary(
+  db: Database,
+  input: GlobalTaskSummaryUpsertInput,
+): Promise<GlobalTaskSummaryRow | null> {
+  const { row } = await upsertGlobalTaskSummaryWithChange(db, input);
+  return row;
+}
+
+export async function upsertGlobalTaskSummariesBatchChanges(
+  db: Database,
+  serverId: string,
+  rows: readonly GlobalTaskSummaryUpsertInput[],
+): Promise<{ saved: GlobalTaskSummaryRow[]; changed: GlobalTaskSummaryRow[] }> {
+  if (rows.length === 0) return { saved: [], changed: [] };
+  const saved: GlobalTaskSummaryRow[] = [];
+  const changed: GlobalTaskSummaryRow[] = [];
+  for (const row of rows) {
+    const res = await upsertGlobalTaskSummaryWithChange(db, { ...row, serverId });
+    if (res.row) {
+      saved.push(res.row);
+      if (res.changed) changed.push(res.row);
+    }
+  }
+  return { saved, changed };
 }
 
 export async function upsertGlobalTaskSummariesBatch(
@@ -255,13 +321,8 @@ export async function upsertGlobalTaskSummariesBatch(
   serverId: string,
   rows: readonly GlobalTaskSummaryUpsertInput[],
 ): Promise<GlobalTaskSummaryRow[]> {
-  if (rows.length === 0) return [];
-  const results: GlobalTaskSummaryRow[] = [];
-  for (const row of rows) {
-    const updated = await upsertGlobalTaskSummary(db, { ...row, serverId });
-    if (updated) results.push(updated);
-  }
-  return results;
+  const { saved } = await upsertGlobalTaskSummariesBatchChanges(db, serverId, rows);
+  return saved;
 }
 
 export async function getGlobalTaskSummaryForServerTask(

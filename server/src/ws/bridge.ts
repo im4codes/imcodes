@@ -409,8 +409,8 @@ import {
 } from '../../../shared/task-pair.js';
 import { GLOBAL_TASK_FLEET_SNAPSHOT_MSG } from '../../../shared/global-task-mode.js';
 import {
-  upsertGlobalTaskSummariesBatch,
-  upsertGlobalTaskSummary,
+  upsertGlobalTaskSummariesBatchChanges,
+  upsertGlobalTaskSummaryWithChange,
   type GlobalTaskSummaryUpsertInput,
 } from '../db/global-task-summaries.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
@@ -15711,8 +15711,8 @@ export class WsBridge {
       });
     }
     if (inputs.length === 0) return;
-    const saved = await upsertGlobalTaskSummariesBatch(db, this.serverId, inputs);
-    for (const row of saved) {
+    const { changed } = await upsertGlobalTaskSummariesBatchChanges(db, this.serverId, inputs);
+    for (const row of changed) {
       await globalTaskHub.notifyTaskUpdated(db, this.serverId, row.taskId, row);
     }
   }
@@ -15793,7 +15793,7 @@ export class WsBridge {
           : (typeof payload.noticeText === 'string' && payload.noticeText.trim()
             ? payload.noticeText.trim().slice(0, 240)
             : undefined);
-        const saved = await upsertGlobalTaskSummary(db, {
+        const { row: saved, changed } = await upsertGlobalTaskSummaryWithChange(db, {
           serverId: this.serverId,
           taskId,
           projectName: typeof payload.projectName === 'string' ? payload.projectName : undefined,
@@ -15815,7 +15815,7 @@ export class WsBridge {
           liveSummary,
           updatedAt: eventTs,
         });
-        if (saved) {
+        if (saved && changed) {
           await globalTaskHub.notifyTaskUpdated(db, this.serverId, saved.taskId, saved);
         }
         return;
@@ -15824,6 +15824,8 @@ export class WsBridge {
       if (eventType === 'assistant.text') {
         if (!sessionId || sessionId.startsWith(SUBSESSION_NAME_PREFIX)) return;
         if (payload.streaming === true || payload.automation === true) return;
+        // Skip historical timeline replay/backfill events so reconnecting daemons do not trigger live Brain-text TTS.
+        if (Date.now() - eventTs > 5 * 60 * 1000) return;
         const rawText = typeof payload.text === 'string' ? payload.text : '';
         if (!rawText.trim()) return;
         const eventId = typeof event.eventId === 'string' && event.eventId.trim()
@@ -15854,8 +15856,8 @@ export class WsBridge {
         if (input) inputs.push(input);
       }
       if (inputs.length === 0) return;
-      const saved = await upsertGlobalTaskSummariesBatch(db, this.serverId, inputs);
-      for (const row of saved) {
+      const { changed } = await upsertGlobalTaskSummariesBatchChanges(db, this.serverId, inputs);
+      for (const row of changed) {
         await globalTaskHub.notifyTaskUpdated(db, this.serverId, row.taskId, row);
       }
       return;
@@ -15873,8 +15875,8 @@ export class WsBridge {
         if (input) inputs.push(input);
       }
       if (inputs.length === 0) return;
-      const saved = await upsertGlobalTaskSummariesBatch(db, this.serverId, inputs);
-      for (const row of saved) {
+      const { changed } = await upsertGlobalTaskSummariesBatchChanges(db, this.serverId, inputs);
+      for (const row of changed) {
         await globalTaskHub.notifyTaskUpdated(db, this.serverId, row.taskId, row);
       }
     }

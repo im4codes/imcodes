@@ -501,6 +501,7 @@ describe('GlobalTaskModeView', () => {
     fireEvent.click(screen.getByTestId('task-mode-server-toggle-srv-2'));
 
     // New Brain text from unmuted srv-1 -> rendered + queued TTS with server prefix; duplicate eventId ignored
+    const liveTs = Date.now();
     await act(async () => {
       ws.simulateMessage({
         type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
@@ -511,7 +512,7 @@ describe('GlobalTaskModeView', () => {
           projectName: 'imcodes',
           eventId: 'evt-brain-1',
           text: 'All unit tests passed.',
-          ts: 20_000,
+          ts: liveTs,
         },
       });
       ws.simulateMessage({
@@ -523,7 +524,7 @@ describe('GlobalTaskModeView', () => {
           projectName: 'imcodes',
           eventId: 'evt-brain-1',
           text: 'All unit tests passed.',
-          ts: 20_000,
+          ts: liveTs,
         },
       });
       // Muted server Brain text must not speak
@@ -536,7 +537,7 @@ describe('GlobalTaskModeView', () => {
           projectName: 'trainer',
           eventId: 'evt-muted-1',
           text: 'Should stay silent.',
-          ts: 20_100,
+          ts: liveTs + 100,
         },
       });
     });
@@ -565,7 +566,7 @@ describe('GlobalTaskModeView', () => {
           round: 2,
           checklist: { total: 5, implemented: 5, audited: 5 },
           createdAt: 100,
-          updatedAt: 25_000,
+          updatedAt: liveTs + 200,
           isTerminal: false,
           needsAttention: false,
         },
@@ -834,5 +835,282 @@ describe('GlobalTaskModeView', () => {
       'srv-plain-1',
     ]);
     expect(selectEl.value).toBe('srv-pin');
+  });
+
+  it('suppresses TTS for stale tasks, pre-mount backfill, out-of-order frames, unmuted server reveals, and stale brain_text while keeping UI updates, manual speak, clock skew tolerance, and live announcements working', async () => {
+    const { setTtsAutoReadEnabled } = await import('../../src/tts.js');
+    const {
+      GLOBAL_TASK_TTS_CLOCK_SKEW_MS,
+      GLOBAL_TASK_TTS_MAX_AGE_MS,
+      shouldAutoSpeakBrainText,
+      shouldAutoSpeakTaskUpdate,
+    } = await import('../../src/components/GlobalTaskModeView.js');
+    setTtsAutoReadEnabled(true);
+
+    const mountAt = Date.now();
+    const { ws } = await mountWithSnapshot();
+    expect(spokenUtterances).toHaveLength(0);
+
+    // Pure boundary checks: 30s clock skew + future-skewed timestamps allowed; >2m or pre-mount rejected
+    expect(shouldAutoSpeakBrainText({
+      eventTs: mountAt - 20_000,
+      now: mountAt,
+      mountAt,
+    })).toBe(true);
+    expect(shouldAutoSpeakBrainText({
+      eventTs: mountAt + 5_000,
+      now: mountAt,
+      mountAt,
+    })).toBe(true);
+    expect(shouldAutoSpeakBrainText({
+      eventTs: mountAt - GLOBAL_TASK_TTS_CLOCK_SKEW_MS - 1_000,
+      now: mountAt,
+      mountAt,
+    })).toBe(false);
+    expect(shouldAutoSpeakBrainText({
+      eventTs: mountAt - GLOBAL_TASK_TTS_MAX_AGE_MS - 1_000,
+      now: mountAt,
+      mountAt,
+    })).toBe(false);
+
+    expect(shouldAutoSpeakTaskUpdate({
+      row: {
+        serverId: 'srv-1',
+        serverName: 'M3-Mac',
+        serverOnline: true,
+        projectName: 'imcodes',
+        brainSession: 'deck_imcodes_brain',
+        brainLabel: 'IM Brain',
+        taskId: 'tsk_skew',
+        title: 'Clock skew live task',
+        status: 'working',
+        flags: [],
+        round: 1,
+        checklist: { total: 0, implemented: 0, audited: 0 },
+        createdAt: mountAt - 10_000,
+        updatedAt: mountAt - 10_000,
+        isTerminal: false,
+        needsAttention: false,
+      },
+      prev: undefined,
+      now: mountAt,
+      mountAt,
+    })).toBe(true);
+
+    // Counterexample 1: !prev historical UPSERT (2 hours old) -> NO TTS, but card still renders in UI
+    const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.UPSERT,
+        task: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          serverOnline: true,
+          projectName: 'imcodes',
+          brainSession: 'deck_imcodes_brain',
+          brainLabel: 'IM Brain',
+          taskId: 'tsk_old_hist',
+          title: 'Old historical done task',
+          status: 'done',
+          flags: [],
+          round: 1,
+          checklist: { total: 2, implemented: 2, audited: 2 },
+          createdAt: twoHoursAgo - 60_000,
+          updatedAt: twoHoursAgo,
+          isTerminal: true,
+          needsAttention: false,
+        },
+      });
+    });
+    expect(screen.getByTestId('task-mode-card-tsk_old_hist')).toBeTruthy();
+    expect(spokenUtterances).toHaveLength(0);
+
+    // Counterexample 2: existing task transitioning status with stale updatedAt (10 minutes ago) -> NO TTS
+    const tenMinAgo = Date.now() - 10 * 60 * 1000;
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.UPSERT,
+        task: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          serverOnline: true,
+          projectName: 'imcodes',
+          brainSession: 'deck_imcodes_brain',
+          brainLabel: 'IM Brain',
+          taskId: 'tsk_pair_1',
+          title: 'Build Global View',
+          status: 'done',
+          flags: [],
+          round: 2,
+          checklist: { total: 5, implemented: 5, audited: 5 },
+          createdAt: 100,
+          updatedAt: tenMinAgo,
+          isTerminal: true,
+          needsAttention: false,
+        },
+      });
+    });
+    expect(spokenUtterances).toHaveLength(0);
+
+    // Out-of-order stale frame whose updatedAt < prev.updatedAt MUST NOT speak even if within 2m
+    const nowLive = Date.now();
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.UPSERT,
+        task: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          serverOnline: true,
+          projectName: 'imcodes',
+          brainSession: 'deck_imcodes_brain',
+          brainLabel: 'IM Brain',
+          taskId: 'tsk_live_monotonic',
+          title: 'Live monotonic task',
+          status: 'passed',
+          flags: [],
+          round: 1,
+          checklist: { total: 1, implemented: 1, audited: 1 },
+          createdAt: nowLive,
+          updatedAt: nowLive,
+          isTerminal: false,
+          needsAttention: false,
+        },
+      });
+    });
+    expect(spokenUtterances).toHaveLength(1);
+    await act(async () => {
+      spokenUtterances[0]!.onend?.();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.UPSERT,
+        task: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          serverOnline: true,
+          projectName: 'imcodes',
+          brainSession: 'deck_imcodes_brain',
+          brainLabel: 'IM Brain',
+          taskId: 'tsk_live_monotonic',
+          title: 'Live monotonic task',
+          status: 'working',
+          flags: [],
+          round: 1,
+          checklist: { total: 1, implemented: 0, audited: 0 },
+          createdAt: nowLive - 5_000,
+          updatedAt: nowLive - 5_000,
+          isTerminal: false,
+          needsAttention: false,
+        },
+      });
+    });
+    expect(spokenUtterances).toHaveLength(1);
+
+    // Counterexample 3: mute srv-2 then unmute srv-2 -> revealed tasks (even with snapshot or fresh updatedAt) DO NOT speak
+    fireEvent.click(screen.getByTestId('task-mode-server-filter-btn'));
+    fireEvent.click(screen.getByTestId('task-mode-server-toggle-srv-2'));
+    await waitFor(() => expect(screen.queryByTestId('task-mode-card-tsk_no_checklist')).toBeNull());
+    fireEvent.click(screen.getByTestId('task-mode-server-toggle-srv-2'));
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: Date.now(),
+        servers: [
+          { id: 'srv-1', name: 'M3-Mac', online: true },
+          { id: 'srv-2', name: 'Linux-GPU', online: true },
+        ],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 'tsk_old_hist',
+            title: 'Old historical done task',
+            status: 'done',
+            flags: [],
+            round: 1,
+            checklist: { total: 2, implemented: 2, audited: 2 },
+            createdAt: twoHoursAgo - 60_000,
+            updatedAt: twoHoursAgo,
+            isTerminal: true,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-2',
+            serverName: 'Linux-GPU',
+            serverOnline: true,
+            projectName: 'trainer',
+            brainSession: 'deck_gpu_brain',
+            brainLabel: 'GPU Brain',
+            taskId: 'tsk_no_checklist',
+            title: 'Check GPU cluster',
+            status: 'awaiting_brain_decision',
+            flags: ['needs_input'],
+            round: 1,
+            checklist: { total: 0, implemented: 0, audited: 0 },
+            createdAt: nowLive,
+            updatedAt: nowLive,
+            isTerminal: false,
+            needsAttention: true,
+          },
+        ],
+      });
+    });
+    expect(screen.getByTestId('task-mode-card-tsk_no_checklist')).toBeTruthy();
+    expect(spokenUtterances).toHaveLength(1);
+
+    // Counterexample 4: stale BRAIN_TEXT (10 minutes ago) & pre-mount backfill (45s before mount) -> NO auto TTS,
+    // while manual speak button still reads the card aloud regardless of age.
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
+        event: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          sessionName: 'deck_imcodes_brain',
+          projectName: 'imcodes',
+          eventId: 'evt-brain-old',
+          text: 'Historical reply from 10 minutes ago.',
+          ts: tenMinAgo,
+        },
+      });
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
+        event: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          sessionName: 'deck_imcodes_brain',
+          projectName: 'imcodes',
+          eventId: 'evt-brain-premount',
+          text: 'Pre-mount reply.',
+          ts: mountAt - GLOBAL_TASK_TTS_CLOCK_SKEW_MS - 15_000,
+        },
+      });
+    });
+    expect(spokenUtterances).toHaveLength(1);
+    fireEvent.click(screen.getByTestId('task-mode-speak-tsk_old_hist'));
+    expect(spokenUtterances).toHaveLength(2);
+
+    // Positive case: fresh live BRAIN_TEXT + fresh live transition both speak
+    const freshNow = Date.now();
+    await act(async () => {
+      spokenUtterances[1]!.onend?.();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
+        event: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          sessionName: 'deck_imcodes_brain',
+          projectName: 'imcodes',
+          eventId: 'evt-brain-live',
+          text: 'Fresh live reply.',
+          ts: freshNow,
+        },
+      });
+    });
+    expect(spokenUtterances).toHaveLength(3);
+    expect(spokenUtterances[2]!.text).toContain('Fresh live reply.');
   });
 });

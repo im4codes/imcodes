@@ -263,6 +263,7 @@ class InMemoryGlobalTaskDb {
               updated_at: nUpdated,
             });
           } else {
+            const isNewerOrEqual = nUpdated >= existing.updated_at;
             this.summaries.set(key, {
               server_id: String(serverId),
               task_id: String(taskId),
@@ -270,20 +271,22 @@ class InMemoryGlobalTaskDb {
               brain_session: sBrain !== '' ? sBrain : existing.brain_session,
               brain_label: sBrainLabel !== '' ? sBrainLabel : existing.brain_label,
               title: sTitle !== '' ? sTitle : existing.title,
-              status: String(status),
-              flags_json: sFlags !== '' ? sFlags : existing.flags_json,
-              round: nRound > 0 || existing.round === 0 ? nRound : existing.round,
-              checklist_total: nTotal > 0 ? nTotal : existing.checklist_total,
-              checklist_implemented: nTotal > 0 ? nImpl : existing.checklist_implemented,
-              checklist_audited: nTotal > 0 ? nAudit : existing.checklist_audited,
+              status: isNewerOrEqual ? String(status) : existing.status,
+              flags_json: isNewerOrEqual && sFlags !== '' ? sFlags : existing.flags_json,
+              round: isNewerOrEqual && (nRound > 0 || existing.round === 0) ? nRound : existing.round,
+              checklist_total: isNewerOrEqual && nTotal > 0 ? nTotal : existing.checklist_total,
+              checklist_implemented: isNewerOrEqual && nTotal > 0 ? nImpl : existing.checklist_implemented,
+              checklist_audited: isNewerOrEqual && nTotal > 0 ? nAudit : existing.checklist_audited,
               executor_label: sExecLabel ?? existing.executor_label,
               auditor_label: sAuditLabel ?? existing.auditor_label,
               auditor: sAuditor ?? existing.auditor,
-              live_summary: sLive ?? existing.live_summary,
-              is_terminal: bTerminal,
-              needs_attention: sFlags !== ''
-                ? bAttention
-                : (bTerminal ? false : (bAttention ? true : existing.needs_attention)),
+              live_summary: isNewerOrEqual ? (sLive ?? existing.live_summary) : existing.live_summary,
+              is_terminal: isNewerOrEqual ? bTerminal : existing.is_terminal,
+              needs_attention: !isNewerOrEqual
+                ? existing.needs_attention
+                : (sFlags !== ''
+                  ? bAttention
+                  : (bTerminal ? false : (bAttention ? true : existing.needs_attention))),
               created_at: existing.created_at > 0 && nCreated > 0
                 ? Math.min(existing.created_at, nCreated)
                 : (nCreated > 0 ? nCreated : existing.created_at),
@@ -806,14 +809,29 @@ describe('global-task-mode server engine', () => {
     });
     expect(globalSubscriberFrames).toEqual([]);
 
-    // Valid completed Brain assistant.text pushes global_tasks.brain_text
+    // Stale historical assistant.text backfill (> 5m old) MUST NOT broadcast BRAIN_TEXT
+    const staleBrainTs = Date.now() - 10 * 60 * 1000;
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'assistant.text',
+        sessionId: 'deck_proj_brain',
+        eventId: 'evt-stale-backfill',
+        ts: staleBrainTs,
+        payload: { text: 'Old timeline replay.', streaming: false },
+      },
+    });
+    expect(globalSubscriberFrames).toEqual([]);
+
+    // Valid completed live Brain assistant.text pushes global_tasks.brain_text
+    const liveBrainTs = Date.now();
     await bridge.ingestGlobalTaskFrame(db, {
       type: TIMELINE_MESSAGES.EVENT,
       event: {
         type: 'assistant.text',
         sessionId: 'deck_proj_brain',
         eventId: 'evt-real-1',
-        ts: 3200,
+        ts: liveBrainTs,
         payload: { text: 'All tests are passing.', streaming: false },
       },
     });
@@ -825,9 +843,87 @@ describe('global-task-mode server engine', () => {
         sessionName: 'deck_proj_brain',
         eventId: 'evt-real-1',
         text: 'All tests are passing.',
-        ts: 3200,
+        ts: liveBrainTs,
       },
     });
+
+    // Re-syncing identical fleet_snapshot or console SNAPSHOT MUST NOT re-broadcast unchanged rows
+    globalSubscriberFrames.length = 0;
+    await bridge.ingestGlobalTaskFleetSnapshot(db, {
+      type: GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
+      pairs: [
+        {
+          taskId: 'tsk_fleet',
+          brain: 'deck_proj_brain',
+          projectName: 'imcodes',
+          title: 'Fleet Pair',
+          status: 'in_audit',
+          flags: [],
+          round: 2,
+          checklist: { total: 4, implemented: 2, audited: 1 },
+          createdAt: 1000,
+          updatedAt: 3000,
+        },
+      ],
+    });
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: 'supervision.task_console.snapshot',
+      scope: { projectName: 'imcodes', coordinatorSessionName: 'deck_proj_brain' },
+      tasks: [
+        {
+          taskId: 'tsk_fleet',
+          title: 'Fleet Pair',
+          pair: {
+            status: 'in_audit',
+            flags: [],
+            round: 2,
+            checklist: { total: 4, implemented: 2, audited: 1 },
+            brain: 'deck_proj_brain',
+            createdAt: 1000,
+            updatedAt: 3000,
+          },
+        },
+      ],
+    });
+    // Out-of-order older task_pair.event MUST NOT regress status or broadcast UPSERT
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 2500,
+        payload: {
+          taskId: 'tsk_fleet',
+          toStatus: 'working',
+          round: 1,
+          flags: [],
+        },
+      },
+    });
+    expect(globalSubscriberFrames).toEqual([]);
+    expect((await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_fleet'))?.status).toBe('in_audit');
+
+    // Genuine change in console SNAPSHOT DOES broadcast UPSERT
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: 'supervision.task_console.snapshot',
+      scope: { projectName: 'imcodes', coordinatorSessionName: 'deck_proj_brain' },
+      tasks: [
+        {
+          taskId: 'tsk_fleet',
+          title: 'Fleet Pair',
+          pair: {
+            status: 'passed',
+            flags: [],
+            round: 2,
+            checklist: { total: 4, implemented: 4, audited: 4 },
+            brain: 'deck_proj_brain',
+            createdAt: 1000,
+            updatedAt: liveBrainTs,
+          },
+        },
+      ],
+    });
+    expect(globalSubscriberFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.UPSERT && f.task.taskId === 'tsk_fleet' && f.task.status === 'passed')).toBe(true);
 
     // Ensure separate Hub instance works too
     const standalone = new GlobalTaskHub();
