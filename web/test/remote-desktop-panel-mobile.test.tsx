@@ -260,7 +260,7 @@ vi.mock('../src/components/FileBrowser.js', () => ({
   },
 }));
 
-import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
+import { RemoteDesktopPanel, resolveRemoteDesktopBrowserOpenUrl } from '../src/components/RemoteDesktopPanel.js';
 import { RemoteDesktopWorkspace } from '../src/components/RemoteDesktopWorkspace.js';
 import type { UseQuickDataResult } from '../src/components/QuickInputPanel.js';
 import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
@@ -3682,18 +3682,36 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(openBtn.disabled).toBe(false);
     await act(async () => { openBtn.click(); });
     expect(openSpy).toHaveBeenCalledWith(
-      expect.stringMatching(/^https?:\/\//),
+      expect.stringMatching(/^https?:\/\/[^/]+\/remote-desktop\/app\/\?machine=server-1$/),
       '_blank',
       'noopener,noreferrer',
     );
 
-    // Native (e.g. iOS App on Mac via Capacitor) uses Browser.open with configured server URL
+    // Native (e.g. iOS App on Mac via Capacitor) uses Browser.open with deep link directly to the target machine
     nativeOpenMocks.isNative.mockReturnValue(true);
     nativeOpenMocks.apiBaseUrl = 'https://im.zhinet.work';
     act(() => { openBtn.click(); });
     await vi.waitFor(() => {
-      expect(nativeOpenMocks.browserOpen).toHaveBeenCalledWith({ url: 'https://im.zhinet.work/' });
+      expect(nativeOpenMocks.browserOpen).toHaveBeenCalledWith({
+        url: 'https://im.zhinet.work/remote-desktop/app/?machine=server-1',
+      });
     });
+
+    // Direct URL resolver boundary checks: subpaths/ports, invalid/missing machineId fallback, non-http(s) rejection
+    expect(resolveRemoteDesktopBrowserOpenUrl('srv_abc-123')).toBe(
+      'https://im.zhinet.work/remote-desktop/app/?machine=srv_abc-123',
+    );
+    nativeOpenMocks.apiBaseUrl = 'http://127.0.0.1:8787/nested/path/';
+    expect(resolveRemoteDesktopBrowserOpenUrl('server-1')).toBe(
+      'http://127.0.0.1:8787/remote-desktop/app/?machine=server-1',
+    );
+    expect(resolveRemoteDesktopBrowserOpenUrl(undefined)).toBe('http://127.0.0.1:8787/remote-desktop/app/');
+    expect(resolveRemoteDesktopBrowserOpenUrl('')).toBe('http://127.0.0.1:8787/remote-desktop/app/');
+    expect(resolveRemoteDesktopBrowserOpenUrl('bad id/?evil=1')).toBe('http://127.0.0.1:8787/remote-desktop/app/');
+    nativeOpenMocks.apiBaseUrl = 'capacitor://localhost';
+    expect(resolveRemoteDesktopBrowserOpenUrl('server-1')).toBeNull();
+    nativeOpenMocks.apiBaseUrl = '';
+    expect(resolveRemoteDesktopBrowserOpenUrl('server-1')).toBeNull();
 
     // Unsafe/non-http(s) URL must never pass to Browser.open
     cleanup();

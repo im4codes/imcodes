@@ -1,4 +1,6 @@
 import { formatRemoteDesktopBytes, addTrafficBytes } from '@shared/remote-desktop-traffic.js';
+import { isPlausibleServerId } from '@shared/controlled-node-host-link.js';
+import { buildRemoteDesktopAppUrl } from '@shared/remote-desktop-app.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -372,7 +374,7 @@ export function remoteDesktopQuickInputHistoryKey(hostKey: string): string {
   return `remote-desktop:${hostKey}`;
 }
 
-export function resolveRemoteDesktopBrowserOpenUrl(): string | null {
+export function resolveRemoteDesktopBrowserOpenUrl(machineId?: string): string | null {
   const candidates: string[] = [];
   if (isNative()) {
     try { candidates.push(getApiBaseUrl()); } catch { /* ignore */ }
@@ -387,7 +389,8 @@ export function resolveRemoteDesktopBrowserOpenUrl(): string | null {
     try {
       const parsed = new URL(candidate);
       if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-        return parsed.toString();
+        const targetServerId = isPlausibleServerId(machineId) ? machineId : undefined;
+        return buildRemoteDesktopAppUrl(targetServerId, parsed.origin);
       }
     } catch {
       // Ignore malformed/non-http(s) URLs.
@@ -1458,7 +1461,7 @@ export function RemoteDesktopPanel({
     || snapshot.error === REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE;
 
   const openInBrowser = async () => {
-    const url = resolveRemoteDesktopBrowserOpenUrl();
+    const url = resolveRemoteDesktopBrowserOpenUrl(machine.serverId);
     if (!url) return;
     if (isNative()) {
       const { Browser } = await import('@capacitor/browser');
@@ -3883,7 +3886,7 @@ export function RemoteDesktopPanel({
                     <span>{t('remote_desktop.webrtc_unavailable')}</span>
                     <button
                       type="button"
-                      disabled={!resolveRemoteDesktopBrowserOpenUrl()}
+                      disabled={!resolveRemoteDesktopBrowserOpenUrl(machine.serverId)}
                       onClick={() => void openInBrowser()}
                     >
                       {t('remote_desktop.open_in_browser')}
