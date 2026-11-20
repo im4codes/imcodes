@@ -14,6 +14,16 @@ import { useNowTicker } from '../hooks/useNowTicker.js';
 import { formatTaskDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
+import { closeServerTaskPair } from '../api.js';
+import type { TaskPairCloseAction } from '@shared/task-pair-close.js';
+import {
+  clampContextMenuPosition,
+  formatTaskPairCloseError,
+  TaskPairCloseConfirmDialog,
+  TaskPairContextMenu,
+  type TaskPairCloseConfirmTarget,
+  type TaskPairContextMenuItem,
+} from './TaskPairActionMenus.js';
 import {
   DEFAULT_TASK_PAIR_SPLIT_MODIFIERS,
   KEYBOARD_SHORTCUTS_PREF_KEY,
@@ -141,7 +151,7 @@ function clampElementScroll(event: { currentTarget: EventTarget | null }): void 
   resetScrollPosition(event.currentTarget);
 }
 
-export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId, collapsedVisitKey, mobileAnchor, visible = true }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; visible?: boolean }) {
+export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId, collapsedVisitKey, mobileAnchor, visible = true, canCloseTasks = true }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; visible?: boolean; canCloseTasks?: boolean }) {
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(isMobileLayout);
   // A phone sub-session or split-executor visit shows its panel CLOSED every time it is opened and keeps the user's own choice in this component's memory only
@@ -197,6 +207,25 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     return (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId ?? null;
   });
   const [splitShortcutModifiers, setSplitShortcutModifiers] = useState<ShortcutModifierKey[]>(readTaskPairSplitModifiers);
+  const [optimisticClosedRows, setOptimisticClosedRows] = useState<Map<string, { toStatus: string; updatedAt: number; endedAt?: number }>>(() => new Map());
+  const [rowContextMenu, setRowContextMenu] = useState<{
+    taskId: string;
+    title: string;
+    status: string;
+    terminal: boolean;
+    payload: Record<string, unknown>;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [closeConfirmTarget, setCloseConfirmTarget] = useState<TaskPairCloseConfirmTarget | null>(null);
+  const [closeSending, setCloseSending] = useState(false);
+  const [closeError, setCloseError] = useState<string | null>(null);
+  useEffect(() => {
+    setOptimisticClosedRows(new Map());
+    setRowContextMenu(null);
+    setCloseConfirmTarget(null);
+    setCloseError(null);
+  }, [serverId]);
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
@@ -292,7 +321,21 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       }
     }
     for (const [id, row] of latest.entries()) {
-      const resolved = taskPairDisplayTitle(row.payload.title, id, row.payload.brief);
+      const override = optimisticClosedRows.get(id);
+      if (override) {
+        const existingUpdatedAt = Number.isFinite(row.updatedAt) ? row.updatedAt : 0;
+        if (!TASK_PAIR_TERMINAL_STATUSES.includes(row.payload.toStatus as TaskPairStatus) || override.updatedAt >= existingUpdatedAt) {
+          const nextPayload: Record<string, unknown> = {
+            ...row.payload,
+            toStatus: override.toStatus,
+            updatedAt: override.updatedAt,
+            ...(override.endedAt !== undefined ? { endedAt: override.endedAt } : {}),
+          };
+          latest.set(id, { ...row, payload: nextPayload, updatedAt: override.updatedAt });
+        }
+      }
+      const effectiveRow = latest.get(id) ?? row;
+      const resolved = taskPairDisplayTitle(effectiveRow.payload.title, id, effectiveRow.payload.brief);
       if (resolved) nextTaskTitles.set(id, resolved);
     }
     const grouped = groupAndOrderTaskPairRows(latest.values(), scopeSessionId);
@@ -320,7 +363,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       hasRows: latest.size > 0 && grouped.allRows.length > 0,
       hasActiveDurationRow: nextHasActiveDurationRow,
     };
-  }, [events, snapshotRows, snapshotTitles, scopeSessionId]);
+  }, [events, snapshotRows, snapshotTitles, scopeSessionId, optimisticClosedRows]);
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
   // inline sub-window shows the strip without touching the choice. On mobile main chat (no scopeSessionId), expanding uses fullscreen
   // overlay so inline cramped measurement / --task-pair-panel-max-h must not collapse or clip it.
@@ -445,7 +488,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     {!collapsed && <div key="expanded-body" class="task-pair-status-body"><div class="task-pair-status-rows" data-testid="task-pair-status-rows">
       {(() => { let sequence = 0; return groups.map((group) => {
         const heading = <h4>{TASK_PAIR_WAIT_KINDS.includes(group.key as typeof TASK_PAIR_WAIT_KINDS[number]) ? t(`taskPair.status.${group.key}`) : group.key === 'awaiting_brain_decision' ? t('taskPair.status.awaiting_brain_decision') : t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
-        const content = group.rows.map((row, index) => { const payload = row.payload; const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const duration = formatTaskDuration({ startedAt: row.startedAt, finishedAt: payload.finishedAt, endedAt: payload.endedAt, updatedAt: row.updatedAt, now, durationMs: payload.durationMs, terminal }, durationUnits); const title = taskPairDisplayTitle(payload.title, String(payload.taskId), payload.brief) ?? t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); const deliveryRound = Math.max(1, Number(payload.deliveryRound ?? 1)); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
+        const content = group.rows.map((row, index) => { const payload = row.payload; const taskIdStr = String(payload.taskId); const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const duration = formatTaskDuration({ startedAt: row.startedAt, finishedAt: payload.finishedAt, endedAt: payload.endedAt, updatedAt: row.updatedAt, now, durationMs: payload.durationMs, terminal }, durationUnits); const title = taskPairDisplayTitle(payload.title, taskIdStr, payload.brief) ?? t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(taskIdStr) ?? 0); const auditRound = Number(payload.round ?? 0); const deliveryRound = Math.max(1, Number(payload.deliveryRound ?? 1)); const canOpenMenu = (canCloseTasks && Boolean(serverId)) || (!isMobile && isTaskPairSplittable(payload) && activeSplitTaskId !== taskIdStr); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} data-task-id={taskIdStr} key={taskIdStr} onContextMenu={(e) => { if (!canOpenMenu) return; e.preventDefault(); e.stopPropagation(); const pos = clampContextMenuPosition(e.clientX, e.clientY, 210, 130); setRowContextMenu({ taskId: taskIdStr, title, status: taskStatus, terminal, payload, x: pos.x, y: pos.y }); }}>
           <span class="task-pair-status-sequence" aria-label={`#${sequenceNumber}`}>{sequenceNumber}</span>
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
@@ -513,11 +556,130 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       }); })()}
     </div></div>}
   </aside>;
-  return shouldPortalToAnchor && mobileAnchor ? createPortal(panelEl, mobileAnchor) : panelEl;
+  const handleConfirmCloseTask = useCallback(async () => {
+    const target = closeConfirmTarget;
+    if (!target || closeSending || !target.serverId) return;
+    setCloseSending(true);
+    setCloseError(null);
+    try {
+      const result = await closeServerTaskPair(target.serverId, target.taskId, {
+        action: target.action,
+        ...(target.action === 'done' ? { force: true } : {}),
+      });
+      if (!result.ok) {
+        setCloseError(formatTaskPairCloseError(result.error, (k, d) => t(k, d ?? k)));
+        return;
+      }
+      const nextStatus = result.status ?? (target.action === 'done' ? 'done' : 'cancelled');
+      const nextUpdatedAt = typeof result.updatedAt === 'number' && Number.isFinite(result.updatedAt)
+        ? result.updatedAt
+        : Date.now();
+      const nextEndedAt = typeof result.endedAt === 'number' && Number.isFinite(result.endedAt)
+        ? result.endedAt
+        : nextUpdatedAt;
+      setOptimisticClosedRows((prev) => {
+        const next = new Map(prev);
+        next.set(target.taskId, { toStatus: nextStatus, updatedAt: nextUpdatedAt, endedAt: nextEndedAt });
+        return next;
+      });
+      setSnapshotRows((prev) => {
+        if (!prev) return prev;
+        return prev.map((row) => (
+          String(row.taskId) === target.taskId
+            ? { ...row, toStatus: nextStatus, updatedAt: nextUpdatedAt, endedAt: nextEndedAt }
+            : row
+        ));
+      });
+      setCloseConfirmTarget(null);
+      setCloseError(null);
+    } catch (err) {
+      setCloseError(err instanceof Error ? err.message : t('taskMode.cancel_failed', 'Failed to cancel task'));
+    } finally {
+      setCloseSending(false);
+    }
+  }, [closeConfirmTarget, closeSending, t]);
+
+  const portalOrPanel = shouldPortalToAnchor && mobileAnchor ? createPortal(panelEl, mobileAnchor) : panelEl;
+  const openCloseDialog = (menu: NonNullable<typeof rowContextMenu>, action: TaskPairCloseAction) => {
+    if (!serverId) return;
+    setCloseError(null);
+    setCloseConfirmTarget({
+      serverId,
+      taskId: menu.taskId,
+      title: menu.title,
+      action,
+      status: menu.status,
+    });
+  };
+  const contextItems: TaskPairContextMenuItem[] = rowContextMenu ? (() => {
+    const items: TaskPairContextMenuItem[] = [];
+    if (canCloseTasks && serverId) {
+      items.push({
+        id: 'cancel',
+        label: t('taskMode.cancel_task', 'Cancel task'),
+        danger: true,
+        disabled: rowContextMenu.terminal,
+        testId: `task-pair-panel-ctx-cancel-${rowContextMenu.taskId}`,
+        onSelect: () => openCloseDialog(rowContextMenu, 'cancel'),
+      });
+      if (!rowContextMenu.terminal && (rowContextMenu.status === 'passed' || rowContextMenu.status === 'awaiting_brain_decision')) {
+        items.push({
+          id: 'done',
+          label: t('taskMode.close_task_done', 'Close as done'),
+          testId: `task-pair-panel-ctx-done-${rowContextMenu.taskId}`,
+          onSelect: () => openCloseDialog(rowContextMenu, 'done'),
+        });
+      }
+    }
+    if (!isMobile && isTaskPairSplittable(rowContextMenu.payload) && activeSplitTaskId !== rowContextMenu.taskId) {
+      items.push({
+        id: 'split',
+        label: t('taskPair.panel_open_split'),
+        testId: `task-pair-panel-ctx-split-${rowContextMenu.taskId}`,
+        onSelect: () => {
+          window.dispatchEvent(new CustomEvent('deck:pair-split', {
+            detail: {
+              taskId: rowContextMenu.taskId,
+              title: rowContextMenu.title,
+              executor: rowContextMenu.payload.executor,
+              auditor: rowContextMenu.payload.auditor,
+              action: 'open',
+            },
+          }));
+        },
+      });
+    }
+    return items;
+  })() : [];
+
+  return <>
+    {portalOrPanel}
+    {rowContextMenu && (
+      <TaskPairContextMenu
+        x={rowContextMenu.x}
+        y={rowContextMenu.y}
+        ariaLabel={rowContextMenu.title}
+        items={contextItems}
+        onClose={() => setRowContextMenu(null)}
+      />
+    )}
+    <TaskPairCloseConfirmDialog
+      target={closeConfirmTarget}
+      busy={closeSending}
+      error={closeError}
+      onCancel={() => {
+        if (!closeSending) {
+          setCloseConfirmTarget(null);
+          setCloseError(null);
+        }
+      }}
+      onConfirm={() => void handleConfirmCloseTask()}
+    />
+  </>;
 }
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
-export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null }; visible?: boolean }) {
+export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null }; visible?: boolean; canCloseTasks?: boolean }) {
   const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
   const [active, setActive] = useState(() => hasPairActivity(props.events, props.serverId));
   const [authorityUnavailable, setAuthorityUnavailable] = useState(() => (

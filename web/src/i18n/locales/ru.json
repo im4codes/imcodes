@@ -5634,6 +5634,21 @@
     "auditor_none": "Нет",
     "project_label": "Проект",
     "enter_session": "Открыть сессию",
-    "send_failed": "Не удалось отправить сообщение"
+    "send_failed": "Не удалось отправить сообщение",
+    "cancel_task": "Отменить задачу",
+    "close_task_done": "Закрыть как выполненную",
+    "cancel_confirm_title": "Отменить эту задачу?",
+    "cancel_confirm_body": "Задача «{{title}}» будет остановлена и помечена как отменённая.",
+    "close_done_confirm_title": "Закрыть задачу как выполненную?",
+    "close_done_confirm_body": "Задача «{{title}}» будет закрыта и помечена как выполненная.",
+    "cancel_confirm_action": "Отменить задачу",
+    "close_done_confirm_action": "Закрыть как выполненную",
+    "cancel_keep": "Оставить задачу",
+    "cancel_failed": "Не удалось отменить задачу",
+    "close_error_offline": "Демон не в сети",
+    "close_error_timeout": "Время ожидания запроса истекло",
+    "close_error_forbidden": "Только владелец сервера может отменять задачи",
+    "close_error_already_terminal": "Задача уже закрыта",
+    "swipe_cancel_hint": "Отмена"
   }
 }

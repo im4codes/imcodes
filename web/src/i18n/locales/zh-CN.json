@@ -5645,6 +5645,21 @@
     "auditor_none": "无审计",
     "project_label": "项目",
     "enter_session": "进入该会话",
-    "send_failed": "发送失败"
+    "send_failed": "发送失败",
+    "cancel_task": "取消任务",
+    "close_task_done": "标记完成并关闭",
+    "cancel_confirm_title": "确认取消该任务？",
+    "cancel_confirm_body": "「{{title}}」将被终止并标记为已取消。",
+    "close_done_confirm_title": "确认完成并关闭任务？",
+    "close_done_confirm_body": "「{{title}}」将被关闭并标记为已完成。",
+    "cancel_confirm_action": "确认取消",
+    "close_done_confirm_action": "确认关闭",
+    "cancel_keep": "保留任务",
+    "cancel_failed": "取消任务失败",
+    "close_error_offline": "节点离线，无法关闭任务",
+    "close_error_timeout": "请求超时，请重试",
+    "close_error_forbidden": "仅服务器所有者可取消任务",
+    "close_error_already_terminal": "任务已处于结束状态",
+    "swipe_cancel_hint": "取消"
   }
 }

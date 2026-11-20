@@ -2,6 +2,11 @@ import { R2_RELAY_MSG } from '../../shared/r2-relay.js';
 import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED } from '../../shared/session-incognito-types.js';
 import { isIncognitoSessionName, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { TASK_PAIR_DECISION_MSG } from '../../shared/task-pair-decision.js';
+import {
+  TASK_PAIR_CLOSE_ERROR,
+  TASK_PAIR_CLOSE_MSG,
+  readTaskPairCloseBody,
+} from '../../shared/task-pair-close.js';
 import { queuedUserMessageAttribution } from '../agent/transport-queued-user-message.js';
 /**
  * Handle commands from the web UI and inbound chat messages via ServerLink.
@@ -9,6 +14,7 @@ import { queuedUserMessageAttribution } from '../agent/transport-queued-user-mes
  */
 import type { ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import { isPairsEngineSession } from './task-pairs/engine.js';
+import { taskPairService } from './task-pairs/service.js';
 import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
@@ -2643,6 +2649,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case AGENT_MCP_MSG.RUN_REQUEST:
       void handleAgentMcpCommand(cmd, (message) => serverLink.send(message));
       break;
+    case TASK_PAIR_CLOSE_MSG.REQUEST:
+      void handleTaskPairCloseRequest(cmd, serverLink);
+      break;
     case 'fs.ls':
       void traceCommandAsync(cmd, 'web_command.fs_ls', () => handleFsList(cmd, serverLink));
       break;
@@ -2994,6 +3003,43 @@ async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: Ser
         error: P2P_CONFIG_ERROR.PERSIST_FAILED,
       });
     }
+  }
+}
+
+async function handleTaskPairCloseRequest(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const taskId = typeof cmd.taskId === 'string' ? cmd.taskId.trim() : '';
+  const body = readTaskPairCloseBody(cmd);
+  if (!requestId) return;
+  if (!taskId || !body) {
+    serverLink?.send({
+      type: TASK_PAIR_CLOSE_MSG.RESPONSE,
+      requestId,
+      ok: false,
+      error: TASK_PAIR_CLOSE_ERROR.INVALID_REQUEST,
+    });
+    return;
+  }
+  try {
+    const result = await taskPairService.closePairFromUi({
+      taskId,
+      ...body,
+      requestId,
+    });
+    serverLink?.send({
+      type: TASK_PAIR_CLOSE_MSG.RESPONSE,
+      requestId,
+      ...result,
+    });
+  } catch (err) {
+    logger.warn({ err, taskId, requestId }, 'task_pair.close_request failed');
+    serverLink?.send({
+      type: TASK_PAIR_CLOSE_MSG.RESPONSE,
+      requestId,
+      ok: false,
+      taskId,
+      error: TASK_PAIR_CLOSE_ERROR.REJECTED,
+    });
   }
 }
 

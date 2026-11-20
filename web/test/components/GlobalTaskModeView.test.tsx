@@ -223,6 +223,12 @@ describe('GlobalTaskModeView', () => {
           headers: { 'content-type': 'application/json' },
         });
       }
+      if (url.includes('/task-pairs/') && url.endsWith('/close')) {
+        return new Response(JSON.stringify({ ok: true, taskId: 'tsk-1', status: 'cancelled', updatedAt: Date.now(), endedAt: Date.now() }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       return new Response(JSON.stringify({}), { status: 200 });
     });
 
@@ -1642,8 +1648,8 @@ describe('GlobalTaskModeView', () => {
     const mobileBlock = css.slice(css.lastIndexOf('@media (max-width: 720px)'));
     expect(mobileBlock).toMatch(/\.global-task-mode-body\s*\{[^}]*padding:\s*8px;[^}]*gap:\s*6px;/s);
     expect(mobileBlock).toMatch(/\.global-task-quickbar\s*\{[^}]*padding:\s*6px 8px;[^}]*gap:\s*5px;/s);
-    expect(mobileBlock).toMatch(/\.global-task-card\s*\{[^}]*padding:\s*5px 7px;[^}]*gap:\s*2\.5px;/s);
-    expect(mobileBlock).toMatch(/\.global-task-card\.is-terminal\s*\{[^}]*padding:\s*4px 7px;/s);
+    expect(mobileBlock).toMatch(/\.global-task-card-surface\s*\{[^}]*padding:\s*5px 7px;[^}]*gap:\s*2\.5px;/s);
+    expect(mobileBlock).toMatch(/\.global-task-card\.is-terminal \.global-task-card-surface\s*\{[^}]*padding:\s*4px 7px;/s);
     expect(mobileBlock).toMatch(/\.global-task-card-title\s*\{[^}]*font-size:\s*11\.5px;/s);
     expect(mobileBlock).toMatch(/\.global-task-card-timing\s*\{[^}]*font-size:\s*9\.5px;/s);
     expect(mobileBlock).toMatch(/\.global-task-progress-track\s*\{[^}]*min-width:\s*20px;/s);
@@ -2186,5 +2192,141 @@ describe('GlobalTaskModeView', () => {
     fireEvent.click(screen.getByTestId('task-mode-composer-enter-session'));
     expect(screen.queryByTestId('task-mode-composer')).toBeNull();
     expect(onJumpToSession).toHaveBeenNthCalledWith(2, 'srv-2', 'deck_gpu_brain');
+  });
+
+  it('supports horizontal swipe-left with confirmation to cancel an active task while ignoring vertical scroll and partial swipes', async () => {
+    const closeCalls: Array<{ url: string; body: unknown }> = [];
+    fetchSpy.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes(GLOBAL_TASK_TICKET_PATH)) {
+        return new Response(JSON.stringify({ ticket: 'gt-ticket' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/task-pairs/') && url.endsWith('/close')) {
+        closeCalls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
+        return new Response(JSON.stringify({
+          ok: true,
+          taskId: 'tsk_pair_1',
+          status: 'cancelled',
+          updatedAt: Date.now(),
+          endedAt: Date.now(),
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+
+    await mountWithSnapshot();
+    const card = screen.getByTestId('task-mode-card-tsk_pair_1');
+
+    // 1. Vertical scroll gesture (dy > dx) must never trigger swipe cancel or modal
+    fireEvent.touchStart(card, { touches: [{ clientX: 200, clientY: 200 }] });
+    fireEvent.touchMove(card, { touches: [{ clientX: 185, clientY: 110 }] });
+    fireEvent.touchEnd(card);
+    expect(screen.queryByTestId('task-mode-swipe-cancel-tsk_pair_1')).toBeNull();
+    expect(screen.queryByTestId('task-pair-close-confirm-dialog')).toBeNull();
+    expect(closeCalls).toHaveLength(0);
+
+    // 2. Tiny horizontal nudge (<40px) snaps back cleanly without revealing or confirming
+    fireEvent.touchStart(card, { touches: [{ clientX: 200, clientY: 200 }] });
+    fireEvent.touchMove(card, { touches: [{ clientX: 175, clientY: 202 }] });
+    fireEvent.touchEnd(card);
+    expect(screen.queryByTestId('task-mode-swipe-cancel-tsk_pair_1')).toBeNull();
+    expect(screen.queryByTestId('task-pair-close-confirm-dialog')).toBeNull();
+
+    // 3. Moderate swipe (55px) reveals Cancel button without auto-cancelling
+    fireEvent.touchStart(card, { touches: [{ clientX: 200, clientY: 200 }] });
+    fireEvent.touchMove(card, { touches: [{ clientX: 145, clientY: 202 }] });
+    fireEvent.touchEnd(card);
+    const swipeBtn = screen.getByTestId('task-mode-swipe-cancel-tsk_pair_1');
+    expect(closeCalls).toHaveLength(0);
+
+    // Tapping revealed button opens confirmation dialog; Keep dismisses without API call
+    fireEvent.click(swipeBtn);
+    expect(screen.getByTestId('task-pair-close-confirm-dialog')).toBeTruthy();
+    fireEvent.click(screen.getByTestId('task-pair-close-keep-btn'));
+    expect(screen.queryByTestId('task-pair-close-confirm-dialog')).toBeNull();
+    expect(closeCalls).toHaveLength(0);
+
+    // 4. Full swipe left (>=88px) opens confirmation dialog; Confirm cancels the task
+    fireEvent.touchStart(card, { touches: [{ clientX: 220, clientY: 200 }] });
+    fireEvent.touchMove(card, { touches: [{ clientX: 120, clientY: 202 }] });
+    fireEvent.touchEnd(card);
+    expect(screen.getByTestId('task-pair-close-confirm-dialog')).toBeTruthy();
+    expect(closeCalls).toHaveLength(0);
+
+    fireEvent.click(screen.getByTestId('task-pair-close-confirm-btn'));
+    await waitFor(() => expect(closeCalls).toHaveLength(1));
+    expect(closeCalls[0]).toEqual({
+      url: 'http://localhost:3000/api/server/srv-1/task-pairs/tsk_pair_1/close',
+      body: { action: 'cancel' },
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId('task-pair-close-confirm-dialog')).toBeNull();
+      expect(screen.getByTestId('task-mode-card-tsk_pair_1').className).toContain('is-terminal');
+    });
+  });
+
+  it('supports desktop right-click context menu on Task Mode cards with confirmation, terminal guard, and error display', async () => {
+    const closeCalls: Array<{ url: string; body: unknown }> = [];
+    let shouldFailOffline = true;
+    fetchSpy.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes(GLOBAL_TASK_TICKET_PATH)) {
+        return new Response(JSON.stringify({ ticket: 'gt-ticket' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/task-pairs/') && url.endsWith('/close')) {
+        closeCalls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
+        if (shouldFailOffline) {
+          return new Response(JSON.stringify({ ok: false, error: 'daemon_offline' }), {
+            status: 503,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          taskId: 'tsk_pair_1',
+          status: 'cancelled',
+          updatedAt: Date.now(),
+          endedAt: Date.now(),
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+
+    await mountWithSnapshot();
+
+    // Terminal card right-click offers Open session / Follow up, NOT Cancel task
+    fireEvent.contextMenu(screen.getByTestId('task-mode-card-tsk_done_1'), { clientX: 120, clientY: 140 });
+    expect(screen.getByTestId('task-pair-context-menu')).toBeTruthy();
+    expect(screen.queryByTestId('task-mode-ctx-cancel-tsk_done_1')).toBeNull();
+    expect(screen.getByTestId('task-mode-ctx-open-tsk_done_1')).toBeTruthy();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByTestId('task-pair-context-menu')).toBeNull();
+
+    // Active card right-click opens Cancel task -> Confirm -> offline error stays in dialog -> retry succeeds
+    fireEvent.contextMenu(screen.getByTestId('task-mode-card-tsk_pair_1'), { clientX: 140, clientY: 160 });
+    fireEvent.click(screen.getByTestId('task-mode-ctx-cancel-tsk_pair_1'));
+    expect(screen.getByTestId('task-pair-close-confirm-dialog')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('task-pair-close-confirm-btn'));
+    await waitFor(() => expect(screen.getByTestId('task-pair-close-confirm-error').textContent).toContain('Daemon is offline'));
+    expect(closeCalls).toHaveLength(1);
+
+    shouldFailOffline = false;
+    fireEvent.click(screen.getByTestId('task-pair-close-confirm-btn'));
+    await waitFor(() => expect(screen.queryByTestId('task-pair-close-confirm-dialog')).toBeNull());
+    expect(closeCalls).toHaveLength(2);
+    expect(screen.getByTestId('task-mode-card-tsk_pair_1').className).toContain('is-terminal');
   });
 });

@@ -3,6 +3,8 @@ import {
   GLOBAL_TASK_SNAPSHOT_PATH,
   GLOBAL_TASK_TICKET_PATH,
   GLOBAL_TASK_WS_PATH,
+  isGlobalTaskAttentionNeeded,
+  isGlobalTaskTerminalStatus,
   isGlobalTaskWithinSyncWindow,
   type GlobalTaskBrainSummary,
   type GlobalTaskBrainTextEvent,
@@ -13,10 +15,11 @@ import {
   type GlobalTaskSummaryRow,
 } from '@shared/global-task-mode.js';
 import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
+import type { TaskPairCloseAction, TaskPairCloseResponse } from '@shared/task-pair-close.js';
 import { fallbackReadableSessionDisplay, pickReadableSessionDisplay } from '@shared/session-display.js';
 import { parseSyncedPreference, type SyncedPreferencePayload } from '@shared/synced-preference.js';
 import { formatLabel } from './format-label.js';
-import { ApiError, apiFetch, getApiBaseUrl, getUserPref, saveUserPref, sendSessionViaHttp } from './api.js';
+import { ApiError, apiFetch, closeServerTaskPair, getApiBaseUrl, getUserPref, saveUserPref, sendSessionViaHttp } from './api.js';
 
 export const GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY = 'imcodes.global-task-mode.muted-servers';
 export const GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY = 'imcodes.global-task-mode.pinned-brains';
@@ -916,6 +919,49 @@ export class GlobalTaskModeStore {
       label: input.label,
       projectName: input.projectName,
     });
+  }
+
+  async closeTaskPair(input: {
+    serverId: string;
+    taskId: string;
+    action: TaskPairCloseAction;
+    force?: boolean;
+  }): Promise<TaskPairCloseResponse> {
+    const serverId = input.serverId.trim();
+    const taskId = input.taskId.trim();
+    if (!serverId || !taskId) {
+      return { ok: false, error: 'invalid_request' };
+    }
+    const result = await closeServerTaskPair(serverId, taskId, {
+      action: input.action,
+      ...(input.force !== undefined ? { force: input.force } : {}),
+    });
+    if (result.ok && result.status) {
+      const targetKey = taskKey(serverId, taskId);
+      const updatedAt = typeof result.updatedAt === 'number' && Number.isFinite(result.updatedAt)
+        ? result.updatedAt
+        : Date.now();
+      const nextTasks = sortGlobalTaskCards(
+        this.state.tasks.map((row) => {
+          if (taskKey(row.serverId, row.taskId) !== targetKey) return row;
+          const nextStatus = result.status!;
+          const nextFlags = result.effect === 'forced' && !row.flags.includes('unaudited')
+            ? row.flags
+            : row.flags;
+          return {
+            ...row,
+            status: nextStatus,
+            flags: nextFlags,
+            isTerminal: isGlobalTaskTerminalStatus(nextStatus),
+            needsAttention: isGlobalTaskAttentionNeeded(nextStatus, nextFlags),
+            updatedAt,
+            ...(result.endedAt !== undefined ? { endedAt: result.endedAt } : isGlobalTaskTerminalStatus(nextStatus) ? { endedAt: updatedAt } : {}),
+          };
+        }),
+      );
+      this.setState({ tasks: nextTasks, lastSyncedAt: Date.now() });
+    }
+    return result;
   }
 
   clearSessionState(): void {

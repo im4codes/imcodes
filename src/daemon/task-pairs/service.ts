@@ -1,4 +1,9 @@
 import { TASK_PAIR_DECISION_BRAIN_NOTICE_REASON, TASK_PAIR_DECISION_KIND, validateTaskPairDecisionDetails } from '../../../shared/task-pair-decision.js';
+import {
+  TASK_PAIR_CLOSE_ERROR,
+  type TaskPairCloseAction,
+  type TaskPairCloseResponse,
+} from '../../../shared/task-pair-close.js';
 import { projectPairScheduling, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
 import { buildDependencyTitleRecord } from '../../../shared/task-pair-display.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_VERSION, taskPairTitleWireAccess, isTaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
@@ -3093,6 +3098,78 @@ export class TaskPairService {
   /** Test/diagnostic view of a project's pairs. */
   listPairs(project: string): StoredTaskPair[] {
     return getTaskPairStore().listPairs(project);
+  }
+
+  /**
+   * Close or cancel a task pair on behalf of the machine's owner via the UI.
+   * Reuses the authoritative marker state machine (`CANCEL` / `DONE`),
+   * releasing resource claims, cleaning queues, ending workspaces, and
+   * projecting live updates cleanly.
+   */
+  async closePairFromUi(input: {
+    taskId: string;
+    action: TaskPairCloseAction;
+    force?: boolean;
+    integration?: string;
+    requestId?: string;
+  }): Promise<TaskPairCloseResponse> {
+    const taskId = input.taskId.trim();
+    if (!taskId || (input.action !== 'cancel' && input.action !== 'done')) {
+      return { ok: false, error: TASK_PAIR_CLOSE_ERROR.INVALID_REQUEST };
+    }
+    const store = getTaskPairStore();
+    const matches = store.findPairsByTaskId(taskId);
+    if (matches.length === 0) {
+      return { ok: false, taskId, error: TASK_PAIR_CLOSE_ERROR.NOT_FOUND };
+    }
+    const stored = matches.find((pair) => !isTerminalTaskPairStatus(pair.state.status)) ?? matches[0]!;
+    const dismissesDoneIntegration = stored.state.status === 'done'
+      && input.action === 'done'
+      && input.integration === 'dismiss';
+    if (isTerminalTaskPairStatus(stored.state.status) && !dismissesDoneIntegration) {
+      return {
+        ok: false,
+        taskId,
+        status: stored.state.status,
+        error: TASK_PAIR_CLOSE_ERROR.ALREADY_TERMINAL,
+      };
+    }
+    const verb = input.action === 'done' ? 'DONE' as const : 'CANCEL' as const;
+    const attrs: Record<string, string> = {};
+    if (verb === 'DONE') {
+      if (input.force !== false) attrs.force = 'true';
+      if (input.integration) attrs.integration = input.integration;
+    }
+    const requestKey = input.requestId?.trim() || `${Date.now()}:${randomUUID()}`;
+    const eventId = `ui:pair-${verb.toLowerCase()}:${stored.project}:${taskId}:${requestKey}`;
+    const transition = this.applyMarker({
+      project: stored.project,
+      writer: 'daemon',
+      marker: { verb, knownVerb: verb, taskId, attrs },
+      source: 'daemon',
+      eventId,
+      suppressAutomaticBrief: true,
+    });
+    await this.waitForIdle();
+    const after = store.getPair(stored.project, taskId)?.state;
+    if (!after) {
+      return { ok: false, taskId, error: TASK_PAIR_CLOSE_ERROR.NOT_FOUND };
+    }
+    if (transition.unusual && transition.effect === 'recorded') {
+      return { ok: false, taskId, status: after.status, error: TASK_PAIR_CLOSE_ERROR.REJECTED };
+    }
+    const endedAt = after.workspace?.endedAt ?? (isTerminalTaskPairStatus(after.status) ? after.updatedAt : undefined);
+    return {
+      ok: true,
+      taskId,
+      status: after.status,
+      effect: transition.effect,
+      projectName: stored.project,
+      brainSession: after.brain,
+      ...(after.title ? { title: after.title } : {}),
+      updatedAt: after.updatedAt,
+      ...(endedAt !== undefined ? { endedAt } : {}),
+    };
   }
 
   isActive(pair: TaskPairState): boolean {

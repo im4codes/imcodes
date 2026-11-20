@@ -20,6 +20,7 @@ import { SubSessionTaskTitle } from '../../src/components/SubSessionTaskTitle.js
 import { SupervisionTaskPairSnapshotBridge, taskConsoleStateToPairSnapshot } from '../../src/components/SupervisionTaskConsole.js';
 import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
+import { clearApiKey, configure as configureApi, configureApiKey } from '../../src/api.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
 import {
   SUPERVISION_TASK_CONSOLE_CACHE_STORAGE_KEY,
@@ -2735,6 +2736,119 @@ describe('SupervisionTaskPairSnapshotBridge warm-cache recovery', () => {
       expect(recentGroup!.open).toBe(true);
     } finally {
       delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      localStorage.clear();
+    }
+  });
+
+  it('supports right-click context menu on status panel rows with confirmation to cancel active tasks and enforces terminal/viewer guards', async () => {
+    configureApi('http://localhost:3000');
+    configureApiKey('test-key');
+    const closeCalls: Array<{ url: string; body: unknown }> = [];
+    let failForbidden = false;
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/task-pairs/') && url.endsWith('/close')) {
+        closeCalls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
+        if (failForbidden) {
+          return new Response(JSON.stringify({ ok: false, error: 'forbidden' }), {
+            status: 403,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          taskId: 'row-active',
+          status: 'cancelled',
+          updatedAt: 20_000,
+          endedAt: 20_000,
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const events = [
+      {
+        eventId: 'ev-active',
+        type: TASK_PAIR_TIMELINE_EVENT,
+        ts: 10_000,
+        payload: {
+          taskId: 'row-active',
+          title: 'Active task row',
+          toStatus: 'working',
+          executor: 'deck_exec_1',
+          auditor: 'deck_aud_1',
+        },
+      },
+      {
+        eventId: 'ev-done',
+        type: TASK_PAIR_TIMELINE_EVENT,
+        ts: 9_000,
+        payload: {
+          taskId: 'row-done',
+          title: 'Done task row',
+          toStatus: 'done',
+          executor: 'deck_exec_2',
+          auditor: 'none',
+        },
+      },
+    ] as unknown as TimelineEvent[];
+
+    try {
+      const { container, rerender } = render(<TaskPairStatusPanel events={events} serverId="srv-panel" />);
+      const activeRow = container.querySelector('.task-pair-status-row[data-task-id="row-active"]') as HTMLElement;
+      expect(activeRow).toBeTruthy();
+
+      // Right-click active row -> open context menu -> Keep dismisses without API call
+      fireEvent.contextMenu(activeRow, { clientX: 120, clientY: 160 });
+      const cancelMenuBtn = screen.getByTestId('task-pair-panel-ctx-cancel-row-active');
+      expect((cancelMenuBtn as HTMLButtonElement).disabled).toBe(false);
+      fireEvent.click(cancelMenuBtn);
+      expect(screen.getByTestId('task-pair-close-confirm-dialog')).toBeTruthy();
+      fireEvent.click(screen.getByTestId('task-pair-close-keep-btn'));
+      expect(screen.queryByTestId('task-pair-close-confirm-dialog')).toBeNull();
+      expect(closeCalls).toHaveLength(0);
+
+      // Failed API error stays in confirmation dialog; retry succeeds and moves row to recent cancelled
+      failForbidden = true;
+      fireEvent.contextMenu(activeRow, { clientX: 120, clientY: 160 });
+      fireEvent.click(screen.getByTestId('task-pair-panel-ctx-cancel-row-active'));
+      fireEvent.click(screen.getByTestId('task-pair-close-confirm-btn'));
+      await waitFor(() => expect(screen.getByTestId('task-pair-close-confirm-error').textContent).toContain('taskMode.close_error_forbidden'));
+      expect(closeCalls).toHaveLength(1);
+
+      failForbidden = false;
+      fireEvent.click(screen.getByTestId('task-pair-close-confirm-btn'));
+      await waitFor(() => expect(screen.queryByTestId('task-pair-close-confirm-dialog')).toBeNull());
+      expect(closeCalls).toHaveLength(2);
+      expect(closeCalls[1]).toEqual({
+        url: 'http://localhost:3000/api/server/srv-panel/task-pairs/row-active/close',
+        body: { action: 'cancel' },
+      });
+      await waitFor(() => {
+        const updatedRow = container.querySelector('.task-pair-status-row[data-task-id="row-active"]');
+        expect(updatedRow?.getAttribute('data-status')).toBe('cancelled');
+      });
+
+      // Terminal row in recent group disables Cancel task
+      const recentDetails = container.querySelector('details.task-pair-status-group-recent') as HTMLDetailsElement;
+      recentDetails.open = true;
+      const doneRow = container.querySelector('.task-pair-status-row[data-task-id="row-done"]') as HTMLElement;
+      fireEvent.contextMenu(doneRow, { clientX: 120, clientY: 200 });
+      expect((screen.getByTestId('task-pair-panel-ctx-cancel-row-done') as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.keyDown(document, { key: 'Escape' });
+
+      // Non-owner / shared viewer (canCloseTasks=false) hides Cancel task
+      rerender(<TaskPairStatusPanel events={events} serverId="srv-panel" canCloseTasks={false} />);
+      const viewerRow = container.querySelector('.task-pair-status-row[data-task-id="row-active"]') as HTMLElement;
+      fireEvent.contextMenu(viewerRow, { clientX: 120, clientY: 160 });
+      expect(screen.queryByTestId('task-pair-panel-ctx-cancel-row-active')).toBeNull();
+    } finally {
+      clearApiKey();
+      vi.unstubAllGlobals();
       localStorage.clear();
     }
   });

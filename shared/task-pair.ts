@@ -2562,7 +2562,7 @@ export function applyTaskPairMarker(
       return done('next_round');
     }
     case 'DONE': {
-      const force = role === 'brain' && isTrue(attrs.force);
+      const force = roleAuthority && isTrue(attrs.force);
       if (terminal && existing.status === 'done' && roleAuthority && attrs[TASK_PAIR_INTEGRATION_ATTR] === TASK_PAIR_INTEGRATION_DISMISS_VALUE) return dismissIntegration(existing, ctx.now);
       if (terminal) return recorded(existing, false);
       if (force) {

@@ -5634,6 +5634,21 @@
     "auditor_none": "なし",
     "project_label": "プロジェクト",
     "enter_session": "セッションを開く",
-    "send_failed": "送信に失敗しました"
+    "send_failed": "送信に失敗しました",
+    "cancel_task": "タスクをキャンセル",
+    "close_task_done": "完了として閉じる",
+    "cancel_confirm_title": "このタスクをキャンセルしますか？",
+    "cancel_confirm_body": "「{{title}}」は停止され、キャンセル済みとして記録されます。",
+    "close_done_confirm_title": "完了として閉じますか？",
+    "close_done_confirm_body": "「{{title}}」を閉じて完了済みにします。",
+    "cancel_confirm_action": "キャンセル確定",
+    "close_done_confirm_action": "完了して閉じる",
+    "cancel_keep": "タスクを保持",
+    "cancel_failed": "タスクのキャンセルに失敗しました",
+    "close_error_offline": "デーモンがオフラインです",
+    "close_error_timeout": "リクエストがタイムアウトしました",
+    "close_error_forbidden": "タスクをキャンセルできるのはサーバー所有者のみです",
+    "close_error_already_terminal": "タスクはすでに終了しています",
+    "swipe_cancel_hint": "キャンセル"
   }
 }

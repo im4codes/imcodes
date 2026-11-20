@@ -32,6 +32,15 @@ import { TtsQuickSettingsPopover } from './TtsQuickSettingsPopover.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { formatTaskDuration } from '../util/tool-duration.js';
+import {
+  clampContextMenuPosition,
+  formatTaskPairCloseError,
+  TaskPairCloseConfirmDialog,
+  TaskPairContextMenu,
+  type TaskPairCloseConfirmTarget,
+  type TaskPairContextMenuItem,
+} from './TaskPairActionMenus.js';
+import type { TaskPairCloseAction } from '@shared/task-pair-close.js';
 
 export type GlobalTaskStatusFilter = 'all' | 'attention' | 'working' | 'audit' | 'done';
 
@@ -68,6 +77,12 @@ interface PressTracker {
 
 const LONG_PRESS_MS = 260;
 const MOVE_CANCEL_PX = 12;
+const SWIPE_START_DX_PX = -12;
+const SWIPE_VERTICAL_SLOP_PX = 10;
+const SWIPE_REVEAL_OFFSET_PX = -84;
+const SWIPE_MIN_OFFSET_PX = -112;
+const SWIPE_REVEAL_THRESHOLD_PX = 40;
+const SWIPE_CONFIRM_THRESHOLD_PX = 88;
 
 export const GLOBAL_TASK_TTS_MAX_AGE_MS = 2 * 60 * 1000;
 export const GLOBAL_TASK_TTS_CLOCK_SKEW_MS = 30 * 1000;
@@ -357,6 +372,24 @@ export function GlobalTaskModeView({
   const [addMessage, setAddMessage] = useState('');
   const [addSending, setAddSending] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
+
+  const [revealedSwipeKey, setRevealedSwipeKey] = useState<string | null>(null);
+  const [draggingSwipe, setDraggingSwipe] = useState<{ key: string; offset: number } | null>(null);
+  const [cardContextMenu, setCardContextMenu] = useState<{ task: GlobalTaskSummaryRow; x: number; y: number } | null>(null);
+  const [closeConfirmTarget, setCloseConfirmTarget] = useState<TaskPairCloseConfirmTarget | null>(null);
+  const [closeSending, setCloseSending] = useState(false);
+  const [closeError, setCloseError] = useState<string | null>(null);
+  const swipeDragRef = useRef<{
+    key: string;
+    startX: number;
+    startY: number;
+    dx: number;
+    mode: 'undecided' | 'horizontal' | 'vertical';
+    source: 'touch' | 'pointer';
+    pointerId?: number;
+    baseOffset: number;
+  } | null>(null);
+  const suppressCardClickKeyRef = useRef<string | null>(null);
 
   // Refs for TTS lifecycle & press gestures
   const ttsAutoReadRef = useRef(ttsAutoRead);
@@ -991,6 +1024,129 @@ export function GlobalTaskModeView({
     });
   }, []);
 
+  const openCloseConfirm = useCallback((task: GlobalTaskSummaryRow, action: TaskPairCloseAction = 'cancel') => {
+    setRevealedSwipeKey(null);
+    setDraggingSwipe(null);
+    setCardContextMenu(null);
+    setCloseError(null);
+    setCloseConfirmTarget({
+      serverId: task.serverId,
+      taskId: task.taskId,
+      title: task.title,
+      action,
+      status: task.status,
+    });
+  }, []);
+
+  const handleConfirmCloseTask = useCallback(async () => {
+    const target = closeConfirmTarget;
+    if (!target || closeSending) return;
+    setCloseSending(true);
+    setCloseError(null);
+    try {
+      const result = await globalTaskModeStore.closeTaskPair({
+        serverId: target.serverId,
+        taskId: target.taskId,
+        action: target.action,
+        ...(target.action === 'done' ? { force: true } : {}),
+      });
+      if (!result.ok) {
+        setCloseError(formatTaskPairCloseError(result.error, (k, d) => t(k, d ?? k)));
+        return;
+      }
+      setCloseConfirmTarget(null);
+      setCloseError(null);
+    } catch (err) {
+      setCloseError(err instanceof Error ? err.message : t('taskMode.cancel_failed', 'Failed to cancel task'));
+    } finally {
+      setCloseSending(false);
+    }
+  }, [closeConfirmTarget, closeSending, t]);
+
+  const startCardSwipe = useCallback((
+    key: string,
+    task: GlobalTaskSummaryRow,
+    clientX: number,
+    clientY: number,
+    source: 'touch' | 'pointer',
+    eventTarget: EventTarget | null,
+    pointerId?: number,
+  ) => {
+    if (task.isTerminal) return;
+    if (source === 'pointer' && swipeDragRef.current?.source === 'touch') return;
+    const el = eventTarget as Element | null;
+    if (el?.closest?.('button, a, input, textarea, select')) return;
+    swipeDragRef.current = {
+      key,
+      startX: clientX,
+      startY: clientY,
+      dx: 0,
+      mode: 'undecided',
+      source,
+      pointerId,
+      baseOffset: revealedSwipeKey === key ? SWIPE_REVEAL_OFFSET_PX : 0,
+    };
+  }, [revealedSwipeKey]);
+
+  const moveCardSwipe = useCallback((
+    key: string,
+    clientX: number,
+    clientY: number,
+    source: 'touch' | 'pointer',
+    pointerId?: number,
+  ) => {
+    const drag = swipeDragRef.current;
+    if (!drag || drag.key !== key || drag.source !== source) return;
+    if (source === 'pointer' && pointerId !== drag.pointerId) return;
+    const dx = clientX - drag.startX;
+    const dy = clientY - drag.startY;
+    drag.dx = dx;
+    if (drag.mode === 'undecided') {
+      if (Math.abs(dy) > SWIPE_VERTICAL_SLOP_PX && Math.abs(dy) >= Math.abs(dx)) {
+        drag.mode = 'vertical';
+        setDraggingSwipe(null);
+        return;
+      }
+      const wantsHorizontalLeft = dx < SWIPE_START_DX_PX && Math.abs(dx) > Math.abs(dy) * 1.4;
+      const wantsDismissRight = drag.baseOffset < 0 && dx > 12 && Math.abs(dx) > Math.abs(dy) * 1.4;
+      if (wantsHorizontalLeft || wantsDismissRight) {
+        drag.mode = 'horizontal';
+        suppressCardClickKeyRef.current = key;
+      } else {
+        return;
+      }
+    }
+    if (drag.mode === 'horizontal') {
+      const nextOffset = Math.max(SWIPE_MIN_OFFSET_PX, Math.min(0, drag.baseOffset + dx));
+      setDraggingSwipe({ key, offset: nextOffset });
+    }
+  }, []);
+
+  const endCardSwipe = useCallback((
+    key: string,
+    task: GlobalTaskSummaryRow,
+    source: 'touch' | 'pointer',
+    cancelled = false,
+    pointerId?: number,
+  ) => {
+    const drag = swipeDragRef.current;
+    if (!drag || drag.key !== key || drag.source !== source) return;
+    if (source === 'pointer' && pointerId !== undefined && pointerId !== drag.pointerId) return;
+    swipeDragRef.current = null;
+    setDraggingSwipe(null);
+    if (cancelled || drag.mode !== 'horizontal') {
+      return;
+    }
+    const finalOffset = Math.max(SWIPE_MIN_OFFSET_PX, Math.min(0, drag.baseOffset + drag.dx));
+    if (!task.isTerminal && Math.abs(finalOffset) >= SWIPE_CONFIRM_THRESHOLD_PX) {
+      openCloseConfirm(task, 'cancel');
+    } else if (!task.isTerminal && Math.abs(finalOffset) >= SWIPE_REVEAL_THRESHOLD_PX) {
+      setRevealedSwipeKey(key);
+    } else {
+      setRevealedSwipeKey((prev) => (prev === key ? null : prev));
+    }
+  }, [openCloseConfirm]);
+
   const renderTaskStatusLabel = (task: GlobalTaskSummaryRow): string => {
     if (task.flags.includes('blocked')) return t('taskPair.flag.blocked');
     if (task.flags.includes('needs_input')) return t('taskPair.flag.needs_input');
@@ -1076,13 +1232,81 @@ export function GlobalTaskModeView({
       () => openVoiceInput(replySnapshot),
     );
 
+    const swipeOffset = !task.isTerminal
+      ? (draggingSwipe?.key === key ? draggingSwipe.offset : (revealedSwipeKey === key ? SWIPE_REVEAL_OFFSET_PX : 0))
+      : 0;
+    const isSwipeDragging = draggingSwipe?.key === key;
+
     return (
       <article
         key={key}
-        class={`global-task-card is-${tone}${task.isTerminal ? ' is-terminal' : ''}${expanded ? ' is-expanded' : ''}`}
+        class={`global-task-card is-${tone}${task.isTerminal ? ' is-terminal' : ''}${expanded ? ' is-expanded' : ''}${swipeOffset < 0 ? ' is-swiped' : ''}`}
         data-testid={`task-mode-card-${task.taskId}`}
-        onClick={() => toggleExpandTask(key)}
+        onClick={() => {
+          if (suppressCardClickKeyRef.current === key) {
+            suppressCardClickKeyRef.current = null;
+            return;
+          }
+          if (revealedSwipeKey === key) {
+            setRevealedSwipeKey(null);
+            return;
+          }
+          toggleExpandTask(key);
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const pos = clampContextMenuPosition(e.clientX, e.clientY, 210, 150);
+          setCardContextMenu({ task, x: pos.x, y: pos.y });
+        }}
+        onTouchStart={(e) => {
+          if (e.touches.length !== 1) return;
+          const touch = e.touches[0]!;
+          startCardSwipe(key, task, touch.clientX, touch.clientY, 'touch', e.target);
+        }}
+        onTouchMove={(e) => {
+          if (e.touches.length !== 1) return;
+          const touch = e.touches[0]!;
+          moveCardSwipe(key, touch.clientX, touch.clientY, 'touch');
+        }}
+        onTouchEnd={() => endCardSwipe(key, task, 'touch', false)}
+        onTouchCancel={() => endCardSwipe(key, task, 'touch', true)}
+        onPointerDown={(e) => {
+          if (e.pointerType !== 'touch') return;
+          startCardSwipe(key, task, e.clientX, e.clientY, 'pointer', e.target, e.pointerId);
+        }}
+        onPointerMove={(e) => {
+          if (e.pointerType !== 'touch') return;
+          moveCardSwipe(key, e.clientX, e.clientY, 'pointer', e.pointerId);
+        }}
+        onPointerUp={(e) => {
+          if (e.pointerType !== 'touch') return;
+          endCardSwipe(key, task, 'pointer', false, e.pointerId);
+        }}
+        onPointerCancel={(e) => {
+          if (e.pointerType !== 'touch') return;
+          endCardSwipe(key, task, 'pointer', true, e.pointerId);
+        }}
       >
+        {!task.isTerminal && swipeOffset < 0 && (
+          <div class="global-task-swipe-action">
+            <button
+              type="button"
+              class="global-task-swipe-cancel-btn"
+              data-testid={`task-mode-swipe-cancel-${task.taskId}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                openCloseConfirm(task, 'cancel');
+              }}
+            >
+              {t('taskMode.swipe_cancel_hint', 'Cancel')}
+            </button>
+          </div>
+        )}
+        <div
+          class={`global-task-card-surface${isSwipeDragging ? ' is-dragging' : ''}`}
+          style={swipeOffset !== 0 ? { transform: `translateX(${swipeOffset}px)` } : undefined}
+        >
         <div class="global-task-card-main">
           <div class="global-task-card-content">
             <div class="global-task-card-meta">
@@ -1195,6 +1419,7 @@ export function GlobalTaskModeView({
             </div>
           </div>
         )}
+        </div>
       </article>
     );
   };
@@ -1780,6 +2005,72 @@ export function GlobalTaskModeView({
           onSend={handleVoiceSend}
         />
       )}
+
+      {cardContextMenu && (() => {
+        const ctxTask = cardContextMenu.task;
+        const ctxBrainLabel = resolveTaskBrainLabel(ctxTask);
+        const ctxReplySnapshot: TaskModeTargetSnapshot = {
+          serverId: ctxTask.serverId,
+          serverName: ctxTask.serverName,
+          sessionName: ctxTask.brainSession,
+          label: ctxBrainLabel,
+          projectName: ctxTask.projectName,
+          taskTitle: ctxTask.title,
+          mode: 'reply',
+        };
+        const items: TaskPairContextMenuItem[] = [];
+        if (!ctxTask.isTerminal) {
+          items.push({
+            id: 'cancel',
+            label: t('taskMode.cancel_task', 'Cancel task'),
+            danger: true,
+            testId: `task-mode-ctx-cancel-${ctxTask.taskId}`,
+            onSelect: () => openCloseConfirm(ctxTask, 'cancel'),
+          });
+          if (ctxTask.status === 'passed' || ctxTask.status === 'awaiting_brain_decision') {
+            items.push({
+              id: 'done',
+              label: t('taskMode.close_task_done', 'Close as done'),
+              testId: `task-mode-ctx-done-${ctxTask.taskId}`,
+              onSelect: () => openCloseConfirm(ctxTask, 'done'),
+            });
+          }
+        }
+        items.push({
+          id: 'open-session',
+          label: t('taskMode.enter_session', 'Open session'),
+          testId: `task-mode-ctx-open-${ctxTask.taskId}`,
+          onSelect: () => onJumpToSession(ctxTask.serverId, ctxTask.brainSession),
+        });
+        items.push({
+          id: 'reply',
+          label: ctxTask.isTerminal ? t('taskMode.follow_up', 'Follow up') : t('taskMode.reply', 'Reply'),
+          testId: `task-mode-ctx-reply-${ctxTask.taskId}`,
+          onSelect: () => openQuickComposer(ctxReplySnapshot),
+        });
+        return (
+          <TaskPairContextMenu
+            x={cardContextMenu.x}
+            y={cardContextMenu.y}
+            ariaLabel={ctxTask.title}
+            items={items}
+            onClose={() => setCardContextMenu(null)}
+          />
+        );
+      })()}
+
+      <TaskPairCloseConfirmDialog
+        target={closeConfirmTarget}
+        busy={closeSending}
+        error={closeError}
+        onCancel={() => {
+          if (!closeSending) {
+            setCloseConfirmTarget(null);
+            setCloseError(null);
+          }
+        }}
+        onConfirm={() => void handleConfirmCloseTask()}
+      />
     </div>
   );
 }

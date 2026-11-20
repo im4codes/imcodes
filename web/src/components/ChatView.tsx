@@ -5290,7 +5290,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             )}
           </div>
         )}
-        {!!sessionId && !hideTaskPairPanel && <TaskPairStatusPanelHost visible={visible} events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} collapsedVisitKey={taskPairPanelVisitKey} mobileAnchorRef={chatTitlebarRef} />}
+        {!!sessionId && !hideTaskPairPanel && <TaskPairStatusPanelHost visible={visible} events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} collapsedVisitKey={taskPairPanelVisitKey} mobileAnchorRef={chatTitlebarRef} canCloseTasks={canManageFileShares} />}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}

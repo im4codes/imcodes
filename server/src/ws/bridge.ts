@@ -407,6 +407,7 @@ import {
   SUBSESSION_NAME_PREFIX,
   isAutoCreatedSubSessionName,
 } from '../../../shared/task-pair.js';
+import { TASK_PAIR_CLOSE_MSG } from '../../../shared/task-pair-close.js';
 import {
   GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
   isGlobalTaskTerminalStatus,
@@ -9725,7 +9726,8 @@ export class WsBridge {
     // Agent-configuration replies go to the waiting owner-only route only,
     // never to browsers.
     if (type === AGENT_SKILLS_MSG.LIST_RESPONSE || type === AGENT_SKILLS_MSG.RUN_RESPONSE
-      || type === AGENT_MCP_MSG.LIST_RESPONSE || type === AGENT_MCP_MSG.RUN_RESPONSE) {
+      || type === AGENT_MCP_MSG.LIST_RESPONSE || type === AGENT_MCP_MSG.RUN_RESPONSE
+      || type === TASK_PAIR_CLOSE_MSG.RESPONSE) {
       const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
       if (requestId) this.machineConfigRequests.resolve(requestId, msg);
       return;

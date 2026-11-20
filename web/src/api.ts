@@ -52,6 +52,11 @@ import {
 import { normalizeSupervisionExecutionConfig } from '@shared/supervision-execution-pool.js';
 import type { ShareGrantSummary, ShareRole, ShareTarget } from './tab-sharing-ui.js';
 import {
+  TASK_PAIR_CLOSE_ERROR,
+  type TaskPairCloseRequestBody,
+  type TaskPairCloseResponse,
+} from '@shared/task-pair-close.js';
+import {
   SESSION_IDENTITY_API_PATH,
   type SessionIdentityProfile,
   type SessionIdentityScope,
@@ -1008,6 +1013,28 @@ export async function cancelSessionViaHttp(
     method: 'POST',
     body: JSON.stringify(payload),
   });
+}
+
+export async function closeServerTaskPair(
+  serverId: string,
+  taskId: string,
+  body: TaskPairCloseRequestBody = { action: 'cancel' },
+): Promise<TaskPairCloseResponse> {
+  try {
+    return await apiFetch<TaskPairCloseResponse>(
+      `/api/server/${encodeURIComponent(serverId)}/task-pairs/${encodeURIComponent(taskId)}/close`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    );
+  } catch (err) {
+    if (err instanceof ApiError && err.code) {
+      return { ok: false, taskId, error: err.code };
+    }
+    return { ok: false, taskId, error: TASK_PAIR_CLOSE_ERROR.REJECTED, detail: err instanceof Error ? err.message : undefined };
+  }
 }
 
 export interface CreateShareRequest {
