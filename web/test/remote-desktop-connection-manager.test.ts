@@ -13,9 +13,10 @@ import {
   RemoteDesktopConnectionManager,
   remoteDesktopHostKey,
 } from '../src/remote-desktop-connection-manager.js';
-import type {
-  RemoteDesktopClientHooks,
-  RemoteDesktopSnapshot,
+import {
+  REMOTE_DESKTOP_CLIENT_ERROR,
+  type RemoteDesktopClientHooks,
+  type RemoteDesktopSnapshot,
 } from '../src/remote-desktop-client.js';
 
 function snapshot(
@@ -557,5 +558,27 @@ describe('RemoteDesktopConnectionManager', () => {
     expect(manager.listConnections()).toHaveLength(0);
     expect(updates).toEqual([0, 1, 0]);
     unsubscribe();
+  });
+
+  it('treats webrtc_unavailable as terminal and never schedules auto-reconnect', async () => {
+    vi.useFakeTimers();
+    const { manager, clients } = setupManager();
+    const connection = manager.connection({ serverId: 'server-a' });
+    const states: string[] = [];
+    const detach = connection.subscribe({}, (snap) => states.push(snap.state));
+    await connection.start();
+
+    clients[0].emit({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      error: REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE,
+      retryable: false,
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(clients).toHaveLength(1);
+    expect(states.at(-1)).toBe(REMOTE_DESKTOP_STATE.FAILED);
+    expect(states).not.toContain(REMOTE_DESKTOP_STATE.RECONNECTING);
+    detach();
+    vi.useRealTimers();
   });
 });

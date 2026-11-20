@@ -22,6 +22,8 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { validateRemoteDesktopBrowserMessage } from '@shared/remote-desktop.js';
 import {
   applyH264ReceiveCodecPreference,
+  isRemoteDesktopWebRtcSupported,
+  REMOTE_DESKTOP_CLIENT_ERROR,
   RemoteDesktopClient,
   chunkRemoteDesktopText,
   isRemoteDesktopKeyAllowed,
@@ -560,6 +562,7 @@ describe('RemoteDesktopClient', () => {
       onDaemonReconnected,
     }, {
       fetchTicket: async () => 'ticket-1',
+      createPeer: () => new FakePeer() as unknown as RTCPeerConnection,
       createSocket: () => {
         socket = new FakeSocket();
         queueMicrotask(() => socket.open());
@@ -588,6 +591,7 @@ describe('RemoteDesktopClient', () => {
     const dependencies = {
       fetchTicket,
       guestBootstrapProof,
+      createPeer: () => new FakePeer() as unknown as RTCPeerConnection,
       createSocket: (url: string) => {
         socketUrl = url;
         socket = new FakeSocket();
@@ -1479,6 +1483,7 @@ describe('RemoteDesktopClient', () => {
     let socket!: FakeSocket;
     const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
       fetchTicket: async () => 'ticket-retry',
+      createPeer: () => new FakePeer() as unknown as RTCPeerConnection,
       createSocket: () => {
         socket = new FakeSocket();
         queueMicrotask(() => socket.open());
@@ -3790,6 +3795,58 @@ describe('remote desktop transport traffic', () => {
     await internal.collectStats(internal.peer);
     await internal.collectStats(peer as unknown as RTCPeerConnection);
     expect(snapshots.at(-1)?.traffic).toEqual({ bytesSent: 65, bytesReceived: 1510 });
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
+  it('fails fast with webrtc_unavailable before signaling when RTCPeerConnection is undefined and no createPeer is injected', async () => {
+    vi.stubGlobal('RTCPeerConnection', undefined);
+    expect(isRemoteDesktopWebRtcSupported()).toBe(false);
+
+    const fetchTicket = vi.fn(async () => 'should-not-fetch');
+    const createSocket = vi.fn();
+    const snapshots: Array<{ state: string; error?: string; terminalReason?: string; retryable?: boolean }> = [];
+    const client = new RemoteDesktopClient('controlled-ios-on-mac', {
+      onSnapshot: (snap) => snapshots.push({
+        state: snap.state,
+        error: snap.error,
+        terminalReason: snap.terminalReason,
+        retryable: snap.retryable,
+      }),
+    }, {
+      fetchTicket,
+      createSocket: createSocket as unknown as (url: string) => WebSocket,
+    });
+
+    await client.start();
+
+    expect(fetchTicket).not.toHaveBeenCalled();
+    expect(createSocket).not.toHaveBeenCalled();
+    expect(snapshots.at(-1)).toEqual({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      error: REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE,
+      terminalReason: REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE,
+      retryable: false,
+    });
+    expect(snapshots.some((s) => s.error === REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR)).toBe(false);
+  });
+
+  it('still allows start() when RTCPeerConnection is undefined if a custom createPeer dependency is injected', async () => {
+    vi.stubGlobal('RTCPeerConnection', undefined);
+    const socket = new FakeSocket();
+    const fetchTicket = vi.fn(async () => 'ticket-with-custom-peer');
+    const client = new RemoteDesktopClient('controlled-test', { onSnapshot: vi.fn() }, {
+      fetchTicket,
+      createSocket: () => {
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => new FakePeer() as unknown as RTCPeerConnection,
+    });
+
+    await client.start();
+
+    expect(fetchTicket).toHaveBeenCalledTimes(1);
+    expect(socket.sent.map((raw) => JSON.parse(raw).type)).toContain(REMOTE_DESKTOP_MSG.START);
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 });

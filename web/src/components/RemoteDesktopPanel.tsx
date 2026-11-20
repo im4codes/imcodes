@@ -33,7 +33,8 @@ import {
   isPointOverRemoteDesktopOverlay,
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../remote-desktop-pointer-overlay.js';
-import { downloadAttachment } from '../api.js';
+import { downloadAttachment, getApiBaseUrl } from '../api.js';
+import { isNative } from '../native.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 import {
   canRevealSavedDownload,
@@ -53,7 +54,7 @@ import {
   type FileDownloadTransportMode,
   type FileUploadTransportMode,
 } from '../direct-file-transfer.js';
-import type { RemoteDesktopSnapshot } from '../remote-desktop-client.js';
+import { REMOTE_DESKTOP_CLIENT_ERROR, type RemoteDesktopSnapshot } from '../remote-desktop-client.js';
 import { describeRemoteDesktopEncoder } from '../remote-desktop-encoder-label.js';
 import {
   RemoteDesktopConnectionManager,
@@ -369,6 +370,30 @@ function activeRemoteDesktopConnectionStep(
 
 export function remoteDesktopQuickInputHistoryKey(hostKey: string): string {
   return `remote-desktop:${hostKey}`;
+}
+
+export function resolveRemoteDesktopBrowserOpenUrl(): string | null {
+  const candidates: string[] = [];
+  if (isNative()) {
+    try { candidates.push(getApiBaseUrl()); } catch { /* ignore */ }
+  } else {
+    if (typeof window !== 'undefined' && window.location?.href) {
+      candidates.push(window.location.href);
+    }
+    try { candidates.push(getApiBaseUrl()); } catch { /* ignore */ }
+  }
+  for (const candidate of candidates) {
+    if (!candidate?.trim()) continue;
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        return parsed.toString();
+      }
+    } catch {
+      // Ignore malformed/non-http(s) URLs.
+    }
+  }
+  return null;
 }
 
 export interface RemoteDesktopPanelProps {
@@ -1427,6 +1452,20 @@ export function RemoteDesktopPanel({
 
   const retryConnection = () => {
     clientRef.current?.retry();
+  };
+
+  const isWebRtcUnavailable = snapshot.terminalReason === REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE
+    || snapshot.error === REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE;
+
+  const openInBrowser = async () => {
+    const url = resolveRemoteDesktopBrowserOpenUrl();
+    if (!url) return;
+    if (isNative()) {
+      const { Browser } = await import('@capacitor/browser');
+      await Browser.open({ url });
+      return;
+    }
+    window.open(url, '_blank', 'noopener,noreferrer');
   };
 
   /**
@@ -3839,16 +3878,29 @@ export function RemoteDesktopPanel({
           {!currentStreamPresented && !mediaPresented && !hasCachedFrame && (
             <div class="remote-desktop-stage-placeholder" role="status">
               {snapshot.state === REMOTE_DESKTOP_STATE.FAILED ? (
-                <>
-                  <span>
-                    {snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.SESSION_LIMIT
-                      ? t('remote_desktop.session_in_use')
-                      : t('remote_desktop.failed', { reason: snapshot.error ?? snapshot.terminalReason ?? '' })}
-                  </span>
-                  <button type="button" onClick={retryConnection}>
-                    {t('remote_desktop.retry')}
-                  </button>
-                </>
+                isWebRtcUnavailable ? (
+                  <>
+                    <span>{t('remote_desktop.webrtc_unavailable')}</span>
+                    <button
+                      type="button"
+                      disabled={!resolveRemoteDesktopBrowserOpenUrl()}
+                      onClick={() => void openInBrowser()}
+                    >
+                      {t('remote_desktop.open_in_browser')}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span>
+                      {snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.SESSION_LIMIT
+                        ? t('remote_desktop.session_in_use')
+                        : t('remote_desktop.failed', { reason: snapshot.error ?? snapshot.terminalReason ?? '' })}
+                    </span>
+                    <button type="button" onClick={retryConnection}>
+                      {t('remote_desktop.retry')}
+                    </button>
+                  </>
+                )
               ) : (
                 <div class="remote-desktop-connection-progress">
                   <strong>

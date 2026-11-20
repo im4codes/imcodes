@@ -9,6 +9,7 @@ import {
   type RemoteDesktopStopOrigin,
 } from '@shared/remote-desktop.js';
 import {
+  REMOTE_DESKTOP_CLIENT_ERROR,
   RemoteDesktopClient,
   type RemoteDesktopClientHooks,
   type RemoteDesktopSnapshot,
@@ -475,6 +476,7 @@ export class RemoteDesktopConnectionManager {
 
   private isReconnectableFailure(snapshot: RemoteDesktopSnapshot): boolean {
     const reason = snapshot.terminalReason ?? snapshot.error;
+    if (reason === REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE) return false;
     return snapshot.state === REMOTE_DESKTOP_STATE.FAILED
       && snapshot.retryable !== false
       && Boolean(snapshot.retryable === true || (reason && RECONNECTABLE_FAILURES.has(reason)));

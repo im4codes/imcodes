@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { RemoteDesktopWallHost } from '../api/remote-desktop-wall.js';
-import type { RemoteDesktopSnapshot } from '../remote-desktop-client.js';
+import { REMOTE_DESKTOP_CLIENT_ERROR, type RemoteDesktopSnapshot } from '../remote-desktop-client.js';
 import type { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
 import { remoteDesktopDisplayName } from '../remote-desktop-display-name.js';
 
@@ -52,8 +52,10 @@ export function RemoteDesktopWallTile({
   const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
   const lastRetryGenerationRef = useRef(retryGeneration);
   const paused = pressurePaused || !wallVisible || !pageVisible || !inViewport;
-  const retryable = snapshot.state === REMOTE_DESKTOP_STATE.FAILED
-    || snapshot.state === REMOTE_DESKTOP_STATE.STOPPED;
+  const webrtcUnavailable = snapshot.terminalReason === REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE
+    || snapshot.error === REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE;
+  const retryable = !webrtcUnavailable
+    && (snapshot.state === REMOTE_DESKTOP_STATE.FAILED || snapshot.state === REMOTE_DESKTOP_STATE.STOPPED);
 
   const retryConnection = useCallback(() => {
     manager.presentation(host, presentationRef.current).retry();

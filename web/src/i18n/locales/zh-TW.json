@@ -4555,6 +4555,8 @@
     },
     "failed": "遠端桌面已停止：{{reason}}",
     "session_in_use": "這台電腦已在另一個遠端桌面視窗中開啟。請先關閉那個視窗，再點重試。",
+    "webrtc_unavailable": "目前應用程式執行環境不支援 WebRTC（例如在 Mac 上執行的 iOS 版 App），無法建立遠端桌面連線。請在桌面瀏覽器中開啟並使用遠端桌面。",
+    "open_in_browser": "在瀏覽器中開啟",
     "retry": "重試",
     "escape_hint": "按 Esc 返回觀看模式",
     "viewers": "{{count}} 人觀看",

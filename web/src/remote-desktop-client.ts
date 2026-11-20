@@ -520,6 +520,14 @@ class RemoteDesktopSignalingSocket {
   }
 }
 
+export const REMOTE_DESKTOP_CLIENT_ERROR = {
+  WEBRTC_UNAVAILABLE: 'webrtc_unavailable',
+} as const;
+
+export function isRemoteDesktopWebRtcSupported(): boolean {
+  return typeof RTCPeerConnection === 'function';
+}
+
 /** Browser-side direct-first WebRTC session. Media/input never use application HTTP/WS. */
 export class RemoteDesktopClient {
   private readonly signaling: RemoteDesktopSignalingSocket;
@@ -676,6 +684,11 @@ export class RemoteDesktopClient {
 
   async start(reconnectAttempt = 0): Promise<void> {
     if (this.requestId || this.stopped) throw new Error('remote_desktop_already_started');
+    if (!this.deps.createPeer && !isRemoteDesktopWebRtcSupported()) {
+      this.startedAt = this.deps.now?.() ?? Date.now();
+      this.fail(REMOTE_DESKTOP_CLIENT_ERROR.WEBRTC_UNAVAILABLE, false);
+      return;
+    }
     this.startedAt = this.deps.now?.() ?? Date.now();
     this.publish({ state: REMOTE_DESKTOP_STATE.AUTHORIZING, durationMs: 0 });
     await this.signaling.connect(

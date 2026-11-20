@@ -94,7 +94,24 @@ const clientHooks: Array<{ onSnapshot(value: unknown): void }> = [];
 const clientStarts: number[] = [];
 let atomicButtonClickAdvertised = true;
 
+const nativeOpenMocks = vi.hoisted(() => ({
+  browserOpen: vi.fn(async () => undefined),
+  isNative: vi.fn(() => false),
+  apiBaseUrl: 'https://im.example.test',
+}));
+
+vi.mock('../src/native.js', () => ({
+  isNative: () => nativeOpenMocks.isNative(),
+}));
+
+vi.mock('@capacitor/browser', () => ({
+  Browser: {
+    open: (...args: unknown[]) => nativeOpenMocks.browserOpen(...args),
+  },
+}));
+
 vi.mock('../src/remote-desktop-client.js', () => ({
+  REMOTE_DESKTOP_CLIENT_ERROR: { WEBRTC_UNAVAILABLE: 'webrtc_unavailable' },
   RemoteDesktopClient: class {
     constructor(readonly serverId: string, hooks: { onSnapshot(value: unknown): void }) {
       clientHooks.push(hooks);
@@ -164,6 +181,7 @@ vi.mock('../src/remote-desktop-client.js', () => ({
 
 vi.mock('../src/api.js', () => ({
   downloadAttachment: fileApiMocks.downloadAttachment,
+  getApiBaseUrl: () => nativeOpenMocks.apiBaseUrl,
   getUserPref: fileApiMocks.getUserPref,
   saveUserPref: fileApiMocks.saveUserPref,
 }));
@@ -3633,6 +3651,72 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(container.textContent).toContain('remote_desktop.failed');
     await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
     expect(clientHooks).toHaveLength(1);
+  });
+
+  it('shows WebRTC-unavailable guidance and Open in Browser instead of protocol_error/Retry', async () => {
+    nativeOpenMocks.isNative.mockReturnValue(false);
+    nativeOpenMocks.apiBaseUrl = 'https://im.example.test';
+    nativeOpenMocks.browserOpen.mockClear();
+    const openSpy = vi.fn();
+    vi.stubGlobal('open', openSpy);
+    const { container, getByRole, queryByRole } = await renderPanel();
+
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      error: 'webrtc_unavailable',
+      retryable: false,
+    }));
+
+    expect(container.textContent).toContain('remote_desktop.webrtc_unavailable');
+    expect(container.textContent).not.toContain('remote_desktop.failed');
+    expect(container.textContent).not.toContain('protocol_error');
+    expect(queryByRole('button', { name: 'remote_desktop.retry' })).toBeNull();
+
+    const openBtn = getByRole('button', { name: 'remote_desktop.open_in_browser' }) as HTMLButtonElement;
+    expect(openBtn.disabled).toBe(false);
+    await act(async () => { openBtn.click(); });
+    expect(openSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/^https?:\/\//),
+      '_blank',
+      'noopener,noreferrer',
+    );
+
+    // Native (e.g. iOS App on Mac via Capacitor) uses Browser.open with configured server URL
+    nativeOpenMocks.isNative.mockReturnValue(true);
+    nativeOpenMocks.apiBaseUrl = 'https://im.zhinet.work';
+    act(() => { openBtn.click(); });
+    await vi.waitFor(() => {
+      expect(nativeOpenMocks.browserOpen).toHaveBeenCalledWith({ url: 'https://im.zhinet.work/' });
+    });
+
+    // Unsafe/non-http(s) URL must never pass to Browser.open
+    cleanup();
+    nativeOpenMocks.apiBaseUrl = 'javascript:alert(1)';
+    nativeOpenMocks.browserOpen.mockClear();
+    const unsafeResult = await renderPanel();
+    act(() => clientHooks.at(-1)!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      error: 'webrtc_unavailable',
+      retryable: false,
+    }));
+    const disabledOpenBtn = unsafeResult.getByRole('button', { name: 'remote_desktop.open_in_browser' }) as HTMLButtonElement;
+    expect(disabledOpenBtn.disabled).toBe(true);
+    await act(async () => { disabledOpenBtn.click(); });
+    expect(nativeOpenMocks.browserOpen).not.toHaveBeenCalled();
+    nativeOpenMocks.isNative.mockReturnValue(false);
+    nativeOpenMocks.apiBaseUrl = 'https://im.example.test';
   });
 });
 

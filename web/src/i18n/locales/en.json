@@ -4556,6 +4556,8 @@
     },
     "failed": "Remote desktop stopped: {{reason}}",
     "session_in_use": "This computer is already open in another remote desktop window. Close that window, then retry.",
+    "webrtc_unavailable": "Remote desktop requires WebRTC, which is unavailable in this app runtime (for example, iOS App on Mac). Please open IM.codes in a desktop browser to use remote desktop.",
+    "open_in_browser": "Open in Browser",
     "retry": "Retry",
     "escape_hint": "Press Escape to return to View mode",
     "viewers": "{{count}} viewing",
