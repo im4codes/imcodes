@@ -712,4 +712,50 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       expect(findMenuItem(restartedMenus.at(-1)!, 'server:switch')?.label).toBe('サーバーを切り替え…');
     });
   });
+
+  it('restores and focuses the main window on focusWindow() and webContents focus while minimized', async () => {
+    let minimized = true;
+    const restore = vi.fn(() => { minimized = false; });
+    const show = vi.fn();
+    const focus = vi.fn();
+    const focusApp = vi.fn();
+
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      focusApp,
+      createMainWindow: (opts) => {
+        const base = createFakeShellWindow({ webPreferences: opts.webPreferences });
+        return Object.assign(base, {
+          isMinimized: () => minimized,
+          restore,
+          show,
+          focus,
+        });
+      },
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: () => {},
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 0 }),
+    });
+
+    const win = await shell.ensureWindow();
+    // Notification click / dock activation restores minimized window and focuses app
+    await shell.focusWindow();
+    expect(restore).toHaveBeenCalledTimes(1);
+    expect(show).toHaveBeenCalledTimes(1);
+    expect(focus).toHaveBeenCalledTimes(1);
+    expect(focusApp).toHaveBeenCalledTimes(1);
+    expect(minimized).toBe(false);
+
+    // WebContents focus event (e.g. renderer window.focus() from Notification click) also restores if minimized
+    minimized = true;
+    (win as unknown as { webContentsEmitter: EventEmitter }).webContentsEmitter.emit('focus');
+    expect(restore).toHaveBeenCalledTimes(2);
+    expect(minimized).toBe(false);
+  });
 });

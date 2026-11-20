@@ -683,4 +683,56 @@ describe('global-task-mode-store', () => {
 
     store.stop();
   });
+
+  it('delivers global_tasks.notification frames with eventId dedup regardless of Task Mode UI mutedServerIds and refcounts acquire()', async () => {
+    const store = new GlobalTaskModeStore();
+    const received: unknown[] = [];
+    const unsub = store.subscribeNotifications((ev) => received.push(ev));
+
+    const release1 = store.acquire();
+    const release2 = store.acquire();
+    await vi.waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
+    const ws = MockWebSocket.instances[0]!;
+    ws.simulateOpen();
+
+    // Mute srv-2 in Task Mode UI — notification frames for srv-2 still propagate to desktop notifier
+    store.setMutedServerIds(['srv-2']);
+    ws.simulateMessage({
+      type: GLOBAL_TASK_MODE_MSG.NOTIFICATION,
+      event: {
+        eventId: 'notif-evt-1',
+        title: 'Srv2 · brain',
+        body: 'Waiting input',
+        notificationType: 'waiting_input',
+        serverId: 'srv-2',
+        session: 'deck_srv2_brain',
+        ts: 5000,
+      },
+    });
+    // Duplicate eventId is dropped
+    ws.simulateMessage({
+      type: GLOBAL_TASK_MODE_MSG.NOTIFICATION,
+      event: {
+        eventId: 'notif-evt-1',
+        title: 'Srv2 · brain',
+        body: 'Waiting input',
+        notificationType: 'waiting_input',
+        serverId: 'srv-2',
+        session: 'deck_srv2_brain',
+        ts: 5000,
+      },
+    });
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ eventId: 'notif-evt-1', serverId: 'srv-2' });
+
+    // Releasing first consumer keeps connection open; releasing last stops it
+    release1();
+    expect(ws.closeCalls).toHaveLength(0);
+    expect(ws.readyState).toBe(MockWebSocket.OPEN);
+    release2();
+    expect(ws.closeCalls).toHaveLength(1);
+    expect(ws.readyState).toBe(MockWebSocket.CLOSED);
+    unsub();
+  });
 });

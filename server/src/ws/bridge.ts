@@ -15142,15 +15142,33 @@ export class WsBridge {
     return this.deliveredPushKeys.has(key) || this.inFlightPushKeys.has(key);
   }
 
+  private getUserPushSocketPresence(userId: string): { hasMobileSocket: boolean; hasDesktopSocket: boolean } {
+    let hasMobileSocket = false;
+    for (const mobileWs of this.mobileSockets) {
+      if (mobileWs.readyState !== WebSocket.OPEN) continue;
+      if (this.browserUserIds.get(mobileWs) !== userId) continue;
+      hasMobileSocket = true;
+      break;
+    }
+    let hasDesktopSocket = globalTaskHub.hasLiveUserSocket(userId);
+    if (!hasDesktopSocket) {
+      for (const browserWs of this.browserSockets) {
+        if (browserWs.readyState !== WebSocket.OPEN) continue;
+        if (this.mobileSockets.has(browserWs)) continue;
+        if (this.browserUserIds.get(browserWs) !== userId) continue;
+        hasDesktopSocket = true;
+        break;
+      }
+    }
+    return { hasMobileSocket, hasDesktopSocket };
+  }
+
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
     const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
-    for (const mobileWs of this.mobileSockets) {
-      if (mobileWs.readyState !== WebSocket.OPEN) continue;
-      if (this.browserUserIds.get(mobileWs) !== server.user_id) continue;
-      return;
-    }
+    const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(server.user_id);
+    if (hasMobileSocket && !hasDesktopSocket) return;
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');
@@ -15217,6 +15235,8 @@ export class WsBridge {
         title,
         body,
         type: pushType,
+        eventId: pushKey,
+        ...(hasMobileSocket ? { suppressMobilePush: true } : {}),
         data: { serverId: this.serverId, session: sessionName, type: eventType },
       }, env);
       this.deliveredPushKeys.set(pushKey, now);
@@ -15236,11 +15256,8 @@ export class WsBridge {
     const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
-    for (const mobileWs of this.mobileSockets) {
-      if (mobileWs.readyState !== WebSocket.OPEN) continue;
-      if (this.browserUserIds.get(mobileWs) !== server.user_id) continue;
-      return;
-    }
+    const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(server.user_id);
+    if (hasMobileSocket && !hasDesktopSocket) return;
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');
@@ -15322,7 +15339,14 @@ export class WsBridge {
         title,
         body,
         type: notifType,
-        data: { serverId: this.serverId, taskId, type: notifType },
+        eventId: pushKey,
+        ...(hasMobileSocket ? { suppressMobilePush: true } : {}),
+        data: {
+          serverId: this.serverId,
+          ...(sessionName ? { session: sessionName } : {}),
+          taskId,
+          type: notifType,
+        },
       }, env);
       this.deliveredPushKeys.set(pushKey, now);
     } finally {

@@ -36,6 +36,7 @@ import {
 } from '../../../shared/push-notifications.js';
 import { getFullServersByUserId } from '../db/queries.js';
 import { listAccessibleControlledMachines } from '../share/machine-access.js';
+import { globalTaskHub } from '../services/global-task-hub.js';
 import { MACHINE_LIST_MAX_ITEMS } from '../../../shared/remote-exec.js';
 
 export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -68,12 +69,32 @@ pushRoutes.post('/register', async (c) => {
          ON CONFLICT (user_id, token) DO UPDATE SET platform = excluded.platform, notification_types = excluded.notification_types`,
         [userId, body.token, body.platform, notificationTypes, Date.now()],
       );
+      try {
+        await c.env.DB.execute(
+          'UPDATE users SET push_notification_types = $1 WHERE id = $2',
+          [notificationTypes, userId],
+        );
+      } catch {
+        // best-effort sync
+      }
     } else {
+      let userRow: { push_notification_types?: string[] | null } | null = null;
+      try {
+        userRow = await c.env.DB.queryOne<{ push_notification_types?: string[] | null }>(
+          'SELECT push_notification_types FROM users WHERE id = $1 LIMIT 1',
+          [userId],
+        );
+      } catch {
+        userRow = null;
+      }
+      const seededTypes = Array.isArray(userRow?.push_notification_types)
+        ? userRow.push_notification_types.filter(isPushNotificationType)
+        : DEFAULT_PUSH_NOTIFICATION_TYPES;
       await c.env.DB.execute(
         `INSERT INTO push_tokens (user_id, token, platform, notification_types, created_at)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (user_id, token) DO UPDATE SET platform = excluded.platform`,
-        [userId, body.token, body.platform, DEFAULT_PUSH_NOTIFICATION_TYPES, Date.now()],
+        [userId, body.token, body.platform, seededTypes, Date.now()],
       );
     }
   } catch (err) {
@@ -100,13 +121,20 @@ pushRoutes.get('/preferences', async (c) => {
       [userId],
     );
   }
-  const userRow = await c.env.DB.queryOne<{ push_enabled_server_ids?: string[] | null }>(
-    'SELECT push_enabled_server_ids FROM users WHERE id = $1 LIMIT 1',
+  const userRow = await c.env.DB.queryOne<{
+    push_enabled_server_ids?: string[] | null;
+    push_notification_types?: string[] | null;
+  }>(
+    'SELECT push_enabled_server_ids, push_notification_types FROM users WHERE id = $1 LIMIT 1',
     [userId],
   );
-  const types = (row && Array.isArray(row.notification_types))
+  const types = (token && row && Array.isArray(row.notification_types))
     ? row.notification_types
-    : DEFAULT_PUSH_NOTIFICATION_TYPES;
+    : Array.isArray(userRow?.push_notification_types)
+      ? userRow.push_notification_types
+      : (row && Array.isArray(row.notification_types))
+        ? row.notification_types
+        : DEFAULT_PUSH_NOTIFICATION_TYPES;
   const enabledServerIds = Array.isArray(userRow?.push_enabled_server_ids)
     ? sanitizePushEnabledServerIds(userRow.push_enabled_server_ids)
     : null;
@@ -145,20 +173,36 @@ pushRoutes.post('/preferences', async (c) => {
       : undefined;
 
   try {
-    if (sanitizedTypes !== undefined) {
-      if (body.token) {
+    if (sanitizedTypes !== undefined && body.token) {
+      await c.env.DB.execute(
+        'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2 AND token = $3',
+        [sanitizedTypes, userId, body.token],
+      );
+      if (sanitizedServerIds !== undefined) {
         await c.env.DB.execute(
-          'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2 AND token = $3',
-          [sanitizedTypes, userId, body.token],
-        );
-      } else {
-        await c.env.DB.execute(
-          'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2',
-          [sanitizedTypes, userId],
+          'UPDATE users SET push_enabled_server_ids = $1 WHERE id = $2',
+          [sanitizedServerIds, userId],
         );
       }
-    }
-    if (sanitizedServerIds !== undefined) {
+    } else if (sanitizedTypes !== undefined && sanitizedServerIds !== undefined) {
+      await c.env.DB.execute(
+        'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2',
+        [sanitizedTypes, userId],
+      );
+      await c.env.DB.execute(
+        'UPDATE users SET push_notification_types = $1, push_enabled_server_ids = $2 WHERE id = $3',
+        [sanitizedTypes, sanitizedServerIds, userId],
+      );
+    } else if (sanitizedTypes !== undefined) {
+      await c.env.DB.execute(
+        'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2',
+        [sanitizedTypes, userId],
+      );
+      await c.env.DB.execute(
+        'UPDATE users SET push_notification_types = $1 WHERE id = $2',
+        [sanitizedTypes, userId],
+      );
+    } else if (sanitizedServerIds !== undefined) {
       await c.env.DB.execute(
         'UPDATE users SET push_enabled_server_ids = $1 WHERE id = $2',
         [sanitizedServerIds, userId],
@@ -272,6 +316,9 @@ export interface PushPayload {
   data?: Record<string, string>;
   type?: PushNotificationType;
   serverId?: string;
+  eventId?: string;
+  suppressMobilePush?: boolean;
+  suppressDesktopPush?: boolean;
 }
 
 async function getAccessiblePushServerIds(db: Database, userId: string): Promise<string[]> {
@@ -285,9 +332,17 @@ async function getAccessiblePushServerIds(db: Database, userId: string): Promise
   return [...ids];
 }
 
+function resolvePushEventId(payload: PushPayload, targetServerId: string | null): string {
+  const explicit = typeof payload.eventId === 'string' ? payload.eventId.trim() : '';
+  if (explicit) return explicit;
+  const scope = payload.data?.session ?? payload.data?.taskId ?? '';
+  const eventType = payload.data?.type ?? payload.type ?? 'push';
+  return `${eventType}:${targetServerId ?? ''}:${scope}:${payload.title}:${payload.body}`;
+}
+
 /**
  * Dispatch push to all devices for a user.
- * Routes iOS to APNs, Android to FCM.
+ * Routes iOS to APNs, Android to FCM/JPush, and live desktop/pc-app clients via GlobalTaskHub.
  */
 export async function dispatchPush(payload: PushPayload, env: Env): Promise<void>;
 export async function dispatchPush(payload: PushPayload, db: Database, env?: Env): Promise<void>;
@@ -310,6 +365,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     platform: string;
     notification_types?: string[] | null;
     push_enabled_server_ids?: string[] | null;
+    push_notification_types?: string[] | null;
   }> = [];
   try {
     tokens = await db.query<{
@@ -317,9 +373,10 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
       platform: string;
       notification_types?: string[] | null;
       push_enabled_server_ids?: string[] | null;
+      push_notification_types?: string[] | null;
     }>(
       // A disabled user's devices receive nothing (security/user-status.ts); their registrations stay, so enabling the account resumes it.
-      `SELECT t.token, t.platform, t.notification_types, usr.push_enabled_server_ids
+      `SELECT t.token, t.platform, t.notification_types, usr.push_enabled_server_ids, usr.push_notification_types
        FROM push_tokens t
        JOIN users usr ON usr.id = t.user_id
        WHERE t.user_id = $1 AND ${activeUserExistsSql('t.user_id')}`,
@@ -330,10 +387,41 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     return;
   }
 
-  if (tokens.length === 0) return;
+  let rawEnabledServerIds: string[] | null | undefined;
+  let userNotificationTypes: readonly string[] | null = null;
+  if (tokens.length > 0) {
+    rawEnabledServerIds = tokens[0].push_enabled_server_ids;
+    userNotificationTypes = Array.isArray(tokens[0].push_notification_types)
+      ? tokens[0].push_notification_types
+      : null;
+  } else {
+    let userRow: {
+      push_enabled_server_ids?: string[] | null;
+      push_notification_types?: string[] | null;
+    } | null = null;
+    try {
+      userRow = await db.queryOne<{
+        push_enabled_server_ids?: string[] | null;
+        push_notification_types?: string[] | null;
+      }>(
+        `SELECT push_enabled_server_ids, push_notification_types
+         FROM users
+         WHERE id = $1 AND ${activeUserExistsSql('id')}
+         LIMIT 1`,
+        [payload.userId],
+      );
+    } catch (err) {
+      logger.warn({ err }, 'Failed to fetch user push preferences');
+      return;
+    }
+    if (!userRow) return;
+    rawEnabledServerIds = userRow.push_enabled_server_ids;
+    userNotificationTypes = Array.isArray(userRow.push_notification_types)
+      ? userRow.push_notification_types
+      : DEFAULT_PUSH_NOTIFICATION_TYPES;
+  }
 
   if (targetServerId && !shouldBypassServerPushMute(payload.type)) {
-    const rawEnabledServerIds = tokens[0].push_enabled_server_ids;
     if (Array.isArray(rawEnabledServerIds)) {
       if (!isPushEnabledForServer(rawEnabledServerIds, targetServerId, [])) return;
     } else {
@@ -350,7 +438,30 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     return allowed.includes(payload.type);
   });
 
-  if (matchingTokens.length === 0) return;
+  const desktopAllowed = userNotificationTypes !== null
+    ? (!payload.type || userNotificationTypes.includes(payload.type))
+    : (matchingTokens.length > 0 || !payload.type);
+
+  if (matchingTokens.length === 0 && !desktopAllowed) return;
+
+  if (desktopAllowed && !payload.suppressDesktopPush) {
+    await globalTaskHub.notifyPushNotification(db, {
+      userId: payload.userId,
+      eventId: resolvePushEventId(payload, targetServerId),
+      title: payload.title,
+      body: payload.body,
+      ...(payload.type ? { notificationType: payload.type } : {}),
+      ...(targetServerId ? { serverId: targetServerId } : {}),
+      ...(payload.data?.session ? { session: payload.data.session } : {}),
+      ...(payload.data?.taskId ? { taskId: payload.data.taskId } : {}),
+      ...(payload.data?.type ? { eventType: payload.data.type } : {}),
+      ts: Date.now(),
+    }).catch((err) => {
+      logger.warn({ err, userId: payload.userId }, 'Desktop globalTaskHub notification emit failed');
+    });
+  }
+
+  if (matchingTokens.length === 0 || payload.suppressMobilePush) return;
 
   // Atomically increment badge count and read the new value
   let badgeCount = 1;

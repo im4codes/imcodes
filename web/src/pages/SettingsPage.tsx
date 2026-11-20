@@ -26,6 +26,15 @@ import {
   hasUnsyncedPushNotificationEdits,
   hasUnsyncedPushEnabledServerEdits,
 } from '../push-notifications.js';
+import {
+  getDesktopNotificationPermission,
+  getLocalDesktopNotificationsEnabled,
+  isDesktopNotificationSupported,
+  requestDesktopNotificationPermission,
+  setLocalDesktopNotificationsEnabled,
+  subscribeDesktopNotificationsEnabled,
+  type DesktopNotificationPermission,
+} from '../desktop-notifications.js';
 import { GuidePage } from './GuidePage.js';
 import { PasskeyManager } from '../components/PasskeyManager.js';
 import { KeyboardShortcutsSection } from '../components/KeyboardShortcutsSection.js';
@@ -154,6 +163,13 @@ export function SettingsPage({
   const [pushPreferences, setPushPreferences] = useState<PushNotificationType[]>(() =>
     getLocalPushNotificationPreferences(),
   );
+  const [desktopNotifPermission, setDesktopNotifPermission] = useState<DesktopNotificationPermission>(() =>
+    getDesktopNotificationPermission(),
+  );
+  const [desktopNotifEnabled, setDesktopNotifEnabled] = useState<boolean>(() =>
+    getLocalDesktopNotificationsEnabled(),
+  );
+  const [desktopNotifRequesting, setDesktopNotifRequesting] = useState(false);
   const [pushEnabledServers, setPushEnabledServers] = useState<string[] | null>(() =>
     getLocalPushEnabledServers(),
   );
@@ -169,6 +185,26 @@ export function SettingsPage({
   const pushServersLoadedRef = useRef(false);
   const pushServersGenerationRef = useRef(0);
   const pushServersAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    setDesktopNotifPermission(getDesktopNotificationPermission());
+    setDesktopNotifEnabled(getLocalDesktopNotificationsEnabled());
+    return subscribeDesktopNotificationsEnabled((enabled) => {
+      setDesktopNotifEnabled(enabled);
+      setDesktopNotifPermission(getDesktopNotificationPermission());
+    });
+  }, []);
+
+  const handleEnableDesktopNotifications = async () => {
+    setDesktopNotifRequesting(true);
+    try {
+      const nextPerm = await requestDesktopNotificationPermission();
+      setDesktopNotifPermission(nextPerm);
+      setDesktopNotifEnabled(getLocalDesktopNotificationsEnabled());
+    } finally {
+      setDesktopNotifRequesting(false);
+    }
+  };
 
   useEffect(() => {
     mountedRef.current = true;
@@ -899,6 +935,51 @@ export function SettingsPage({
               aria-labelledby="settings-tab-notifications"
               aria-label={t('settings.tab_notifications')}
             >
+              {!isNative() && (
+                <div class="settings-card" data-testid="desktop-notification-settings-card">
+                  <div style={inlineLabelStyle}>{t('settings.push_desktop_label')}</div>
+                  <h2 style={{ fontSize: '16px', fontWeight: '600', margin: '0 0 6px', color: '#e2e8f0' }}>
+                    {t('settings.push_desktop_title')}
+                  </h2>
+                  <p style={{ color: '#94a3b8', fontSize: '13px', lineHeight: 1.5, margin: '0 0 12px' }}>
+                    {t('settings.push_desktop_desc')}
+                  </p>
+                  {!isDesktopNotificationSupported() ? (
+                    <div style={{ color: '#94a3b8', fontSize: '13px' }}>
+                      {t('settings.push_desktop_unsupported')}
+                    </div>
+                  ) : desktopNotifPermission === 'granted' ? (
+                    <label class="settings-checkbox-row">
+                      <input
+                        type="checkbox"
+                        aria-label={t('settings.push_desktop_toggle_title')}
+                        checked={desktopNotifEnabled}
+                        onChange={() => setLocalDesktopNotificationsEnabled(!desktopNotifEnabled)}
+                        style={checkboxStyle}
+                      />
+                      <div style={checkboxTextWrapStyle}>
+                        <div style={checkboxTitleStyle}>{t('settings.push_desktop_toggle_title')}</div>
+                        <div style={checkboxDescStyle}>{t('settings.push_desktop_toggle_desc')}</div>
+                      </div>
+                    </label>
+                  ) : desktopNotifPermission === 'denied' ? (
+                    <div style={{ color: '#f87171', fontSize: '13px' }}>
+                      {t('settings.push_desktop_denied')}
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      class="settings-btn-primary"
+                      data-testid="enable-desktop-notifications-btn"
+                      disabled={desktopNotifRequesting}
+                      onClick={() => void handleEnableDesktopNotifications()}
+                    >
+                      {t('settings.push_desktop_enable_btn')}
+                    </button>
+                  )}
+                </div>
+              )}
+
               {/* Push Notification Preferences */}
               <div class="settings-card" data-testid="push-notification-settings-card">
                 <div style={inlineLabelStyle}>{t('settings.push_notifications_label')}</div>

@@ -2403,7 +2403,15 @@
     "tts_quality_siri": "Siri",
     "tts_quality_default": "기본",
     "tts_open_android_settings": "시스템 음성 설정 열기",
-    "tts_open_ios_settings": "시스템 설정 열기"
+    "tts_open_ios_settings": "시스템 설정 열기",
+    "push_desktop_label": "데스크톱 / PC 앱",
+    "push_desktop_title": "데스크톱 시스템 알림",
+    "push_desktop_desc": "데스크톱 브라우저와 PC 앱에서 OS 알림을 수신하며 아래 알림 유형 및 허용 서버 설정과 동기화됩니다.",
+    "push_desktop_enable_btn": "데스크톱 알림 활성화",
+    "push_desktop_toggle_title": "이 컴퓨터에 알림 표시",
+    "push_desktop_toggle_desc": "다른 서버나 백그라운드 창에서 작업 중에도 동기화된 알림 설정에 따라 시스템 알림을 표시합니다.",
+    "push_desktop_denied": "브라우저 또는 OS 설정에서 알림 권한이 차단되어 있습니다. 알림 권한을 허용해 주세요.",
+    "push_desktop_unsupported": "현재 브라우저 환경에서는 데스크톱 알림을 지원하지 않습니다."
   },
   "capabilities": {
     "eyebrow": "이식 가능한 AI 기능",

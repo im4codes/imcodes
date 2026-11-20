@@ -6,6 +6,7 @@ import {
   isGlobalTaskWithinSyncWindow,
   type GlobalTaskBrainSummary,
   type GlobalTaskBrainTextEvent,
+  type GlobalTaskNotificationEvent,
   type GlobalTaskServerFrame,
   type GlobalTaskServerSummary,
   type GlobalTaskSnapshotResponse,
@@ -85,6 +86,7 @@ export interface SendGlobalBrainMessageInput {
 }
 
 export type BrainTextListener = (event: GlobalTaskBrainTextEvent) => void;
+export type NotificationListener = (event: GlobalTaskNotificationEvent) => void;
 export type StoreListener = (state: GlobalTaskModeState) => void;
 
 function readStorageJson<T>(key: string, fallback: T): T {
@@ -411,7 +413,10 @@ export class GlobalTaskModeStore {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private listeners = new Set<StoreListener>();
   private brainTextListeners = new Set<BrainTextListener>();
+  private notificationListeners = new Set<NotificationListener>();
   private seenBrainEventIds = new Set<string>();
+  private seenNotificationEventIds = new Set<string>();
+  private activeConsumerCount = 0;
   private brainTextOrder: string[] = [];
   private hasExplicitMutedFilter = hasStoredMutedServerFilter();
   private state: GlobalTaskModeState = this.createInitialState();
@@ -449,6 +454,29 @@ export class GlobalTaskModeStore {
     this.brainTextListeners.add(listener);
     return () => {
       this.brainTextListeners.delete(listener);
+    };
+  }
+
+  subscribeNotifications(listener: NotificationListener): () => void {
+    this.notificationListeners.add(listener);
+    return () => {
+      this.notificationListeners.delete(listener);
+    };
+  }
+
+  acquire(): () => void {
+    this.activeConsumerCount += 1;
+    if (this.activeConsumerCount === 1) {
+      void this.start();
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activeConsumerCount = Math.max(0, this.activeConsumerCount - 1);
+      if (this.activeConsumerCount === 0) {
+        this.stop();
+      }
     };
   }
 
@@ -641,8 +669,10 @@ export class GlobalTaskModeStore {
   }
 
   clearSessionState(): void {
+    this.activeConsumerCount = 0;
     this.stop();
     this.seenBrainEventIds.clear();
+    this.seenNotificationEventIds.clear();
     this.brainTextOrder = [];
     this.hasExplicitMutedFilter = false;
     try {
@@ -827,6 +857,25 @@ export class GlobalTaskModeStore {
 
       this.setState({ latestBrainTexts: nextMap });
       for (const listener of [...this.brainTextListeners]) {
+        try {
+          listener(event);
+        } catch {
+          // isolate subscriber failures
+        }
+      }
+      return;
+    }
+
+    if (frame.type === GLOBAL_TASK_MODE_MSG.NOTIFICATION) {
+      const event = frame.event;
+      if (!event || !event.eventId || !event.title) return;
+      if (this.seenNotificationEventIds.has(event.eventId)) return;
+      this.seenNotificationEventIds.add(event.eventId);
+      if (this.seenNotificationEventIds.size > MAX_SEEN_BRAIN_EVENT_IDS) {
+        const oldest = this.seenNotificationEventIds.values().next().value;
+        if (oldest !== undefined) this.seenNotificationEventIds.delete(oldest);
+      }
+      for (const listener of [...this.notificationListeners]) {
         try {
           listener(event);
         } catch {

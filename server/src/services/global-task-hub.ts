@@ -7,9 +7,11 @@ import {
   serializeBoundedPgNotifyPayload,
   truncateGlobalBrainText,
   type GlobalTaskBrainTextEvent,
+  type GlobalTaskNotificationEvent,
   type GlobalTaskServerFrame,
   type GlobalTaskSummaryRow,
 } from '../../../shared/global-task-mode.js';
+import type { PushNotificationType } from '../../../shared/push-notifications.js';
 import type { Database } from '../db/client.js';
 import {
   emitGlobalTaskPgNotify,
@@ -42,6 +44,19 @@ type GlobalTaskNotifyEnvelope =
     ts: number;
   }
   | { kind: 'server_state'; serverId: string; online: boolean; ts: number }
+  | {
+    kind: 'notification';
+    userId: string;
+    eventId: string;
+    title: string;
+    body: string;
+    notificationType?: PushNotificationType;
+    serverId?: string;
+    session?: string;
+    taskId?: string;
+    eventType?: string;
+    ts: number;
+  }
   | { kind: 'access_changed'; userId?: string; serverId?: string; ts: number };
 
 const RECONNECT_INITIAL_MS = 1000;
@@ -254,6 +269,13 @@ export class GlobalTaskHub {
     }
   }
 
+  hasLiveUserSocket(userId: string): boolean {
+    for (const sub of this.clients.values()) {
+      if (sub.ws.readyState === WebSocket.OPEN && sub.userId === userId) return true;
+    }
+    return false;
+  }
+
   /**
    * Immediately close live Global Task Mode sockets belonging to disabled/inactive accounts.
    */
@@ -433,6 +455,55 @@ export class GlobalTaskHub {
     }
   }
 
+  async notifyPushNotification(
+    db: Database | null,
+    input: {
+      userId: string;
+      eventId: string;
+      title: string;
+      body: string;
+      notificationType?: PushNotificationType;
+      serverId?: string;
+      session?: string;
+      taskId?: string;
+      eventType?: string;
+      ts?: number;
+    },
+  ): Promise<void> {
+    if (!input.userId || !input.eventId || !input.title) return;
+    const activeDb = db ?? this.db ?? null;
+    const notifyObj: Record<string, unknown> = {
+      kind: 'notification',
+      userId: input.userId,
+      eventId: input.eventId,
+      title: input.title,
+      body: input.body ?? '',
+      ...(input.notificationType ? { notificationType: input.notificationType } : {}),
+      ...(input.serverId ? { serverId: input.serverId } : {}),
+      ...(input.session ? { session: input.session } : {}),
+      ...(input.taskId ? { taskId: input.taskId } : {}),
+      ...(input.eventType ? { eventType: input.eventType } : {}),
+      ts: Number(input.ts ?? Date.now()) || Date.now(),
+    };
+    const boundedJson = serializeBoundedPgNotifyPayload(notifyObj, 'body', GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
+    await emitGlobalTaskPgNotify(activeDb, boundedJson);
+
+    if (!this.pgListening) {
+      const parsed = JSON.parse(boundedJson) as Extract<GlobalTaskNotifyEnvelope, { kind: 'notification' }>;
+      await this.broadcastUserNotification(parsed.userId, {
+        eventId: parsed.eventId,
+        title: parsed.title,
+        body: parsed.body,
+        ...(parsed.notificationType ? { notificationType: parsed.notificationType } : {}),
+        ...(parsed.serverId ? { serverId: parsed.serverId } : {}),
+        ...(parsed.session ? { session: parsed.session } : {}),
+        ...(parsed.taskId ? { taskId: parsed.taskId } : {}),
+        ...(parsed.eventType ? { eventType: parsed.eventType } : {}),
+        ts: parsed.ts,
+      });
+    }
+  }
+
   async handleNotifyPayload(rawPayload: string, dbOverride?: Database): Promise<void> {
     let parsed: GlobalTaskNotifyEnvelope;
     try {
@@ -467,6 +538,22 @@ export class GlobalTaskHub {
 
     if (parsed.kind === 'server_state' && parsed.serverId) {
       await this.broadcastServerState(parsed.serverId, Boolean(parsed.online));
+      return;
+    }
+
+    if (parsed.kind === 'notification') {
+      if (!parsed.userId || !parsed.eventId || !parsed.title) return;
+      await this.broadcastUserNotification(parsed.userId, {
+        eventId: parsed.eventId,
+        title: parsed.title,
+        body: typeof parsed.body === 'string' ? parsed.body : '',
+        ...(parsed.notificationType ? { notificationType: parsed.notificationType } : {}),
+        ...(parsed.serverId ? { serverId: parsed.serverId } : {}),
+        ...(parsed.session ? { session: parsed.session } : {}),
+        ...(parsed.taskId ? { taskId: parsed.taskId } : {}),
+        ...(parsed.eventType ? { eventType: parsed.eventType } : {}),
+        ts: Number(parsed.ts ?? Date.now()) || Date.now(),
+      });
       return;
     }
 
@@ -523,6 +610,31 @@ export class GlobalTaskHub {
     const frame: GlobalTaskServerFrame = { type: GLOBAL_TASK_MODE_MSG.SERVER_STATE, serverId, online };
     for (const sub of recipients) {
       safeSendWs(sub.ws, frame);
+    }
+  }
+
+  private async broadcastUserNotification(userId: string, event: GlobalTaskNotificationEvent): Promise<void> {
+    const candidates = [...this.clients.values()].filter(
+      (sub) => sub.ws.readyState === WebSocket.OPEN && sub.userId === userId,
+    );
+    if (candidates.length === 0) return;
+
+    const activeDb = candidates[0]!.db;
+    const userAccess = await loadUserAccess(activeDb, userId);
+    const decision = evaluateUserAccess(userAccess, undefined);
+    if (!decision.ok) {
+      for (const sub of candidates) {
+        this.clients.delete(sub.ws);
+        try { sub.ws.close(1008, 'account_inactive'); } catch { /* ignore */ }
+      }
+      return;
+    }
+
+    const frame: GlobalTaskServerFrame = { type: GLOBAL_TASK_MODE_MSG.NOTIFICATION, event };
+    for (const sub of candidates) {
+      if (this.clients.has(sub.ws) && sub.ws.readyState === WebSocket.OPEN) {
+        safeSendWs(sub.ws, frame);
+      }
     }
   }
 }

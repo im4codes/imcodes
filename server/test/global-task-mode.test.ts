@@ -1218,4 +1218,99 @@ describe('global-task-mode server engine', () => {
     expect(watchRes.browserSockets).toBeGreaterThanOrEqual(1);
     expect((ownerWs.close as ReturnType<typeof vi.fn>)).toHaveBeenCalled();
   });
+
+  it('fans out global_tasks.notification across PG NOTIFY / in-process to target user only and drops disabled accounts', async () => {
+    const memDb = new InMemoryGlobalTaskDb();
+    const db = memDb.asDatabase();
+    memDb.servers.set('srv-a', {
+      id: 'srv-a',
+      user_id: 'user-a',
+      team_id: null,
+      name: 'Alpha Box',
+      token_hash: 'h',
+      last_heartbeat_at: Date.now(),
+      status: 'online',
+      daemon_version: '1.0.0',
+      bound_with_key_id: null,
+      created_at: 1000,
+      node_role: 'full',
+      revoked_at: null,
+    });
+
+    const userAFrames: GlobalTaskServerFrame[] = [];
+    const userAWs = {
+      readyState: WebSocket.OPEN,
+      send: vi.fn((data: string) => { userAFrames.push(JSON.parse(data)); }),
+      on: vi.fn(),
+      once: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    const userBFrames: GlobalTaskServerFrame[] = [];
+    const userBWs = {
+      readyState: WebSocket.OPEN,
+      send: vi.fn((data: string) => { userBFrames.push(JSON.parse(data)); }),
+      on: vi.fn(),
+      once: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    await globalTaskHub.handleConnection(userAWs, 'user-a', db);
+    await globalTaskHub.handleConnection(userBWs, 'user-b', db);
+    expect(globalTaskHub.hasLiveUserSocket('user-a')).toBe(true);
+    expect(globalTaskHub.hasLiveUserSocket('user-c')).toBe(false);
+
+    const framesFor = (frames: GlobalTaskServerFrame[]) => frames.slice(1);
+
+    // 1. In-process dispatch delivers only to user-a, not user-b, and emits PG NOTIFY
+    await globalTaskHub.notifyPushNotification(db, {
+      userId: 'user-a',
+      eventId: 'notif-1',
+      title: 'Alpha Box · proj',
+      body: 'Ready for review',
+      notificationType: 'task_complete',
+      serverId: 'srv-a',
+      session: 'deck_proj_brain',
+      eventType: 'session.idle',
+      ts: 12345,
+    });
+
+    expect(framesFor(userAFrames)).toEqual([
+      {
+        type: GLOBAL_TASK_MODE_MSG.NOTIFICATION,
+        event: {
+          eventId: 'notif-1',
+          title: 'Alpha Box · proj',
+          body: 'Ready for review',
+          notificationType: 'task_complete',
+          serverId: 'srv-a',
+          session: 'deck_proj_brain',
+          eventType: 'session.idle',
+          ts: 12345,
+        },
+      },
+    ]);
+    expect(framesFor(userBFrames)).toEqual([]);
+    expect(memDb.pgNotifies.at(-1)?.channel).toBe(GLOBAL_TASK_NOTIFY_CHANNEL);
+    expect(Buffer.byteLength(memDb.pgNotifies.at(-1)!.payload, 'utf8')).toBeLessThanOrEqual(GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
+
+    // 2. PG NOTIFY replay delivers to user-a across pods
+    await globalTaskHub.handleNotifyPayload(memDb.pgNotifies.at(-1)!.payload, db);
+    expect(framesFor(userAFrames)).toHaveLength(2);
+    expect(framesFor(userBFrames)).toHaveLength(0);
+
+    // 3. Disabled user receives zero notifications and socket closes with 1008
+    memDb.users.get('user-a')!.status = 'disabled';
+    await globalTaskHub.notifyPushNotification(db, {
+      userId: 'user-a',
+      eventId: 'notif-blocked',
+      title: 'Blocked',
+      body: 'Should never reach disabled user',
+      notificationType: 'remote_desktop',
+      serverId: 'srv-a',
+      ts: 12346,
+    });
+    expect(framesFor(userAFrames)).toHaveLength(2);
+    expect((userAWs.close as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(1008, 'account_inactive');
+  });
 });

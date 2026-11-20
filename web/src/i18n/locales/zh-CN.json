@@ -2404,7 +2404,15 @@
     "tts_quality_siri": "Siri 语音",
     "tts_quality_default": "默认",
     "tts_open_android_settings": "前往系统语音设置",
-    "tts_open_ios_settings": "打开系统设置"
+    "tts_open_ios_settings": "打开系统设置",
+    "push_desktop_label": "桌面端 / PC App",
+    "push_desktop_title": "桌面系统消息推送通知",
+    "push_desktop_desc": "在桌面浏览器和 PC App 中接收系统级弹窗通知，并与下方通知类型及服务器白名单设置保持同步。",
+    "push_desktop_enable_btn": "启用桌面系统通知",
+    "push_desktop_toggle_title": "在此电脑显示系统通知",
+    "push_desktop_toggle_desc": "即使在其他服务器或后台窗口工作，也按已同步的通知偏好推送桌面消息。",
+    "push_desktop_denied": "通知权限已被浏览器或系统阻止，请在浏览器或系统设置中允许通知后再开启。",
+    "push_desktop_unsupported": "当前浏览器环境不支持桌面系统通知。"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

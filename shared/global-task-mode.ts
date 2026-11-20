@@ -1,3 +1,5 @@
+import type { PushNotificationType } from './push-notifications.js';
+
 export const GLOBAL_TASK_WS_PATH = '/api/global-tasks/ws' as const;
 export const GLOBAL_TASK_SNAPSHOT_PATH = '/api/global-tasks' as const;
 export const GLOBAL_TASK_TICKET_PATH = '/api/global-tasks/ws-ticket' as const;
@@ -16,6 +18,7 @@ export const GLOBAL_TASK_MODE_MSG = {
   SNAPSHOT: 'global_tasks.snapshot',
   UPSERT: 'global_tasks.upsert',
   BRAIN_TEXT: 'global_tasks.brain_text',
+  NOTIFICATION: 'global_tasks.notification',
   SERVER_STATE: 'global_tasks.server_state',
   PONG: 'pong',
 } as const;
@@ -76,6 +79,18 @@ export interface GlobalTaskBrainTextEvent {
   ts: number;
 }
 
+export interface GlobalTaskNotificationEvent {
+  eventId: string;
+  title: string;
+  body: string;
+  notificationType?: PushNotificationType;
+  serverId?: string;
+  session?: string;
+  taskId?: string;
+  eventType?: string;
+  ts: number;
+}
+
 export interface GlobalTaskSnapshotResponse {
   tasks: GlobalTaskSummaryRow[];
   brains: GlobalTaskBrainSummary[];
@@ -114,6 +129,7 @@ export type GlobalTaskServerFrame =
   | ({ type: typeof GLOBAL_TASK_MODE_MSG.SNAPSHOT } & GlobalTaskSnapshotResponse)
   | { type: typeof GLOBAL_TASK_MODE_MSG.UPSERT; task: GlobalTaskSummaryRow }
   | { type: typeof GLOBAL_TASK_MODE_MSG.BRAIN_TEXT; event: GlobalTaskBrainTextEvent }
+  | { type: typeof GLOBAL_TASK_MODE_MSG.NOTIFICATION; event: GlobalTaskNotificationEvent }
   | { type: typeof GLOBAL_TASK_MODE_MSG.SERVER_STATE; serverId: string; online: boolean }
   | { type: typeof GLOBAL_TASK_MODE_MSG.PONG };
 

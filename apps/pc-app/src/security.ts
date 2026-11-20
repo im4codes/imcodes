@@ -19,6 +19,7 @@ export const ALLOWED_WEB_PERMISSIONS = new Set<string>([
   'media',
   'fullscreen',
   'keyboardLock',
+  'notifications',
 ]);
 
 function parseHttpOrigin(rawUrl: string): { protocol: 'http:' | 'https:'; origin: string } | null {
@@ -156,7 +157,7 @@ export interface WindowSecurityGuardOptions {
  * - Same-active-origin navigation & redirect allowlist
  * - Window-open denial + strict allowlisted external URL handoff
  * - Webview attachment prevention (defense-in-depth alongside webviewTag=false)
- * - Active-trusted-origin scoped permission gate (clipboard, media, fullscreen & keyboardLock only)
+ * - Active-trusted-origin scoped permission gate (clipboard, media, fullscreen, keyboardLock & notifications only)
  * - User-confirmed download destination (never silent disk writes)
  */
 export function attachWindowSecurityGuards(options: WindowSecurityGuardOptions): void {

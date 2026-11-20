@@ -963,4 +963,176 @@ describe('push preferences and registration routes', () => {
       expect(fetchSpy).not.toHaveBeenCalled();
     });
   });
+
+  describe('PC-only / desktop notification sync and dispatchPush fallback', () => {
+    it('reads and persists notification types on users for PC-only users without push_tokens and seeds newly registered tokens', async () => {
+      mockDb.queryOne
+        .mockResolvedValueOnce(null) // no push_tokens row
+        .mockResolvedValueOnce({
+          push_enabled_server_ids: ['srv-pc-1'],
+          push_notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE, PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT],
+        });
+
+      const getRes = await app.request('/api/push/preferences', {
+        headers: { Authorization: 'Bearer valid-user-token' },
+      });
+      expect(getRes.status).toBe(200);
+      expect(await getRes.json()).toEqual({
+        ok: true,
+        types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE, PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT],
+        defaultTypes: DEFAULT_PUSH_NOTIFICATION_TYPES,
+        enabledServerIds: ['srv-pc-1'],
+      });
+
+      mockDb.execute.mockResolvedValue({ changes: 1 });
+      const postRes = await app.request('/api/push/preferences', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer valid-user-token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          types: [PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE, PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP],
+        }),
+      });
+      expect(postRes.status).toBe(200);
+      expect(mockDb.execute).toHaveBeenCalledWith(
+        'UPDATE users SET push_notification_types = $1 WHERE id = $2',
+        [[PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE, PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP], 'user-123'],
+      );
+
+      // New iOS token registration without explicit notificationTypes inherits users.push_notification_types
+      mockDb.execute.mockClear();
+      mockDb.queryOne.mockResolvedValueOnce({
+        push_notification_types: [PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE, PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP],
+      });
+      mockDb.execute.mockResolvedValueOnce({ rowCount: 1 });
+      const regRes = await app.request('/api/push/register', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer valid-user-token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          token: 'ios-synced-token',
+          platform: PUSH_PLATFORM_IOS,
+        }),
+      });
+      expect(regRes.status).toBe(200);
+      expect(mockDb.execute).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO push_tokens'),
+        expect.arrayContaining([
+          'user-123',
+          'ios-synced-token',
+          PUSH_PLATFORM_IOS,
+          [PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE, PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP],
+        ]),
+      );
+    });
+
+    it('emits desktop notification via globalTaskHub when push_tokens is empty without incrementing badge_count, and honors mutes & inactive users', async () => {
+      const { globalTaskHub } = await import('../src/services/global-task-hub.js');
+      const notifySpy = vi.spyOn(globalTaskHub, 'notifyPushNotification').mockResolvedValue();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+      const mockEnv = { DB: mockDb } as any;
+
+      try {
+        // 1. Active PC-only user with srv-pc-1 allowed -> emits desktop notification, no badge increment, no mobile fetch
+        mockDb.query.mockResolvedValueOnce([]); // no push_tokens
+        mockDb.queryOne.mockResolvedValueOnce({
+          push_enabled_server_ids: ['srv-pc-1'],
+          push_notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE, PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP],
+        });
+        await dispatchPush({
+          userId: 'user-pc-1',
+          serverId: 'srv-pc-1',
+          title: 'PC Machine · proj',
+          body: 'Build complete',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+          eventId: 'evt-pc-1',
+          data: { serverId: 'srv-pc-1', session: 'deck_proj_brain', type: 'session.idle' },
+        }, mockEnv);
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+        expect(notifySpy).toHaveBeenCalledWith(mockDb, expect.objectContaining({
+          userId: 'user-pc-1',
+          eventId: 'evt-pc-1',
+          serverId: 'srv-pc-1',
+          session: 'deck_proj_brain',
+          notificationType: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+        }));
+        expect(fetchSpy).not.toHaveBeenCalled();
+
+        // 2. Muted server suppresses task_complete, but remote_desktop bypasses server mute
+        notifySpy.mockClear();
+        mockDb.query.mockResolvedValueOnce([]);
+        mockDb.queryOne.mockResolvedValueOnce({
+          push_enabled_server_ids: ['srv-pc-1'],
+          push_notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE, PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP],
+        });
+        await dispatchPush({
+          userId: 'user-pc-1',
+          serverId: 'srv-muted',
+          title: 'Muted Server',
+          body: 'Should not fire',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+        }, mockEnv);
+        expect(notifySpy).not.toHaveBeenCalled();
+
+        mockDb.query.mockResolvedValueOnce([]);
+        mockDb.queryOne.mockResolvedValueOnce({
+          push_enabled_server_ids: ['srv-pc-1'],
+          push_notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE, PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP],
+        });
+        await dispatchPush({
+          userId: 'user-pc-1',
+          serverId: 'srv-muted',
+          title: 'Security Alert',
+          body: 'Auto unlock',
+          type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+          eventId: 'evt-rd-1',
+        }, mockEnv);
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+
+        // 3. Disabled / non-existent user receives zero desktop notifications
+        notifySpy.mockClear();
+        mockDb.query.mockResolvedValueOnce([]);
+        mockDb.queryOne.mockResolvedValueOnce(null);
+        await dispatchPush({
+          userId: 'user-disabled',
+          serverId: 'srv-pc-1',
+          title: 'Should drop',
+          body: 'Disabled user',
+          type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+        }, mockEnv);
+        expect(notifySpy).not.toHaveBeenCalled();
+
+        // 4. suppressMobilePush still delivers desktop notification without incrementing badge_count or calling mobile providers
+        notifySpy.mockClear();
+        mockDb.query.mockClear();
+        mockDb.query.mockResolvedValueOnce([
+          {
+            token: 'ios-tok-1',
+            platform: PUSH_PLATFORM_IOS,
+            notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+            push_enabled_server_ids: ['srv-pc-1'],
+            push_notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          },
+        ]);
+        await dispatchPush({
+          userId: 'user-both',
+          serverId: 'srv-pc-1',
+          title: 'Both Active',
+          body: 'Mobile open + PC open',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+          suppressMobilePush: true,
+        }, mockEnv);
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+        expect(mockDb.query).toHaveBeenCalledTimes(1); // only initial token select, no badge_count UPDATE
+        expect(fetchSpy).not.toHaveBeenCalled();
+      } finally {
+        notifySpy.mockRestore();
+        fetchSpy.mockRestore();
+      }
+    });
+  });
 });

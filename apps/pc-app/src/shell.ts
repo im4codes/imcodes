@@ -38,6 +38,10 @@ export const DOCS_HELP_URL = 'https://docs.im.codes';
 
 export interface ShellWindowLike extends TrustedWindowLike {
   on(event: 'closed', listener: () => void): unknown;
+  isMinimized?(): boolean;
+  restore?(): void;
+  show?(): void;
+  focus?(): void;
   webContents: TrustedWindowLike['webContents'] & SecurityWebContentsLike & {
     session: SecuritySessionLike & {
       cookies?: CookiesChangeEventLike;
@@ -45,6 +49,7 @@ export interface ShellWindowLike extends TrustedWindowLike {
     };
     on(event: 'did-navigate', listener: () => void): unknown;
     on(event: 'did-finish-load', listener: () => void): unknown;
+    on(event: 'focus', listener: () => void): unknown;
     reload(): void;
     reloadIgnoringCache(): void;
     toggleDevTools(): void;
@@ -78,6 +83,7 @@ export interface PcAppShellDeps {
     cancelId?: number;
   }) => Promise<{ response: number }>;
   showNotification?: (options: { title: string; body: string }) => void;
+  focusApp?: () => void;
   promptAddServer?: () => Promise<ServerPromptInput | null>;
   detectLocalBoundOrigin?: () => string | { origin: string; label?: string } | null;
   welcomeLocale?: string;
@@ -104,6 +110,7 @@ export interface PcAppShellInstance {
   getLocale: () => PcAppLocale;
   getWindow: () => ShellWindowLike | null;
   ensureWindow: () => Promise<ShellWindowLike>;
+  focusWindow: () => Promise<ShellWindowLike | null>;
   showServerPicker: () => Promise<void>;
   addAndSelectServer: (rawUrl: string, label?: string) => Promise<string>;
   selectServer: (origin: string) => Promise<string>;
@@ -351,7 +358,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       onClearSession: () => void handleClearSession(),
       onBindFallback: () => void handleBindFallback(),
       onOpenDocs: () => void openDocsSafely(DOCS_HELP_URL),
-      onOpenSettings: handleOpenSettings,
+      onOpenSettings: deps.onOpenSettings ?? handleOpenSettings,
       settingsEnabled: Boolean(controller.currentTrustedOrigin()),
     });
     deps.setApplicationMenu(template);
@@ -473,6 +480,13 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       }
     });
 
+    win.webContents.on('focus', () => {
+      if (win.isDestroyed()) return;
+      if (win.isMinimized?.()) {
+        win.restore?.();
+      }
+    });
+
     if (win.webContents.session.cookies) {
       bind.attachCookies(win.webContents.session.cookies);
       win.webContents.session.cookies.on('changed', (_event, cookie, _cause, removed) => {
@@ -503,6 +517,18 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     return win;
   };
 
+  const focusWindow = async (): Promise<ShellWindowLike | null> => {
+    const win = await ensureWindow();
+    if (win.isDestroyed()) return null;
+    if (win.isMinimized?.()) {
+      win.restore?.();
+    }
+    win.show?.();
+    win.focus?.();
+    deps.focusApp?.();
+    return win;
+  };
+
   return {
     store,
     controller,
@@ -510,6 +536,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     getLocale: () => activeLocale,
     getWindow: () => mainWindow,
     ensureWindow,
+    focusWindow,
     showServerPicker,
     addAndSelectServer: async (rawUrl, label) => {
       await ensureWindow();

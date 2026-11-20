@@ -604,4 +604,44 @@ describe('SettingsPage push notification settings', () => {
     const recoveredCb = await screen.findByLabelText('Recovered Node') as HTMLInputElement;
     expect(recoveredCb.checked).toBe(true);
   });
+
+  it('renders Desktop System Notifications controls and requests browser/pc-app permission', async () => {
+    const OriginalNotification = globalThis.Notification;
+    let perm: NotificationPermission = 'default';
+    const requestPermission = vi.fn(async () => {
+      perm = 'granted';
+      return perm;
+    });
+    vi.stubGlobal('Notification', {
+      get permission() { return perm; },
+      requestPermission,
+    });
+
+    try {
+      render(
+        <SettingsPage
+          displayName="Ada Lovelace"
+          username="ada"
+          hasPassword={true}
+          initialTab="notifications"
+          onBack={vi.fn()}
+          onDisplayNameChanged={vi.fn()}
+          onUserAuthUpdated={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByTestId('desktop-notification-settings-card')).toBeDefined();
+      const enableBtn = screen.getByTestId('enable-desktop-notifications-btn');
+      fireEvent.click(enableBtn);
+
+      await waitFor(() => {
+        expect(requestPermission).toHaveBeenCalledTimes(1);
+      });
+      const toggle = await screen.findByLabelText('settings.push_desktop_toggle_title') as HTMLInputElement;
+      expect(toggle.checked).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      if (OriginalNotification) globalThis.Notification = OriginalNotification;
+    }
+  });
 });

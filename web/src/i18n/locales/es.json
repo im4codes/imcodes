@@ -2404,7 +2404,15 @@
     "tts_quality_siri": "Siri",
     "tts_quality_default": "Estándar",
     "tts_open_android_settings": "Abrir ajustes de voz del sistema",
-    "tts_open_ios_settings": "Abrir Ajustes del sistema"
+    "tts_open_ios_settings": "Abrir Ajustes del sistema",
+    "push_desktop_label": "Escritorio / PC App",
+    "push_desktop_title": "Notificaciones del sistema en escritorio",
+    "push_desktop_desc": "Recibe notificaciones nativas del sistema en navegadores de escritorio y PC App, sincronizadas con tus tipos y servidores permitidos.",
+    "push_desktop_enable_btn": "Activar notificaciones de escritorio",
+    "push_desktop_toggle_title": "Mostrar notificaciones en este equipo",
+    "push_desktop_toggle_desc": "Muestra alertas del sistema según tus preferencias sincronizadas incluso al usar otros servidores o ventanas.",
+    "push_desktop_denied": "El permiso de notificaciones está bloqueado en tu navegador o sistema operativo. Habilítalo en la configuración.",
+    "push_desktop_unsupported": "Las notificaciones de escritorio no son compatibles con este navegador."
   },
   "capabilities": {
     "eyebrow": "Capacidades de IA portátiles",

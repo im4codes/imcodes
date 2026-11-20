@@ -343,6 +343,11 @@ import {
   hasUnsyncedPushEnabledServerEdits,
 } from './push-notifications.js';
 import {
+  canReceiveDesktopNotifications,
+  DESKTOP_NOTIFICATION_PREFS_CHANGED_EVENT,
+  showDesktopNotification,
+} from './desktop-notifications.js';
+import {
   resolveEffectivePushEnabledServerIds,
   sanitizePushEnabledServerIds,
 } from '@shared/push-notifications.js';
@@ -1238,6 +1243,8 @@ function InternalMainApp() {
   }, [beginAuthAttempt, holdAuthCredentialCleanupGate]);
 
   const [servers, setServers] = useState<ServerInfo[]>([]);
+  const serversRef = useRef<ServerInfo[]>(servers);
+  serversRef.current = servers;
   const [serversLoaded, setServersLoaded] = useState(false);
   const [serversSynced, setServersSynced] = useState(false);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(
@@ -1856,6 +1863,42 @@ function InternalMainApp() {
     return () => {
       unsubscribe();
       document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [auth]);
+
+  // Desktop / pc-app: keep GlobalTaskHub notification stream active when OS notifications
+  // are permitted & enabled, and dispatch native Notification banners across all servers.
+  useEffect(() => {
+    if (!auth || isNative()) return;
+    let releaseStream: (() => void) | null = null;
+    const syncStream = () => {
+      const shouldListen = canReceiveDesktopNotifications();
+      if (shouldListen && !releaseStream) {
+        releaseStream = globalTaskModeStore.acquire();
+      } else if (!shouldListen && releaseStream) {
+        const rel = releaseStream;
+        releaseStream = null;
+        rel();
+      }
+    };
+    syncStream();
+    window.addEventListener(DESKTOP_NOTIFICATION_PREFS_CHANGED_EVENT, syncStream);
+    const unsubscribeNotifications = globalTaskModeStore.subscribeNotifications((event) => {
+      const hubServers = globalTaskModeStore.getState().servers.map((s) => s.id);
+      const accessible = new Set<string>([...hubServers, ...serversRef.current.map((s) => s.id)]);
+      showDesktopNotification(event, {
+        activeServerId: selectedServerIdRef.current,
+        activeSession: activeSessionRef.current,
+        accessibleServerIds: [...accessible],
+      });
+    });
+    return () => {
+      window.removeEventListener(DESKTOP_NOTIFICATION_PREFS_CHANGED_EVENT, syncStream);
+      unsubscribeNotifications();
+      if (releaseStream) {
+        releaseStream();
+        releaseStream = null;
+      }
     };
   }, [auth]);
 

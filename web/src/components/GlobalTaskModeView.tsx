@@ -446,7 +446,12 @@ export function GlobalTaskModeView({
       setTtsAutoRead(getTtsAutoReadEnabled());
     });
 
-    void globalTaskModeStore.start();
+    const releaseStream = typeof globalTaskModeStore.acquire === 'function'
+      ? globalTaskModeStore.acquire()
+      : (() => {
+        void globalTaskModeStore.start();
+        return () => { globalTaskModeStore.stop(); };
+      })();
 
     return () => {
       for (const tracker of pressTrackersRef.current.values()) {
@@ -458,7 +463,7 @@ export function GlobalTaskModeView({
       unsubBrainText();
       unsubTtsState();
       unsubTtsPrefs();
-      globalTaskModeStore.stop();
+      releaseStream();
 
       const activeTts = getTtsState();
       if (

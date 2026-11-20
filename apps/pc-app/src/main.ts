@@ -58,7 +58,18 @@ export async function startPcApp(): Promise<void> {
       dialog.showMessageBox(win as unknown as BrowserWindow, options),
     showNotification: ({ title, body }) => {
       if (Notification.isSupported()) {
-        new Notification({ title, body }).show();
+        const notification = new Notification({ title, body });
+        notification.on('click', () => {
+          void pcShell.focusWindow();
+        });
+        notification.show();
+      }
+    },
+    focusApp: () => {
+      if (process.platform === 'darwin') {
+        app.focus({ steal: true });
+      } else {
+        app.focus();
       }
     },
     bindDeps: {
@@ -72,6 +83,8 @@ export async function startPcApp(): Promise<void> {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       void pcShell.ensureWindow();
+    } else {
+      void pcShell.focusWindow();
     }
   });
 

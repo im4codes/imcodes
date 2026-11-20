@@ -2403,7 +2403,15 @@
     "tts_quality_siri": "Siri",
     "tts_quality_default": "標準",
     "tts_open_android_settings": "システム音声設定を開く",
-    "tts_open_ios_settings": "システム設定を開く"
+    "tts_open_ios_settings": "システム設定を開く",
+    "push_desktop_label": "デスクトップ / PC アプリ",
+    "push_desktop_title": "デスクトップシステム通知",
+    "push_desktop_desc": "デスクトップブラウザや PC アプリで OS 通知を受信し、下の通知種別および許可サーバー設定と同期します。",
+    "push_desktop_enable_btn": "デスクトップ通知を有効にする",
+    "push_desktop_toggle_title": "このコンピューターに通知を表示",
+    "push_desktop_toggle_desc": "別のサーバーやバックグラウンドウィンドウで作業中でも、同期された設定に従って通知を表示します。",
+    "push_desktop_denied": "通知の許可がブラウザまたは OS 設定でブロックされています。サイトの通知を許可してください。",
+    "push_desktop_unsupported": "このブラウザ環境はデスクトップ通知に対応していません。"
   },
   "capabilities": {
     "eyebrow": "ポータブル AI 機能",
