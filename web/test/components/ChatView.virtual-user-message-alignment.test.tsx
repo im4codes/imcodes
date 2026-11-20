@@ -178,20 +178,24 @@ describe('Human user message right-alignment in virtualized and non-virtualized 
     expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s*\{[^}]*border-right:\s*2px solid rgba\(34,\s*211,\s*238/);
     expect(css).toMatch(/@media\s*\(min-width:\s*641px\)\s*\{[^}]*\.chat-user\.chat-user-origin-user\s*\{[^}]*max-width:\s*95%;/);
 
-    // Pending / failed states and 22-line image fold height for human user bubble
+    // Pending / failed states and restored 10-line unified fold height for human user bubble
     expect(css).toMatch(/\.chat-user\.chat-user-origin-user\.chat-pending\s*\{/);
     expect(css).toMatch(/\.chat-user\.chat-user-origin-user\.chat-failed\s*\{/);
-    expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s+\.chat-user-message-fold\.has-images\s+\.chat-user-message-fold-content\.is-folded[\s\S]*?max-height:\s*calc\(1\.45em \* 22\);/);
+    expect(css).toMatch(/\.chat-user-message-fold-content\.is-folded[\s\S]*?max-height:\s*calc\(1\.45em \* 10\);/);
+    expect(css).not.toMatch(/calc\(1\.45em \* 22\)/);
 
-    // Compact path badge, left/right split layout, horizontal multi-image tiling, and attachments wrap
+    // Integrated image caption, left/right split layout, compact thumbnail heights, and attachments wrap
     expect(css).toMatch(/\.chat-path-actions-badge\s*\{[^}]*display:\s*inline-flex;/);
-    expect(css).toMatch(/@media\s*\(min-width:\s*720px\)\s*\{[^}]*\.chat-user\.chat-user-origin-user\s+\.chat-user-message-fold\.has-split-layout\s*>\s*\.chat-user-split-layout\s*\{[^}]*flex-direction:\s*row;/);
+    expect(css).toMatch(/@media\s*\(min-width:\s*720px\)\s*\{[^}]*\.chat-user\.chat-user-origin-user\s+\.chat-user-message-fold\.has-split-layout\s+\.chat-user-split-layout\s*\{[^}]*flex-direction:\s*row;/);
     expect(css).toMatch(/\.chat-user-attachments\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*wrap;/);
-    expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s+\.chat-local-image-preview\s*\{[^}]*display:\s*inline-flex;[^}]*max-width:\s*min\(360px,\s*100%\);/);
-    expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s+\.chat-user-message-fold\.has-multi-images\s+\.chat-local-image-preview\s*\{[^}]*max-width:\s*min\(240px,\s*100%\);/);
+    expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s+\.chat-local-image-preview\s*\{[^}]*display:\s*inline-flex;[^}]*max-width:\s*min\(260px,\s*100%\);/);
+    expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s+\.chat-user-message-fold\.has-multi-images\s+\.chat-local-image-preview\s*\{[^}]*max-width:\s*min\(210px,\s*100%\);/);
+    expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s+\.chat-local-image-preview-img\s*\{[^}]*max-height:\s*150px;/);
+    expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s+\.chat-user-message-fold\.has-multi-images\s+\.chat-local-image-preview-img\s*\{[^}]*max-height:\s*112px;/);
+    expect(css).toMatch(/\.chat-local-image-preview-caption\s*\{[^}]*display:\s*flex;/);
   });
 
-  it('formats sent-bubble file paths as basename badges, splits media/text on images+text, and preserves actions', async () => {
+  it('renders image badges inside preview captions without duplicating in prose, omits empty text pane on image-only messages, and folds at 10 lines', async () => {
     const { fireEvent } = await import('@testing-library/preact');
     const ws = {
       fsReadFile: vi.fn(() => 'read-image-preview'),
@@ -209,7 +213,7 @@ describe('Human user message right-alignment in virtualized and non-virtualized 
         text: `#1:(/Users/k/.imcodes/uploads/a/shot.png)\n${Array.from({ length: 14 }, (_, i) => `line-${i + 1}`).join('\n')}`,
       }),
       makeMessage({
-        text: `#1:(/Users/k/.imcodes/uploads/a/shot.png)\n${Array.from({ length: 24 }, (_, i) => `overflow-${i + 1}`).join('\n')}`,
+        text: `#1:(/Users/k/.imcodes/uploads/a/short.png)\nline-1\nline-2`,
       }),
       makeMessage({ text: agentDelivery('Agent msg /tmp/a.png /tmp/b.png') }, { source: 'daemon' }),
       makeMessage({ text: 'System notice /tmp/sys/audit.log', messageOrigin: 'system' }, { source: 'daemon' }),
@@ -230,17 +234,19 @@ describe('Human user message right-alignment in virtualized and non-virtualized 
     const userBubbles = container.querySelectorAll('.chat-user.chat-user-origin-user');
     expect(userBubbles).toHaveLength(5);
 
-    // 1. Single image + text: compact badge shows only basename, no raw upload path text, split layout active
+    // 1. Single image + text: #1 badge lives inside image caption (NOT duplicated in text pane), split layout inside fold content
     const singleBubble = userBubbles[0];
     const singleFold = singleBubble.querySelector('.chat-user-message-fold');
     expect(singleFold?.classList.contains('has-images')).toBe(true);
     expect(singleFold?.classList.contains('has-multi-images')).toBe(false);
     expect(singleFold?.classList.contains('has-split-layout')).toBe(true);
+    expect(singleFold?.querySelector('.chat-user-message-fold-content > .chat-user-split-layout')).toBeTruthy();
     expect(singleBubble.querySelectorAll('.chat-user-media-pane .chat-local-image-preview')).toHaveLength(1);
-    const singleBadge = singleBubble.querySelector('.chat-user-text-pane .chat-path-actions-badge');
-    expect(singleBadge).toBeTruthy();
-    expect(singleBadge?.querySelector('.chat-path-badge-index')?.textContent).toBe('#1');
-    const singleLink = singleBadge?.querySelector('.chat-path-link') as HTMLElement | null;
+    expect(singleBubble.querySelector('.chat-user-text-pane .chat-path-actions-badge')).toBeNull();
+    const singleCaptionBadge = singleBubble.querySelector('.chat-local-image-preview-caption .chat-path-actions-badge');
+    expect(singleCaptionBadge).toBeTruthy();
+    expect(singleCaptionBadge?.querySelector('.chat-path-badge-index')?.textContent).toBe('#1');
+    const singleLink = singleCaptionBadge?.querySelector('.chat-path-link') as HTMLElement | null;
     expect(singleLink?.textContent).toBe('one.png');
     expect(singleLink?.getAttribute('title')).toBe('/Users/k/.imcodes/uploads/ff26735e930883fe84068ff9424c80aa/one.png');
     expect(singleBubble.textContent).not.toContain('ff26735e930883fe84068ff9424c80aa');
@@ -249,7 +255,7 @@ describe('Human user message right-alignment in virtualized and non-virtualized 
       path: '/Users/k/.imcodes/uploads/ff26735e930883fe84068ff9424c80aa/one.png',
     }));
 
-    // 2. Multi-image + non-image path + attachments: split layout, basename badges, attachments wrap
+    // 2. Multi-image + non-image path + attachments: image badges only in captions, non-image badge only in text pane
     const multiBubble = userBubbles[1];
     const multiFold = multiBubble.querySelector('.chat-user-message-fold');
     expect(multiFold?.classList.contains('has-images')).toBe(true);
@@ -257,23 +263,25 @@ describe('Human user message right-alignment in virtualized and non-virtualized 
     expect(multiFold?.classList.contains('has-split-layout')).toBe(true);
     expect(multiBubble.querySelectorAll('.chat-user-media-pane .chat-local-image-preview')).toHaveLength(2);
     expect(multiBubble.querySelector('.chat-user-attachments')).toBeTruthy();
-    const multiBadges = Array.from(multiBubble.querySelectorAll('.chat-path-actions-badge .chat-path-link'));
-    expect(multiBadges.map((el) => el.textContent)).toEqual(['one.png', 'two.jpg', 'spec.pdf']);
+    expect(Array.from(multiBubble.querySelectorAll('.chat-local-image-preview-caption .chat-path-link')).map((el) => el.textContent)).toEqual(['one.png', 'two.jpg']);
+    expect(Array.from(multiBubble.querySelectorAll('.chat-user-text-pane .chat-path-link')).map((el) => el.textContent)).toEqual(['spec.pdf']);
     expect(multiBubble.textContent).not.toContain('/Users/k/docs/');
 
-    // 3. Images-only message: tiled images without forcing a split prose column
+    // 3. Images-only message: omits empty .chat-user-text-pane and keeps badges in image captions
     const imagesOnlyFold = userBubbles[2].querySelector('.chat-user-message-fold');
     expect(imagesOnlyFold?.classList.contains('has-images')).toBe(true);
     expect(imagesOnlyFold?.classList.contains('has-multi-images')).toBe(true);
     expect(imagesOnlyFold?.classList.contains('has-split-layout')).toBe(false);
+    expect(userBubbles[2].querySelector('.chat-user-text-pane')).toBeNull();
     expect(userBubbles[2].querySelectorAll('.chat-user-media-pane .chat-local-image-preview')).toHaveLength(2);
+    expect(Array.from(userBubbles[2].querySelectorAll('.chat-local-image-preview-caption .chat-path-link')).map((el) => el.textContent)).toEqual(['only1.png', 'only2.png']);
 
-    // 4. Text-with-image fold threshold stays generous (14 lines does not fold; 24 lines folds)
+    // 4. Unified 10-line fold threshold: 14 lines with image folds cleanly, short 3-line message stays unfolded
     const fourteenLinesFold = userBubbles[3].querySelector('.chat-user-message-fold');
-    expect(fourteenLinesFold?.classList.contains('is-foldable')).toBe(false);
-    const twentyFourLinesFold = userBubbles[4].querySelector('.chat-user-message-fold');
-    expect(twentyFourLinesFold?.classList.contains('is-foldable')).toBe(true);
-    expect(twentyFourLinesFold?.classList.contains('is-folded')).toBe(true);
+    expect(fourteenLinesFold?.classList.contains('is-foldable')).toBe(true);
+    expect(fourteenLinesFold?.classList.contains('is-folded')).toBe(true);
+    const shortLinesFold = userBubbles[4].querySelector('.chat-user-message-fold');
+    expect(shortLinesFold?.classList.contains('is-foldable')).toBe(false);
 
     // 5. Incoming agent & system bubbles remain untouched (no basename badge collapse)
     const agentBubble = container.querySelector('.chat-user.chat-user-origin-agent');

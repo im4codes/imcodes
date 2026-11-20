@@ -75,4 +75,32 @@ describe('ChatLocalImagePreview streamed load lifecycle (tsk_5rf R2)', () => {
     await waitFor(() => expect(container.querySelector('.chat-local-image-preview-loading')).toBeNull());
     expect(onLoadFailed).not.toHaveBeenCalled();
   });
+
+  it('renders caption slot on loaded and error cards without duplicating it during pending settle', async () => {
+    const loader = vi.fn(async () => ({ dataUrl: STREAM_URL, alt: 'shot.png' }));
+    const { container } = render(
+      <ChatLocalImagePreview
+        path="/repo/shot.png"
+        loadImagePreview={loader}
+        caption={<span data-testid="img-cap">#1 shot.png</span>}
+      />,
+    );
+
+    // Loading placeholder preserves caption cleanly
+    expect(container.querySelectorAll('.chat-local-image-preview-caption')).toHaveLength(1);
+    expect(container.querySelector('[data-testid="img-cap"]')?.textContent).toBe('#1 shot.png');
+
+    await waitFor(() => expect(container.querySelector('img')).not.toBeNull());
+    // Pending settling renders only 1 caption inside the card
+    expect(container.querySelectorAll('.chat-local-image-preview-caption')).toHaveLength(1);
+
+    fireEvent.load(container.querySelector('img') as HTMLImageElement);
+    await waitFor(() => expect(container.querySelector('.chat-local-image-preview-loading')).toBeNull());
+    expect(container.querySelector('.chat-local-image-preview-caption [data-testid="img-cap"]')).toBeTruthy();
+
+    // Error state preserves caption for click/download fallback
+    fireEvent.error(container.querySelector('img') as HTMLImageElement);
+    await waitFor(() => expect(container.querySelector('.chat-local-image-preview-error')).not.toBeNull());
+    expect(container.querySelector('.chat-local-image-preview-error .chat-local-image-preview-caption [data-testid="img-cap"]')).toBeTruthy();
+  });
 });

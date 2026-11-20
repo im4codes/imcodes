@@ -372,6 +372,7 @@ export function splitTextWithCloudDocsAndUrls(
     onRemoteDesktopClick?: (targetId: string) => void;
     onUrlClick?: (url: string) => void;
     onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+    omitEmptyFallback?: boolean;
     renderPlainText: (chunkText: string, baseOffset: number) => h.JSX.Element[];
   },
 ): h.JSX.Element[] {
@@ -433,5 +434,5 @@ export function splitTextWithCloudDocsAndUrls(
       }
     }
   }
-  return parts.length ? parts : [<span>{text}</span>];
+  return parts.length || options.omitEmptyFallback ? parts : [<span>{text}</span>];
 }

@@ -1,3 +1,4 @@
+import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { ImageLightbox } from './ImageLightbox.js';
@@ -28,6 +29,7 @@ interface Props {
   path: string;
   loadImagePreview: ChatLocalImagePreviewLoader;
   onDownload?: ChatLocalImagePreviewDownloadHandler;
+  caption?: ComponentChildren;
 }
 
 // tsk_5rf R2: a streamed preview resolves a URL, not bytes, so a resolved URL
@@ -44,7 +46,7 @@ function basename(path: string): string {
   return path.split(/[/\\]/).pop() || path;
 }
 
-export function ChatLocalImagePreview({ path, loadImagePreview, onDownload }: Props) {
+export function ChatLocalImagePreview({ path, loadImagePreview, onDownload, caption }: Props) {
   const { t } = useTranslation();
   const [preview, setPreview] = useState<PreviewState>({ status: 'loading' });
   const [lightboxOpen, setLightboxOpen] = useState(false);
@@ -147,13 +149,18 @@ export function ChatLocalImagePreview({ path, loadImagePreview, onDownload }: Pr
         class="chat-local-image-preview chat-local-image-preview-error"
         title={path}
       >
-        {t('file_browser.preview_error')}
+        <span class="chat-local-image-preview-error-label">{t('file_browser.preview_error')}</span>
+        {caption && <span class="chat-local-image-preview-caption">{caption}</span>}
       </span>
     );
   }
 
   if (preview.status === 'loading') {
-    return <span class="chat-local-image-preview chat-local-image-preview-loading" aria-hidden="true" />;
+    return (
+      <span class="chat-local-image-preview chat-local-image-preview-loading" aria-hidden={caption ? undefined : 'true'}>
+        {caption && <span class="chat-local-image-preview-caption">{caption}</span>}
+      </span>
+    );
   }
 
   const settling = preview.status === 'pending';
@@ -193,6 +200,7 @@ export function ChatLocalImagePreview({ path, loadImagePreview, onDownload }: Pr
             openLightbox();
           }}
         />
+        {caption && <span class="chat-local-image-preview-caption">{caption}</span>}
       </span>
       {lightboxOpen && shown.status === 'ok' && (
         <ImageLightbox
