@@ -109,6 +109,7 @@ import {
   canHandleGlobalNavigationShortcut,
   canHandleOpenSettingsShortcut,
   canHandleReturnToMainWindowShortcut,
+  canHandleToggleTaskModeShortcut,
   cycleOrderedId,
   formatShortcutKeycaps,
   hasDomBlockingOverlay,
@@ -8399,6 +8400,20 @@ function InternalMainApp() {
         e.preventDefault();
         e.stopPropagation();
         returnToMainWindowRef.current();
+        return;
+      }
+
+      if (matched?.action === 'toggleTaskMode') {
+        if (!canHandleToggleTaskModeShortcut(e.target, document.activeElement, {
+          hasBlockingOverlay: hasBlockingNavigationOverlayRef.current,
+          isMobile,
+          isComposing: isImeComposingKeyEvent(e),
+        })) {
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        setShowTaskMode((prev) => !prev);
         return;
       }
 

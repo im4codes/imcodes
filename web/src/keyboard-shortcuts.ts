@@ -6,7 +6,8 @@ export type ShortcutActionId =
   | 'serverNext'
   | 'tabPrev'
   | 'tabNext'
-  | 'subSessionCloseAll';
+  | 'subSessionCloseAll'
+  | 'toggleTaskMode';
 
 export const SHORTCUT_ACTION_IDS: readonly ShortcutActionId[] = [
   'serverPrev',
@@ -14,6 +15,7 @@ export const SHORTCUT_ACTION_IDS: readonly ShortcutActionId[] = [
   'tabPrev',
   'tabNext',
   'subSessionCloseAll',
+  'toggleTaskMode',
 ];
 
 export type ShortcutSlot = 'primary' | 'secondary';
@@ -214,7 +216,7 @@ export function isMacPlatform(nav?: {
   return /Macintosh|Mac OS/i.test(userAgent);
 }
 
-/** Unified default primary shortcut map across all desktop platforms (`Alt+I/K/J/L`, `Ctrl+0`). */
+/** Unified default primary shortcut map across all desktop platforms (`Alt+I/K/J/L`, `Ctrl+0`, `Ctrl+Shift+T`). */
 export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutActionId, string> {
   void isMac;
   return {
@@ -223,6 +225,7 @@ export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutAct
     tabPrev: 'Alt+j',
     tabNext: 'Alt+l',
     subSessionCloseAll: 'Ctrl+0',
+    toggleTaskMode: 'Ctrl+Shift+t',
   };
 }
 
@@ -235,6 +238,7 @@ export function getDefaultSecondaryShortcuts(isMac = isMacPlatform()): Record<Sh
       tabPrev: 'Ctrl+a',
       tabNext: 'Ctrl+d',
       subSessionCloseAll: null,
+      toggleTaskMode: null,
     };
   }
   return {
@@ -243,6 +247,7 @@ export function getDefaultSecondaryShortcuts(isMac = isMacPlatform()): Record<Sh
     tabPrev: null,
     tabNext: null,
     subSessionCloseAll: null,
+    toggleTaskMode: null,
   };
 }
 
@@ -828,22 +833,27 @@ export function canHandleGlobalNavigationShortcut(
   return true;
 }
 
+function matchesElementOrAncestor(el: Element | null, selector: string): boolean {
+  return Boolean(el && typeof (el as HTMLElement).closest === 'function' && (el as HTMLElement).closest(selector));
+}
+
+function getEventDocument(target: EventTarget | null, activeElement: Element | null): Document | undefined {
+  return (activeElement?.ownerDocument ?? (target instanceof Node ? target.ownerDocument : undefined))
+    ?? (typeof document !== 'undefined' ? document : undefined);
+}
+
 function isShortcutRecordingActive(
   target: EventTarget | null,
   activeElement: Element | null,
 ): boolean {
   const targetEl = target instanceof Element ? target : null;
-  if (typeof targetEl?.closest === 'function' && targetEl.closest('[data-shortcut-recording="true"]')) {
-    return true;
-  }
   if (
-    typeof (activeElement as HTMLElement | null)?.closest === 'function'
-    && activeElement?.closest('[data-shortcut-recording="true"]')
+    matchesElementOrAncestor(targetEl, '[data-shortcut-recording="true"]')
+    || matchesElementOrAncestor(activeElement, '[data-shortcut-recording="true"]')
   ) {
     return true;
   }
-  const doc = (activeElement?.ownerDocument ?? (target instanceof Node ? target.ownerDocument : undefined))
-    ?? (typeof document !== 'undefined' ? document : undefined);
+  const doc = getEventDocument(target, activeElement);
   return Boolean(doc?.querySelector('[data-shortcut-recording="true"]'));
 }
 
@@ -891,6 +901,34 @@ export function matchesOpenSettingsShortcut(
   if (e.altKey || e.shiftKey) return false;
   if (isMac ? (!e.metaKey || e.ctrlKey) : (!e.ctrlKey || e.metaKey)) return false;
   return e.key === ',' || e.code === 'Comma';
+}
+
+/**
+ * Determine whether the global Task Mode <-> Workspace toggle shortcut (`toggleTaskMode`)
+ * should run. Active in both Workspace (including composer/terminals) and GlobalTaskModeView,
+ * while blocking mobile, IME composition, active shortcut recording, and open modal dialogs/settings.
+ */
+export function canHandleToggleTaskModeShortcut(
+  target: EventTarget | null,
+  activeElement: Element | null,
+  options: {
+    hasBlockingOverlay: boolean;
+    isMobile: boolean;
+    isComposing?: boolean;
+  },
+): boolean {
+  if (options.isMobile || options.isComposing || options.hasBlockingOverlay) return false;
+  const doc = getEventDocument(target, activeElement);
+  if (hasDomBlockingOverlay(doc)) return false;
+  const targetEl = target instanceof Element ? target : null;
+  const blockSelector = `[data-shortcut-recording="true"], ${BLOCKING_DIALOG_SELECTOR}`;
+  if (
+    matchesElementOrAncestor(targetEl, blockSelector)
+    || matchesElementOrAncestor(activeElement, blockSelector)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function isTerminalOrRemoteSurfaceElement(el: Element | null): boolean {

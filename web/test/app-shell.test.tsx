@@ -516,6 +516,9 @@ vi.mock('../src/pages/SettingsPage.js', () => ({
       <button onClick={() => onChangeShortcutOverrides?.({ subSessionCloseAll: 'Alt+Shift+x' })}>
         settings-close-all-alt-shift-x
       </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ toggleTaskMode: 'Alt+t' })}>
+        settings-toggle-task-mode-alt-t
+      </button>
       <button onClick={onBack}>settings-back</button>
     </div>
   ),
@@ -9369,6 +9372,109 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
     }
   }, 15000);
+
+  it('toggles Task Mode and Workspace via Ctrl+Shift+T, respects custom overrides, and ignores IME/recording/modals', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+    const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(mainInput));
+
+    expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+
+    // 1. Default Ctrl+Shift+T enters Task Mode even from workspace composer
+    const enterEvt = new KeyboardEvent('keydown', {
+      key: 'T',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    mainInput.dispatchEvent(enterEvt);
+    expect(enterEvt.defaultPrevented).toBe(true);
+    await waitFor(() => expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy());
+
+    // 2. Open modal dialog (aria-modal="true") blocks toggle while open
+    const modal = document.createElement('div');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    const modalInput = document.createElement('input');
+    modal.appendChild(modalInput);
+    document.body.appendChild(modal);
+    modalInput.focus();
+
+    const blockedInModal = new KeyboardEvent('keydown', {
+      key: 'T',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    modalInput.dispatchEvent(blockedInModal);
+    expect(blockedInModal.defaultPrevented).toBe(false);
+    expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy();
+    modal.remove();
+
+    // 3. IME composition is ignored
+    const imeEvt = new KeyboardEvent('keydown', {
+      key: 'T',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      isComposing: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(imeEvt);
+    expect(imeEvt.defaultPrevented).toBe(false);
+    expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy();
+
+    // 4. Second Ctrl+Shift+T exits Task Mode back to Workspace
+    const exitEvt = new KeyboardEvent('keydown', {
+      key: 't',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(exitEvt);
+    expect(exitEvt.defaultPrevented).toBe(true);
+    await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+
+    // 5. Custom recorded shortcut Alt+t overrides Ctrl+Shift+T
+    fireEvent.click(screen.getByText('server-settings'));
+    fireEvent.click(await screen.findByText('settings-toggle-task-mode-alt-t'));
+    fireEvent.click(screen.getByText('settings-back'));
+
+    const oldCtrlShiftT = new KeyboardEvent('keydown', {
+      key: 'T',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(oldCtrlShiftT);
+    expect(oldCtrlShiftT.defaultPrevented).toBe(false);
+    expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+
+    const customAltT = new KeyboardEvent('keydown', {
+      key: 't',
+      code: 'KeyT',
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(customAltT);
+    expect(customAltT.defaultPrevented).toBe(true);
+    await waitFor(() => expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy());
+  }, 25000);
 
   it('blocks tab-switching shortcuts when terminal subwindow header chrome has focus, while preserving chat subwindow navigation', async () => {
     useSubSessionsState.subSessions = [

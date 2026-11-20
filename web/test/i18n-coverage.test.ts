@@ -854,4 +854,26 @@ describe('generic i18n coverage guard', () => {
       expect(pageInfo, `${locale}:repo.callback_page_info {{pageSize}}`).toContain('{{pageSize}}');
     }
   });
+
+  it('keeps settings.shortcuts.actions.toggle_task_mode keys present and translated across all 7 locales', () => {
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as Record<string, any>;
+    const enTitle = String(readPath(enMessages, 'settings.shortcuts.actions.toggle_task_mode.title') ?? '');
+    const enDesc = String(readPath(enMessages, 'settings.shortcuts.actions.toggle_task_mode.desc') ?? '');
+    expect(enTitle.trim().length).toBeGreaterThan(0);
+    expect(enDesc.trim().length).toBeGreaterThan(0);
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      const title = readPath(messages, 'settings.shortcuts.actions.toggle_task_mode.title');
+      const desc = readPath(messages, 'settings.shortcuts.actions.toggle_task_mode.desc');
+      expect(title, `${locale}:toggle_task_mode.title`).toEqual(expect.any(String));
+      expect(desc, `${locale}:toggle_task_mode.desc`).toEqual(expect.any(String));
+      expect((title as string).trim().length, `${locale}:toggle_task_mode.title`).toBeGreaterThan(0);
+      expect((desc as string).trim().length, `${locale}:toggle_task_mode.desc`).toBeGreaterThan(0);
+      if (locale !== 'en') {
+        expect(title, `${locale}:toggle_task_mode.title translated`).not.toBe(enTitle);
+        expect(desc, `${locale}:toggle_task_mode.desc translated`).not.toBe(enDesc);
+      }
+    }
+  });
 });

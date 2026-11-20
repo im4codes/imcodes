@@ -69,6 +69,8 @@ vi.mock('react-i18next', () => ({
         'settings.shortcuts.actions.tab_next.desc': 'Switch right',
         'settings.shortcuts.actions.subsession_close_all.title': 'Return to Main Window',
         'settings.shortcuts.actions.subsession_close_all.desc': 'Minimize open windows that support minimizing (sub-sessions, Remote Desktop, Desktop Wall) and close other floating overlays',
+        'settings.shortcuts.actions.toggle_task_mode.title': 'Toggle Task Mode / Workspace',
+        'settings.shortcuts.actions.toggle_task_mode.desc': 'Switch between Global Task Mode and the main Workspace view',
         'settings.shortcuts.subsession_quick.title': 'Sub-session Quick Shortcuts',
         'settings.shortcuts.subsession_quick.desc': 'Choose modifiers for 1–9 open or minimize.',
         'settings.shortcuts.subsession_quick.open_label': 'Toggle sub-session #',
@@ -136,6 +138,7 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByText('Previous Tab')).toBeDefined();
     expect(screen.getByText('Next Tab')).toBeDefined();
     expect(screen.getByText('Return to Main Window')).toBeDefined();
+    expect(screen.getByText('Toggle Task Mode / Workspace')).toBeDefined();
 
     cleanup();
     render(<KeyboardShortcutsSection isMacOverride={true} />);
@@ -151,6 +154,10 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-subSessionCloseAll').textContent).toContain('⌃');
     expect(screen.getByTestId('shortcut-record-subSessionCloseAll').textContent).toContain('0');
     expect(screen.getByTestId('shortcut-record-subSessionCloseAll-secondary').textContent).toContain('Not set');
+    expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('⇧');
+    expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('T');
+    expect(screen.getByTestId('shortcut-record-toggleTaskMode-secondary').textContent).toContain('Not set');
     // macOS secondary defaults preserve Ctrl+W/S/A/D
     expect(screen.getByTestId('shortcut-record-serverPrev-secondary').textContent).toContain('⌃');
     expect(screen.getByTestId('shortcut-record-serverPrev-secondary').textContent).toContain('W');
@@ -220,6 +227,9 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('L');
     expect(screen.getByTestId('shortcut-record-subSessionCloseAll').textContent).toContain('Ctrl');
     expect(screen.getByTestId('shortcut-record-subSessionCloseAll').textContent).toContain('0');
+    expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('Ctrl');
+    expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('Shift');
+    expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('T');
     // Windows / Linux secondary defaults are unassigned
     expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
     expect((screen.getByTestId('shortcut-clear-tabPrev-secondary') as HTMLButtonElement).disabled).toBe(true);
@@ -453,6 +463,45 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     fireEvent.click(screen.getByTestId('shortcut-reset-subSessionCloseAll'));
     expect(closeAllBtn.textContent).toContain('Ctrl');
     expect(closeAllBtn.textContent).toContain('0');
+
+    // Interactive recording, persistence, conflict reassignment, clear & reset on toggleTaskMode
+    const toggleTaskBtn = screen.getByTestId('shortcut-record-toggleTaskMode');
+    expect(toggleTaskBtn.textContent).toContain('Ctrl');
+    expect(toggleTaskBtn.textContent).toContain('Shift');
+    expect(toggleTaskBtn.textContent).toContain('T');
+
+    fireEvent.click(toggleTaskBtn);
+    expect(toggleTaskBtn.getAttribute('data-shortcut-recording')).toBe('true');
+    fireEvent.keyDown(document, { key: 't', code: 'KeyT', altKey: true });
+    expect(toggleTaskBtn.textContent).toContain('Alt');
+    expect(toggleTaskBtn.textContent).toContain('T');
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      KEYBOARD_SHORTCUTS_PREF_KEY,
+      expect.stringContaining('"toggleTaskMode":"Alt+t"'),
+      expect.anything(),
+    );
+
+    // Record custom secondary shortcut Meta+Shift+k
+    const toggleTaskSecondaryBtn = screen.getByTestId('shortcut-record-toggleTaskMode-secondary');
+    fireEvent.click(toggleTaskSecondaryBtn);
+    fireEvent.keyDown(document, { key: 'K', code: 'KeyK', metaKey: true, shiftKey: true });
+    expect(toggleTaskSecondaryBtn.textContent).toContain('Win');
+    expect(toggleTaskSecondaryBtn.textContent).toContain('Shift');
+    expect(toggleTaskSecondaryBtn.textContent).toContain('K');
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      KEYBOARD_SHORTCUTS_PREF_KEY,
+      expect.stringContaining('"toggleTaskMode":"Meta+Shift+k"'),
+      expect.anything(),
+    );
+
+    fireEvent.click(screen.getByTestId('shortcut-clear-toggleTaskMode'));
+    expect(toggleTaskBtn.textContent).toContain('Not set');
+    fireEvent.click(screen.getByTestId('shortcut-reset-toggleTaskMode'));
+    expect(toggleTaskBtn.textContent).toContain('Ctrl');
+    expect(toggleTaskBtn.textContent).toContain('Shift');
+    expect(toggleTaskBtn.textContent).toContain('T');
+    fireEvent.click(screen.getByTestId('shortcut-clear-toggleTaskMode-secondary'));
+    expect(toggleTaskSecondaryBtn.textContent).toContain('Not set');
   });
 
   it('configures Mac inline voice double-tap modifier (Ctrl/Option/Cmd/Shift/Disabled) and persists to keyboard_shortcuts_v1', () => {

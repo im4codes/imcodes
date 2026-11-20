@@ -2365,6 +2365,10 @@
         "subsession_close_all": {
           "title": "Return to Main Window",
           "desc": "Minimize open windows that support minimizing (sub-sessions, Remote Desktop, Desktop Wall) and close other floating overlays"
+        },
+        "toggle_task_mode": {
+          "title": "Toggle Task Mode / Workspace",
+          "desc": "Switch between Global Task Mode and the main Workspace view"
         }
       },
       "subsession_quick": {

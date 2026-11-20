@@ -13,6 +13,7 @@ import {
   canHandleGlobalNavigationShortcut,
   canHandleOpenSettingsShortcut,
   canHandleReturnToMainWindowShortcut,
+  canHandleToggleTaskModeShortcut,
   chordFromKeyboardEvent,
   cycleOrderedId,
   findShortcutConflicts,
@@ -60,6 +61,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
       subSessionCloseAll: 'Ctrl+0',
+      toggleTaskMode: 'Ctrl+Shift+t',
     });
 
     expect(getDefaultShortcuts(false)).toEqual({
@@ -68,6 +70,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
       subSessionCloseAll: 'Ctrl+0',
+      toggleTaskMode: 'Ctrl+Shift+t',
     });
 
     expect(getDefaultSecondaryShortcuts(true)).toEqual({
@@ -76,6 +79,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: 'Ctrl+a',
       tabNext: 'Ctrl+d',
       subSessionCloseAll: null,
+      toggleTaskMode: null,
     });
 
     expect(getDefaultSecondaryShortcuts(false)).toEqual({
@@ -84,6 +88,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: null,
       tabNext: null,
       subSessionCloseAll: null,
+      toggleTaskMode: null,
     });
   });
 
@@ -155,6 +160,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
       subSessionCloseAll: 'Ctrl+0',
+      toggleTaskMode: 'Ctrl+Shift+t',
     });
     expect(resolveKeyboardShortcuts({ tabPrev: 'Meta+ArrowLeft', tabNext: 'Meta+ArrowRight' }, true)).toEqual({
       serverPrev: 'Alt+i',
@@ -162,6 +168,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: 'Meta+ArrowLeft',
       tabNext: 'Meta+ArrowRight',
       subSessionCloseAll: 'Ctrl+0',
+      toggleTaskMode: 'Ctrl+Shift+t',
     });
     expect(resolveKeyboardShortcuts(clean, false)).toEqual({
       serverPrev: 'Alt+ArrowUp',
@@ -169,6 +176,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
       subSessionCloseAll: 'Ctrl+0',
+      toggleTaskMode: 'Ctrl+Shift+t',
     });
 
     // Dual-slot sanitization, legacy backward compatibility, and non-resurrecting clear semantics
@@ -178,6 +186,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: { primary: 'Meta+ArrowLeft', secondary: 'Ctrl+a' },
       tabNext: { primary: 'Alt+l', secondary: 'Ctrl+d' },
       subSessionCloseAll: { primary: 'Ctrl+0', secondary: null },
+      toggleTaskMode: { primary: 'Ctrl+Shift+t', secondary: null },
     });
 
     const dirtyDual = sanitizeShortcutOverrides({
@@ -202,6 +211,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: { primary: 'Meta+ArrowLeft', secondary: null },
       tabNext: { primary: 'Alt+l', secondary: 'Ctrl+ArrowRight' },
       subSessionCloseAll: { primary: 'Ctrl+0', secondary: null },
+      toggleTaskMode: { primary: 'Ctrl+Shift+t', secondary: null },
     });
     expect(resolveKeyboardShortcutSlots({}, false)).toEqual({
       serverPrev: { primary: 'Alt+i', secondary: null },
@@ -209,6 +219,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: { primary: 'Alt+j', secondary: null },
       tabNext: { primary: 'Alt+l', secondary: null },
       subSessionCloseAll: { primary: 'Ctrl+0', secondary: null },
+      toggleTaskMode: { primary: 'Ctrl+Shift+t', secondary: null },
     });
 
     // applyShortcutSlotOverride persists explicit null for cleared non-null defaults and prunes redundant defaults
@@ -389,6 +400,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: 'Ctrl+ArrowUp',
       tabNext: null,
       subSessionCloseAll: 'Ctrl+0',
+      toggleTaskMode: 'Ctrl+Shift+t',
     })).toEqual({
       serverPrev: ['tabPrev'],
       tabPrev: ['serverPrev'],
@@ -453,6 +465,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: { primary: 'Alt+j', secondary: 'Alt+j' },
       tabNext: { primary: 'Alt+l', secondary: null },
       subSessionCloseAll: { primary: 'Ctrl+0', secondary: 'Alt+l' },
+      toggleTaskMode: { primary: 'Ctrl+Shift+t', secondary: null },
     })).toEqual({
       serverPrev: { secondary: [{ action: 'serverNext', slot: 'secondary' }] },
       serverNext: { secondary: [{ action: 'serverPrev', slot: 'secondary' }] },
@@ -463,6 +476,34 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: { primary: [{ action: 'subSessionCloseAll', slot: 'secondary' }] },
       subSessionCloseAll: { secondary: [{ action: 'tabNext', slot: 'primary' }] },
     });
+
+    // toggleTaskMode default Ctrl+Shift+T matches both uppercase 'T' and lowercase 't' on Mac and non-Mac,
+    // and supports custom recorded overrides
+    expect(formatShortcutKeycaps('Ctrl+Shift+t', true)).toEqual(['⌃', '⇧', 'T']);
+    expect(formatShortcutKeycaps('Ctrl+Shift+t', false)).toEqual(['Ctrl', 'Shift', 'T']);
+    for (const slots of [macSlots, resolveKeyboardShortcutSlots({}, false)]) {
+      expect(matchNavigationShortcutBinding(
+        { key: 'T', code: 'KeyT', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true },
+        slots,
+      )).toEqual({ action: 'toggleTaskMode', slot: 'primary', chord: 'Ctrl+Shift+t' });
+      expect(matchNavigationShortcutBinding(
+        { key: 't', code: 'KeyT', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true },
+        slots,
+      )).toEqual({ action: 'toggleTaskMode', slot: 'primary', chord: 'Ctrl+Shift+t' });
+    }
+    const customTaskModeSlots = resolveKeyboardShortcutSlots({ toggleTaskMode: 'Alt+t', secondary: { toggleTaskMode: 'Meta+Shift+k' } }, true);
+    expect(matchNavigationShortcutBinding(
+      { key: 'T', code: 'KeyT', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true },
+      customTaskModeSlots,
+    )).toBeNull();
+    expect(matchNavigationShortcutBinding(
+      { key: '†', code: 'KeyT', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false },
+      customTaskModeSlots,
+    )).toEqual({ action: 'toggleTaskMode', slot: 'primary', chord: 'Alt+t' });
+    expect(matchNavigationShortcutBinding(
+      { key: 'K', code: 'KeyK', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
+      customTaskModeSlots,
+    )).toEqual({ action: 'toggleTaskMode', slot: 'secondary', chord: 'Meta+Shift+k' });
   });
 
   it('sorts tabs matching SessionTabs visual order (pinned first, then tabOrder) and cycles with wrap-around', () => {
@@ -1138,5 +1179,69 @@ describe('keyboard-shortcuts core helpers', () => {
     composer.remove();
     xterm.remove();
     recorder.remove();
+  });
+
+  it('allows toggleTaskMode in Workspace, composer, terminals, and Task Mode while blocking mobile, IME, shortcut recording, and modal dialogs', () => {
+    const composer = document.createElement('div');
+    composer.className = 'controls-input';
+    composer.contentEditable = 'true';
+    document.body.appendChild(composer);
+    composer.focus();
+
+    expect(canHandleToggleTaskModeShortcut(composer, composer, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(true);
+
+    const xterm = document.createElement('div');
+    xterm.className = 'xterm';
+    const xtermTa = document.createElement('textarea');
+    xtermTa.className = 'xterm-helper-textarea';
+    xterm.appendChild(xtermTa);
+    document.body.appendChild(xterm);
+    xtermTa.focus();
+    expect(canHandleToggleTaskModeShortcut(xtermTa, xtermTa, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(true);
+    xterm.remove();
+
+    expect(canHandleToggleTaskModeShortcut(document.body, document.body, {
+      hasBlockingOverlay: false,
+      isMobile: true,
+    })).toBe(false);
+    expect(canHandleToggleTaskModeShortcut(composer, composer, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+      isComposing: true,
+    })).toBe(false);
+    expect(canHandleToggleTaskModeShortcut(composer, composer, {
+      hasBlockingOverlay: true,
+      isMobile: false,
+    })).toBe(false);
+
+    const recorder = document.createElement('button');
+    recorder.setAttribute('data-shortcut-recording', 'true');
+    document.body.appendChild(recorder);
+    expect(canHandleToggleTaskModeShortcut(recorder, recorder, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(false);
+    recorder.remove();
+
+    const modal = document.createElement('div');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    const modalInput = document.createElement('input');
+    modal.appendChild(modalInput);
+    document.body.appendChild(modal);
+    modalInput.focus();
+    expect(canHandleToggleTaskModeShortcut(modalInput, modalInput, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(false);
+    modal.remove();
+
+    composer.remove();
   });
 });

@@ -2365,6 +2365,10 @@
         "subsession_close_all": {
           "title": "回到主窗口",
           "desc": "最小化所有支持最小化的已打开窗口（子会话、远程桌面、桌面墙等），并关闭其他悬浮浮层"
+        },
+        "toggle_task_mode": {
+          "title": "切换任务模式 / 工作台",
+          "desc": "在全局任务模式与主工作区视图之间切换"
         }
       },
       "subsession_quick": {

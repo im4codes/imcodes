@@ -2365,6 +2365,10 @@
         "subsession_close_all": {
           "title": "Volver a la ventana principal",
           "desc": "Minimiza las ventanas abiertas que admiten minimizar (subsesiones, Escritorio remoto, Muro de escritorios) y cierra otras superposiciones flotantes"
+        },
+        "toggle_task_mode": {
+          "title": "Alternar Modo Tareas / Espacio de trabajo",
+          "desc": "Cambiar entre el Modo Tareas global y la vista principal del espacio de trabajo"
         }
       },
       "subsession_quick": {

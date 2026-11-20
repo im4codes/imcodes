@@ -70,6 +70,10 @@ const ACTION_LABELS: Record<ShortcutActionId, { titleKey: string; descKey: strin
     titleKey: 'settings.shortcuts.actions.subsession_close_all.title',
     descKey: 'settings.shortcuts.actions.subsession_close_all.desc',
   },
+  toggleTaskMode: {
+    titleKey: 'settings.shortcuts.actions.toggle_task_mode.title',
+    descKey: 'settings.shortcuts.actions.toggle_task_mode.desc',
+  },
 };
 
 type ModifierGroupId = 'subsession' | 'taskPairSplit';
