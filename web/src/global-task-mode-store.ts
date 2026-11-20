@@ -15,7 +15,7 @@ import {
   type GlobalTaskSummaryRow,
 } from '@shared/global-task-mode.js';
 import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
-import type { TaskPairCloseAction, TaskPairCloseResponse } from '@shared/task-pair-close.js';
+import { TASK_PAIR_CLOSE_ERROR, type TaskPairCloseAction, type TaskPairCloseResponse } from '@shared/task-pair-close.js';
 import { fallbackReadableSessionDisplay, pickReadableSessionDisplay } from '@shared/session-display.js';
 import { parseSyncedPreference, type SyncedPreferencePayload } from '@shared/synced-preference.js';
 import { formatLabel } from './format-label.js';
@@ -930,7 +930,7 @@ export class GlobalTaskModeStore {
     const serverId = input.serverId.trim();
     const taskId = input.taskId.trim();
     if (!serverId || !taskId) {
-      return { ok: false, error: 'invalid_request' };
+      return { ok: false, error: TASK_PAIR_CLOSE_ERROR.INVALID_REQUEST };
     }
     const result = await closeServerTaskPair(serverId, taskId, {
       action: input.action,
