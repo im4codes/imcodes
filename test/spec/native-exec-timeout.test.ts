@@ -3,10 +3,11 @@ import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { getCurrentTest } from 'vitest/suite';
 
-import { NATIVE_COMPILE_TEST_TIMEOUT_MS } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative, runNativeOrThrow } from './support/native-exec.js';
 import { readSource } from '../helpers/read-source.js';
 
-const SPEC_DIRS = ['test/spec', 'test/node', 'test/util'].map((dir) => resolve(__dirname, '..', '..', dir));
+const SPEC_DIRS = ['test/spec', 'test/node', 'test/util', 'test/native'].map((dir) => resolve(__dirname, '..', '..', dir));
+const COMPILER_CALL_RE = /(?:spawnSync|execFileSync|execFile|runNative|runNativeOrThrow)\(\s*(?:['"`](?:xcrun|clang\+\+|clang|g\+\+|swiftc|javac|\/usr\/bin\/clang\+\+)['"`]|swiftCompiler\b)/;
 
 describe('native compile specs are not held to the default 20 s per-test timeout', () => {
   it('importing the native-exec helper raises the importing file\'s per-test timeout', () => {
@@ -20,7 +21,7 @@ describe('native compile specs are not held to the default 20 s per-test timeout
     for (const dir of SPEC_DIRS) {
       for (const name of readdirSync(dir).filter((entry) => entry.endsWith('.test.ts') && entry !== 'native-exec-timeout.test.ts')) {
         const source = readSource(join(dir, name));
-        const compilesNatively = /-fsanitize|(?:spawnSync|execFileSync|execFile|runNative|runNativeOrThrow)\(\s*['"`](?:xcrun|clang\+\+|clang|g\+\+|\/usr\/bin\/clang\+\+)['"`]/.test(source);
+        const compilesNatively = /-fsanitize/.test(source) || COMPILER_CALL_RE.test(source);
         if (!compilesNatively) continue;
         const importsHelper = /support\/native-exec/.test(source);
         const explicitTimeout = /^\s*\}, *\d[\d_]{4,}\);/m.test(source);
@@ -28,5 +29,30 @@ describe('native compile specs are not held to the default 20 s per-test timeout
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it('native compile tests never invoke compilers or compiled probes via blocking spawnSync/execFileSync', () => {
+    const syncCompilerRe = /(?:spawnSync|execFileSync)\(\s*(?:['"`](?:xcrun|clang\+\+|clang|g\+\+|swiftc|javac|\/usr\/bin\/clang\+\+)['"`]|(?:swiftCompiler|cxx)\b)(?!\s*,\s*\[\s*['"`]--version['"`]\s*\])/;
+    const syncNativeRunRe = /(?:spawnSync|execFileSync)\(\s*(?:binary|executable|binFile|['"`]java['"`])\b/;
+    const offenders: string[] = [];
+    for (const dir of SPEC_DIRS) {
+      for (const name of readdirSync(dir).filter((entry) => entry.endsWith('.test.ts') && entry !== 'native-exec-timeout.test.ts')) {
+        const source = readSource(join(dir, name));
+        if (syncCompilerRe.test(source) || syncNativeRunRe.test(source)) {
+          offenders.push(`${dir.split('/').slice(-2).join('/')}/${name}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('runNative and runNativeOrThrow forward options.timeout cleanly', async () => {
+    const res = await runNative(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], { timeout: 100 });
+    expect(res.status).toBeNull();
+    expect(res.signal).toBeTruthy();
+
+    await expect(
+      runNativeOrThrow(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], { timeout: 100 }),
+    ).rejects.toThrow(/signal/);
   });
 });

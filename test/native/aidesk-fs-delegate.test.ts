@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { AIDESK_AGENT_SOURCES, aideskAgentCompileArgs } from '../../scripts/build-aidesk-app.mjs';
+import { runNative } from '../spec/support/native-exec.js';
 import {
   MACOS_FS_DELEGATE_ANSWER_MAGIC,
   MACOS_FS_DELEGATE_LIMITS,
@@ -58,15 +59,15 @@ describe('aidesk fs delegate: metadata timestamp oracle', () => {
   });
 });
 
-function run(requestFile: string, options: { dir?: string; chainStart?: string; trustedUid?: number; now?: number; probe?: string; requireProbe?: boolean } = {}): MacosFsDelegateAnswer {
-  const result = spawnSync(binary, [
+async function run(requestFile: string, options: { dir?: string; chainStart?: string; trustedUid?: number; now?: number; probe?: string; requireProbe?: boolean } = {}): Promise<MacosFsDelegateAnswer> {
+  const result = await runNative(binary, [
     requestFile,
     options.dir ?? requestDir,
     options.chainStart ?? root,
     String(options.trustedUid ?? uid),
     String(options.now ?? NOW),
     ...(options.probe === undefined ? [] : [options.probe, ...(options.requireProbe ? ['require'] : [])]),
-  ], { encoding: 'utf8' });
+  ]);
   expect(result.status).toBe(0);
   const answer = parseMacosFsDelegateAnswer(result.stdout);
   expect(answer, `unparseable answer: ${JSON.stringify(result.stdout)}`).not.toBeNull();
@@ -92,13 +93,13 @@ function expectRefused(answer: MacosFsDelegateAnswer, reason: string): void {
 }
 
 describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
-  beforeAll(() => {
+  beforeAll(async () => {
     work = mkdtempSync(join(tmpdir(), 'imcodes-fsd-build-'));
     binary = join(work, 'fsd');
-    const built = spawnSync('g++', [
+    const built = await runNative('g++', [
       '-std=c++17', '-Wall', '-Wextra', '-Werror', `-I${SOURCE}`,
       join(SOURCE, 'aidesk_fs_delegate.cc'), join(SOURCE, 'aidesk_fs_delegate_test_main.cc'), '-o', binary,
-    ], { encoding: 'utf8' });
+    ]);
     expect(built.stderr).toBe('');
     expect(built.status).toBe(0);
   });
@@ -116,12 +117,12 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
     return () => rmSync(root, { recursive: true, force: true });
   });
 
-  it('lists a directory: real path, directories, regular files, and `other` for a symlink', () => {
+  it('lists a directory: real path, directories, regular files, and `other` for a symlink', async () => {
     mkdirSync(join(fixtureDir, 'sub'));
     writeFileSync(join(fixtureDir, 'a.txt'), 'x');
     writeFileSync(join(fixtureDir, '.hidden'), 'x');
     symlinkSync(join(fixtureDir, 'a.txt'), join(fixtureDir, 'link'));
-    const answer = run(writeRequest());
+    const answer = await run(writeRequest());
     expect(answer.ok).toBe(true);
     if (!answer.ok) return;
     expect(answer.realPath).toBe(realpathSync(fixtureDir));
@@ -131,111 +132,111 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
     });
   });
 
-  it('frames names that would break a line protocol (newline, spaces, unicode) through hex', () => {
+  it('frames names that would break a line protocol (newline, spaces, unicode) through hex', async () => {
     const odd = ['line\nbreak', 'two  spaces', '日本語', 'tab\there'];
     for (const name of odd) writeFileSync(join(fixtureDir, name), 'x');
-    const answer = run(writeRequest());
+    const answer = await run(writeRequest());
     expect(answer.ok).toBe(true);
     if (!answer.ok) return;
     expect(answer.entries.map((entry) => entry.name).sort()).toEqual([...odd].sort());
   });
 
-  it('resolves a symlinked directory request to its real path (the node policy then judges that real path)', () => {
+  it('resolves a symlinked directory request to its real path (the node policy then judges that real path)', async () => {
     mkdirSync(join(root, 'real'));
     writeFileSync(join(root, 'real', 'inside.txt'), 'x');
     symlinkSync(join(root, 'real'), join(root, 'via-link'));
-    const answer = run(writeRequest({ path: join(root, 'via-link') }));
+    const answer = await run(writeRequest({ path: join(root, 'via-link') }));
     expect(answer.ok).toBe(true);
     if (!answer.ok) return;
     expect(answer.realPath).toBe(realpathSync(join(root, 'real')));
     expect(answer.entries).toEqual([{ name: 'inside.txt', kind: 'f' }]);
   });
 
-  it('answers stable reasons for a missing path, a file, and a relative or dotted path', () => {
-    expectRefused(run(writeRequest({ path: join(fixtureDir, 'nope') })), MACOS_FS_DELEGATE_REASON.NOT_FOUND);
+  it('answers stable reasons for a missing path, a file, and a relative or dotted path', async () => {
+    expectRefused(await run(writeRequest({ path: join(fixtureDir, 'nope') })), MACOS_FS_DELEGATE_REASON.NOT_FOUND);
     writeFileSync(join(fixtureDir, 'f'), 'x');
-    expectRefused(run(writeRequest({ path: join(fixtureDir, 'f') })), MACOS_FS_DELEGATE_REASON.NOT_DIRECTORY);
-    expectRefused(run(writeRequest({ path: 'relative/path' })), MACOS_FS_DELEGATE_REASON.BAD_PATH);
-    expectRefused(run(writeRequest({ path: `${fixtureDir}/../data` })), MACOS_FS_DELEGATE_REASON.BAD_PATH);
-    expectRefused(run(writeRequest({ path: `${fixtureDir}/./sub` })), MACOS_FS_DELEGATE_REASON.BAD_PATH);
-    expectRefused(run(writeRequest({ path: `${fixtureDir}//x` })), MACOS_FS_DELEGATE_REASON.BAD_PATH);
+    expectRefused(await run(writeRequest({ path: join(fixtureDir, 'f') })), MACOS_FS_DELEGATE_REASON.NOT_DIRECTORY);
+    expectRefused(await run(writeRequest({ path: 'relative/path' })), MACOS_FS_DELEGATE_REASON.BAD_PATH);
+    expectRefused(await run(writeRequest({ path: `${fixtureDir}/../data` })), MACOS_FS_DELEGATE_REASON.BAD_PATH);
+    expectRefused(await run(writeRequest({ path: `${fixtureDir}/./sub` })), MACOS_FS_DELEGATE_REASON.BAD_PATH);
+    expectRefused(await run(writeRequest({ path: `${fixtureDir}//x` })), MACOS_FS_DELEGATE_REASON.BAD_PATH);
   });
 
   describe('time', () => {
-    it('refuses an expired request, a far-future expiry, a created-in-the-future (rolled back clock) one, and a longer-than-TTL window', () => {
-      expectRefused(run(writeRequest({ expiresMs: NOW - 1 })), MACOS_FS_DELEGATE_REASON.REQUEST_EXPIRED);
-      expectRefused(run(writeRequest({ expiresMs: NOW })), MACOS_FS_DELEGATE_REASON.REQUEST_EXPIRED);
-      expectRefused(run(writeRequest({ createdMs: NOW, expiresMs: NOW + MACOS_FS_DELEGATE_LIMITS.REQUEST_TTL_MS + MACOS_FS_DELEGATE_LIMITS.MAX_CLOCK_SKEW_MS + 1 })), MACOS_FS_DELEGATE_REASON.REQUEST_EXPIRY_TOO_FAR);
-      expectRefused(run(writeRequest({ createdMs: NOW + MACOS_FS_DELEGATE_LIMITS.MAX_CLOCK_SKEW_MS + 1, expiresMs: NOW + 5_000 })), MACOS_FS_DELEGATE_REASON.REQUEST_CREATED_IN_FUTURE);
-      expectRefused(run(writeRequest({ createdMs: NOW - 60_000, expiresMs: NOW + 5_000 })), MACOS_FS_DELEGATE_REASON.REQUEST_EXPIRY_TOO_FAR);
+    it('refuses an expired request, a far-future expiry, a created-in-the-future (rolled back clock) one, and a longer-than-TTL window', async () => {
+      expectRefused(await run(writeRequest({ expiresMs: NOW - 1 })), MACOS_FS_DELEGATE_REASON.REQUEST_EXPIRED);
+      expectRefused(await run(writeRequest({ expiresMs: NOW })), MACOS_FS_DELEGATE_REASON.REQUEST_EXPIRED);
+      expectRefused(await run(writeRequest({ createdMs: NOW, expiresMs: NOW + MACOS_FS_DELEGATE_LIMITS.REQUEST_TTL_MS + MACOS_FS_DELEGATE_LIMITS.MAX_CLOCK_SKEW_MS + 1 })), MACOS_FS_DELEGATE_REASON.REQUEST_EXPIRY_TOO_FAR);
+      expectRefused(await run(writeRequest({ createdMs: NOW + MACOS_FS_DELEGATE_LIMITS.MAX_CLOCK_SKEW_MS + 1, expiresMs: NOW + 5_000 })), MACOS_FS_DELEGATE_REASON.REQUEST_CREATED_IN_FUTURE);
+      expectRefused(await run(writeRequest({ createdMs: NOW - 60_000, expiresMs: NOW + 5_000 })), MACOS_FS_DELEGATE_REASON.REQUEST_EXPIRY_TOO_FAR);
     });
 
-    it('accepts the edges: expiry exactly now+TTL, creation within the allowed skew', () => {
-      expect(run(writeRequest({ createdMs: NOW, expiresMs: NOW + MACOS_FS_DELEGATE_LIMITS.REQUEST_TTL_MS })).ok).toBe(true);
-      expect(run(writeRequest({ createdMs: NOW + MACOS_FS_DELEGATE_LIMITS.MAX_CLOCK_SKEW_MS, expiresMs: NOW + 5_000 })).ok).toBe(true);
+    it('accepts the edges: expiry exactly now+TTL, creation within the allowed skew', async () => {
+      expect((await run(writeRequest({ createdMs: NOW, expiresMs: NOW + MACOS_FS_DELEGATE_LIMITS.REQUEST_TTL_MS }))).ok).toBe(true);
+      expect((await run(writeRequest({ createdMs: NOW + MACOS_FS_DELEGATE_LIMITS.MAX_CLOCK_SKEW_MS, expiresMs: NOW + 5_000 }))).ok).toBe(true);
     });
   });
 
   describe('request authenticity (a same-user process must not be able to mint a request)', () => {
-    it('refuses a request directory or ancestor owned by someone else', () => {
-      expectRefused(run(writeRequest(), { trustedUid: uid + 1 }), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
+    it('refuses a request directory or ancestor owned by someone else', async () => {
+      expectRefused(await run(writeRequest(), { trustedUid: uid + 1 }), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
     });
 
-    it('refuses a group- or world-writable request directory, and a world-writable ancestor', () => {
+    it('refuses a group- or world-writable request directory, and a world-writable ancestor', async () => {
       const file = writeRequest();
       chmodSync(requestDir, 0o775);
-      expectRefused(run(file), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
+      expectRefused(await run(file), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
       chmodSync(requestDir, 0o757);
-      expectRefused(run(file), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
+      expectRefused(await run(file), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
       chmodSync(requestDir, 0o755);
       chmodSync(join(root, 'fs'), 0o757);
-      expectRefused(run(file), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
+      expectRefused(await run(file), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
       chmodSync(join(root, 'fs'), 0o755);
-      expect(run(file).ok).toBe(true);
+      expect((await run(file)).ok).toBe(true);
     });
 
-    it('refuses a request directory that is reached through a symlink, before opening anything', () => {
+    it('refuses a request directory that is reached through a symlink, before opening anything', async () => {
       const real = join(root, 'elsewhere');
       mkdirSync(real, { mode: 0o755 });
       writeFileSync(join(real, 'r.req'), serializeMacosFsDelegateRequest({ op: MACOS_FS_DELEGATE_OP.LIST, path: fixtureDir, nonce: 'a1b2c3d4e5f60718', createdMs: NOW - 1, expiresMs: NOW + 5_000 }), { mode: 0o644 });
       const link = join(root, 'linkdir');
       symlinkSync(real, link);
-      expectRefused(run(join(link, 'r.req'), { dir: link }), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
+      expectRefused(await run(join(link, 'r.req'), { dir: link }), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
     });
 
-    it('refuses a request file that is group/world writable, a symlink, or hard-linked', () => {
-      expectRefused(run(writeRequest({}, 'w.req', 0o664)), MACOS_FS_DELEGATE_REASON.REQUEST_OWNER_UNTRUSTED);
-      expectRefused(run(writeRequest({}, 'o.req', 0o646)), MACOS_FS_DELEGATE_REASON.REQUEST_OWNER_UNTRUSTED);
+    it('refuses a request file that is group/world writable, a symlink, or hard-linked', async () => {
+      expectRefused(await run(writeRequest({}, 'w.req', 0o664)), MACOS_FS_DELEGATE_REASON.REQUEST_OWNER_UNTRUSTED);
+      expectRefused(await run(writeRequest({}, 'o.req', 0o646)), MACOS_FS_DELEGATE_REASON.REQUEST_OWNER_UNTRUSTED);
       const real = writeRequest({}, 'real.req');
       symlinkSync(real, join(requestDir, 'sym.req'));
-      expectRefused(run(join(requestDir, 'sym.req')), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(join(requestDir, 'sym.req')), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
       linkSync(real, join(requestDir, 'hard.req'));
-      expectRefused(run(join(requestDir, 'hard.req')), MACOS_FS_DELEGATE_REASON.REQUEST_OWNER_UNTRUSTED);
+      expectRefused(await run(join(requestDir, 'hard.req')), MACOS_FS_DELEGATE_REASON.REQUEST_OWNER_UNTRUSTED);
     });
 
-    it('refuses a file outside the request directory and names that could escape it', () => {
+    it('refuses a file outside the request directory and names that could escape it', async () => {
       const outside = join(root, 'outside.req');
       writeFileSync(outside, serializeMacosFsDelegateRequest({ op: MACOS_FS_DELEGATE_OP.LIST, path: fixtureDir, nonce: 'a1b2c3d4e5f60718', createdMs: NOW - 1, expiresMs: NOW + 5_000 }), { mode: 0o644 });
-      expectRefused(run(outside), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(`${requestDir}/../outside.req`), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(join(requestDir, '.hidden.req')), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run('relative.req'), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(join(requestDir, 'missing.req')), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(outside), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(`${requestDir}/../outside.req`), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(join(requestDir, '.hidden.req')), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run('relative.req'), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(join(requestDir, 'missing.req')), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
     });
 
-    it('refuses a chain start that is not an ancestor of the request directory', () => {
-      expectRefused(run(writeRequest(), { chainStart: join(tmpdir(), 'not-an-ancestor') }), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
+    it('refuses a chain start that is not an ancestor of the request directory', async () => {
+      expectRefused(await run(writeRequest(), { chainStart: join(tmpdir(), 'not-an-ancestor') }), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
     });
   });
 
   describe('list_meta (size / modified / created time per entry)', () => {
-    it('answers the numbers the filesystem has, exactly, and plain `list` stays without them', () => {
+    it('answers the numbers the filesystem has, exactly, and plain `list` stays without them', async () => {
       const known = new Date(1_700_000_000_123);
       writeFileSync(join(fixtureDir, 'a.txt'), 'x'.repeat(120));
       utimesSync(join(fixtureDir, 'a.txt'), known, known);
       mkdirSync(join(fixtureDir, 'sub'));
       writeFileSync(join(fixtureDir, 'empty'), '');
-      const meta = run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST_META }, 'meta.req'));
+      const meta = await run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST_META }, 'meta.req'));
       expect(meta.ok).toBe(true);
       if (!meta.ok) return;
       const byName = Object.fromEntries(meta.entries.map((entry) => [entry.name, entry]));
@@ -247,14 +248,14 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
       expect(byName['sub']!.meta!.size).toBe(0); // a directory's own byte size is not reported
       expect(byName['sub']!.meta!.mtimeMs).toBe(nativeMtimeMs(statSync(join(fixtureDir, 'sub'), { bigint: true }).mtimeNs));
       for (const entry of meta.entries) expect(entry.meta, entry.name).toBeDefined();
-      const plain = run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST }, 'plain.req'));
+      const plain = await run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST }, 'plain.req'));
       expect(plain.ok && plain.entries.every((entry) => entry.meta === undefined)).toBe(true);
     });
 
-    it('a symlink entry is `o` with metadata of the link itself, and the entry count/truncation rules are unchanged', () => {
+    it('a symlink entry is `o` with metadata of the link itself, and the entry count/truncation rules are unchanged', async () => {
       writeFileSync(join(fixtureDir, 'target'), 'abc');
       symlinkSync(join(fixtureDir, 'target'), join(fixtureDir, 'link'));
-      const meta = run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST_META }, 'link.req'));
+      const meta = await run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST_META }, 'link.req'));
       expect(meta.ok && meta.entries.find((entry) => entry.name === 'link')!.kind).toBe('o');
       expect(meta.ok && meta.entries.find((entry) => entry.name === 'link')!.meta!.size).toBe(0);
       expect(meta.ok && meta.entries.find((entry) => entry.name === 'link')!.meta!.mtimeMs)
@@ -264,25 +265,25 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
   });
 
   describe('Full Disk Access probe (answer at once instead of stopping on a per-folder consent prompt)', () => {
-    it.skipIf(uid === 0)('answers permission_denied without touching the path when the probe file cannot be read', () => {
+    it.skipIf(uid === 0)('answers permission_denied without touching the path when the probe file cannot be read', async () => {
       writeFileSync(join(fixtureDir, 'a.txt'), 'x');
       const probe = join(root, 'tcc.db');
       writeFileSync(probe, 'x');
       chmodSync(probe, 0o000);
-      expectRefused(run(writeRequest(), { probe }), MACOS_FS_DELEGATE_REASON.PERMISSION_DENIED);
+      expectRefused(await run(writeRequest(), { probe }), MACOS_FS_DELEGATE_REASON.PERMISSION_DENIED);
       chmodSync(probe, 0o644);
-      expect(run(writeRequest({}, 'second.req'), { probe }).ok).toBe(true);
+      expect((await run(writeRequest({}, 'second.req'), { probe })).ok).toBe(true);
     });
 
-    it('answers permission_unknown (a visible state, not a silent timeout) when the probe file is not where expected', () => {
-      expectRefused(run(writeRequest(), { probe: join(root, 'no-such-tcc.db') }), MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN);
+    it('answers permission_unknown (a visible state, not a silent timeout) when the probe file is not where expected', async () => {
+      expectRefused(await run(writeRequest(), { probe: join(root, 'no-such-tcc.db') }), MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN);
       writeFileSync(join(root, 'plain-file'), 'x');
-      expectRefused(run(writeRequest({}, 'second.req'), { probe: join(root, 'plain-file', 'under-a-file') }), MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN);
+      expectRefused(await run(writeRequest({}, 'second.req'), { probe: join(root, 'plain-file', 'under-a-file') }), MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN);
     });
 
-    it('with the probe required (production) an unusable probe path is "cannot tell", not "carry on"; unrequired it is skipped', () => {
-      expectRefused(run(writeRequest(), { probe: '', requireProbe: true }), MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN);
-      expect(run(writeRequest({}, 'second.req'), { probe: '' }).ok).toBe(true);
+    it('with the probe required (production) an unusable probe path is "cannot tell", not "carry on"; unrequired it is skipped', async () => {
+      expectRefused(await run(writeRequest(), { probe: '', requireProbe: true }), MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN);
+      expect((await run(writeRequest({}, 'second.req'), { probe: '' })).ok).toBe(true);
     });
   });
 
@@ -300,24 +301,24 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
       return file;
     };
 
-    it('refuses an unknown version or operation', () => {
-      expectRefused(run(put(base().replace('v=1', 'v=2'))), MACOS_FS_DELEGATE_REASON.UNSUPPORTED_VERSION);
-      expectRefused(run(put(base().replace('op=list', 'op=read'))), MACOS_FS_DELEGATE_REASON.UNSUPPORTED_OP);
+    it('refuses an unknown version or operation', async () => {
+      expectRefused(await run(put(base().replace('v=1', 'v=2'))), MACOS_FS_DELEGATE_REASON.UNSUPPORTED_VERSION);
+      expectRefused(await run(put(base().replace('op=list', 'op=read'))), MACOS_FS_DELEGATE_REASON.UNSUPPORTED_OP);
     });
 
-    it('refuses a missing, duplicated or extra key, a bad hex path, a bad nonce, a non-numeric time, and a missing final newline', () => {
-      expectRefused(run(put(base([], ['nonce']))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(put(base(['op=list']))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(put(base(['extra=1']))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(put(base().replace(/path_hex=[0-9a-f]+/, 'path_hex=zz'))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(put(base().replace('nonce=a1b2c3d4e5f60718', 'nonce=short'))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(put(base().replace(/created_ms=\d+/, 'created_ms=-5'))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(put(base().trimEnd())), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+    it('refuses a missing, duplicated or extra key, a bad hex path, a bad nonce, a non-numeric time, and a missing final newline', async () => {
+      expectRefused(await run(put(base([], ['nonce']))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(put(base(['op=list']))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(put(base(['extra=1']))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(put(base().replace(/path_hex=[0-9a-f]+/, 'path_hex=zz'))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(put(base().replace('nonce=a1b2c3d4e5f60718', 'nonce=short'))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(put(base().replace(/created_ms=\d+/, 'created_ms=-5'))), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(put(base().trimEnd())), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
     });
 
-    it('refuses an empty file and an oversize file', () => {
-      expectRefused(run(put('')), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
-      expectRefused(run(put(`${'x'.repeat(6_000)}\n`)), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+    it('refuses an empty file and an oversize file', async () => {
+      expectRefused(await run(put('')), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
+      expectRefused(await run(put(`${'x'.repeat(6_000)}\n`)), MACOS_FS_DELEGATE_REASON.BAD_REQUEST_FILE);
     });
   });
 });
@@ -379,12 +380,12 @@ describe('aidesk fs delegate: native constants mirror the shared protocol', () =
     }
   });
 
-  it.skipIf(!HAVE_COMPILER)('the test-only build (compile-time root) still compiles warning-free', () => {
-    const built = spawnSync('g++', [
+  it.skipIf(!HAVE_COMPILER)('the test-only build (compile-time root) still compiles warning-free', async () => {
+    const built = await runNative('g++', [
       '-std=c++20', '-Wall', '-Wextra', '-Werror', '-fsyntax-only',
       '-DIMCODES_FS_DELEGATE_TEST_RUNTIME_ROOT="/private/var/run/imcodes-fsd-cc8-test/fs-delegate"',
       `-I${SOURCE}`, join(SOURCE, 'aidesk_fs_delegate.cc'),
-    ], { encoding: 'utf8' });
+    ]);
     expect(built.stderr).toBe('');
     expect(built.status).toBe(0);
   });

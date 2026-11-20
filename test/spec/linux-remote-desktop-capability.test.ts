@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { NATIVE_COMPILE_TEST_TIMEOUT_MS } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { readSource } from '../helpers/read-source.js';
 
 /**
@@ -35,20 +35,20 @@ function compiler(): string | null {
 }
 
 describe('linux remote desktop capability probe', () => {
-  it('passes every advertisement counterexample', () => {
+  it('passes every advertisement counterexample', async () => {
     const cxx = compiler();
     expect(cxx, 'a C++20 compiler is required').not.toBeNull();
 
     const directory = mkdtempSync(join(tmpdir(), 'imcodes-linux-capability-'));
     try {
       const binary = join(directory, 'capability');
-      const build = spawnSync(cxx!, [
+      const build = await runNative(cxx!, [
         '-std=c++20', '-O0', '-Wall', '-Wextra', '-Werror',
         PROBE, SELECTION, TEST, '-o', binary,
-      ], { encoding: 'utf8' });
+      ]);
       expect(build.status, `${build.stdout}\n${build.stderr}`).toBe(0);
 
-      const run = spawnSync(binary, [], { encoding: 'utf8' });
+      const run = await runNative(binary, []);
       expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
       expect(run.stdout).toContain('linux capability probe: ok');
     } finally {
@@ -56,7 +56,7 @@ describe('linux remote desktop capability probe', () => {
     }
   }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
-  it('behaviorally REDs a compile-clean always-ready substitution', () => {
+  it('behaviorally REDs a compile-clean always-ready substitution', async () => {
     const cxx = compiler();
     expect(cxx).not.toBeNull();
 
@@ -76,14 +76,14 @@ describe('linux remote desktop capability probe', () => {
       const binary = join(directory, 'mutant');
       // The mutant lives outside the source tree, so its relative include of
       // the probe header has to be resolved explicitly.
-      const build = spawnSync(cxx!, [
+      const build = await runNative(cxx!, [
         '-std=c++20', '-O0', '-w',
         '-I', NATIVE,
         mutant, SELECTION, TEST, '-o', binary,
-      ], { encoding: 'utf8' });
+      ]);
       expect(build.status, `mutant must compile: ${build.stderr}`).toBe(0);
 
-      const run = spawnSync(binary, [], { encoding: 'utf8' });
+      const run = await runNative(binary, []);
       expect(run.status, 'always-ready mutant must fail a counterexample').not.toBe(0);
     } finally {
       rmSync(directory, { recursive: true, force: true });

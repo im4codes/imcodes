@@ -41,6 +41,8 @@ export interface NativeExecResult {
 export interface NativeExecOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  /** Milliseconds before killing the child process. */
+  timeout?: number;
   /** Bytes. Native builds are chatty under -Werror; default generously. */
   maxBuffer?: number;
   /** Written to the child's stdin, then EOF — the spawnSync `input` option. */
@@ -66,6 +68,7 @@ export function runNative(
       {
         ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
         ...(options.env !== undefined ? { env: options.env } : {}),
+        ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
         encoding: 'utf8',
         maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
       },

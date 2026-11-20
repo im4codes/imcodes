@@ -1,11 +1,10 @@
-import { execFile, execFileSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { aideskAgentCompileArgs } from '../../scripts/build-aidesk-app.mjs';
 import { HOST_CLANG_ARCH } from '../helpers/macos-host-arch.js';
+import { runNativeOrThrow } from '../spec/support/native-exec.js';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
 import {
@@ -14,7 +13,6 @@ import {
 } from '../../src/node/remote-desktop-local-panel.js';
 
 const mac = process.platform === 'darwin' ? describe : describe.skip;
-const execFileAsync = promisify(execFile);
 
 mac('macOS aiDesk status client against the real local panel', () => {
   let root = '';
@@ -33,9 +31,9 @@ mac('macOS aiDesk status client against the real local panel', () => {
     agent = join(root, 'aidesk-agent');
     // The release build's own compile arguments (every source and framework of the agent), not a second hand-written list that can
     // fall behind the first: a source added to the agent once left this link without it.
-    execFileSync('/usr/bin/clang++', aideskAgentCompileArgs({
+    await runNativeOrThrow('/usr/bin/clang++', aideskAgentCompileArgs({
       arch: HOST_CLANG_ARCH, minimumSystemVersion: '12.3', optimization: '-O0', outPath: agent,
-    }), { stdio: 'pipe' });
+    }));
     panel = await startRemoteDesktopLocalPanel({
       publicNodeId: '1234567890',
       serverUrl: 'https://example.test/',
@@ -54,9 +52,9 @@ mac('macOS aiDesk status client against the real local panel', () => {
 
   async function probe() {
     const stateUrl = new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, panel.url);
-    const { stdout } = await execFileAsync(agent, [
+    const stdout = await runNativeOrThrow(agent, [
       '--aidesk-status-probe', stateUrl.href,
-    ], { encoding: 'utf8', timeout: 15_000 });
+    ], { timeout: 15_000 });
     return JSON.parse(stdout) as Record<string, unknown>;
   }
 

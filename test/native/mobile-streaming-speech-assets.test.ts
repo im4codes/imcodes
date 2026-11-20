@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile, readdir } from 'node:fs/promises';
-import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
+import { runNativeOrThrow } from '../spec/support/native-exec.js';
 import {
   STREAMING_SPEECH_PLUGIN_NAME,
   STREAMING_SPEECH_TTS_STATE_EVENT,
@@ -1248,11 +1248,11 @@ public class Harness {
     }
     sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/test/java/com/imcodes/speech/SpeechGainTest.java', import.meta.url)));
     sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/test/java/com/imcodes/speech/Qwen3SpeechTests.java', import.meta.url)));
-    execFileSync('javac',['-d',classesDir,...sources],{stdio:'pipe',timeout:30000});
-    const unitOut = execFileSync('java', ['-cp', classesDir, 'com.imcodes.speech.Qwen3SpeechTests'], { encoding: 'utf8', timeout: 15000 }).trim();
+    await runNativeOrThrow('javac', ['-d', classesDir, ...sources], { timeout: 30000 });
+    const unitOut = (await runNativeOrThrow('java', ['-cp', classesDir, 'com.imcodes.speech.Qwen3SpeechTests'], { timeout: 15000 })).trim();
     expect(unitOut).toBe('QWEN3_JAVA_UNIT_TESTS:PASS');
     for (const dtype of ['FLOAT', 'FLOAT16']) {
-      const output=execFileSync('java',['-Djava.io.tmpdir='+root, '-DortDtype='+dtype, '-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
+      const output = (await runNativeOrThrow('java', ['-Djava.io.tmpdir=' + root, '-DortDtype=' + dtype, '-cp', classesDir, 'Harness'], { timeout: 15000 })).trim().split('\n');
       expect(output, `ORT dtype ${dtype}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','NO_AGC_OK','SOURCE_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','HAPTIC_OK','TTS_ANDROID_OK','SpeechGainTest: ALL 7 TESTS PASSED']);
     }
   }, 95000);
@@ -2029,8 +2029,8 @@ do {
     print("SPEECH_GAIN_AND_INBOX_VAD:PASS")
 }
 `);
-  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 120000 });
-  const result = execFileSync(executable, [emptyDir, biasedDir], { encoding: 'utf8', timeout: 90000 });
+  await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { timeout: 120000 });
+  const result = await runNativeOrThrow(executable, [emptyDir, biasedDir], { timeout: 90000 });
   for (const name of [
     'RECOGNIZER_DECODER',
     'BG_UNDECODED_SHORT',
@@ -2152,8 +2152,8 @@ let asrIdx = suffixWithPrefix.firstIndex(of: Int32(Qwen3ASRTokens.asrTextTokenId
 assert(Array(suffixWithPrefix[(asrIdx + 1)...]) == [201, 202, 203], "prefixTokens missing after asrTextTokenId: \\(suffixWithPrefix)")
 print("PROMPT_PREFIX_INSERTION:PASS")
 `);
-  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 120000 });
-  const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 90000 });
+  await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { timeout: 120000 });
+  const result = await runNativeOrThrow(executable, [], { timeout: 90000 });
   for (const name of ['UTF8_ROLLBACK_GUARD', 'HEADER_AND_SHORT_GUARD', 'PROMPT_PREFIX_INSERTION']) {
     expect(result).toContain(name + ':PASS');
   }
@@ -2166,8 +2166,8 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through toke
   expect(state).toContain('mutating func finish(');
   const file = join(root, 'SpeechWindowTests.swift'), executable = join(root, 'speech-window-tests');
   await writeFile(file, 'import Foundation\n' + state + '\n' + swiftWindowCases);
-  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 120000 });
-  const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 90000 });
+  await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { timeout: 120000 });
+  const result = await runNativeOrThrow(executable, [], { timeout: 90000 });
   for (const name of ['TAIL', 'PREFIX_ROLLBACK_CADENCE', 'REPEATED_PHRASE_PUNCTUATION', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'LONG_TRANSCRIPT', 'VARIABLE_TAP', 'BACKLOG_CHUNKING', 'DISJOINT_LOW_RMS_PARTITION', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'ZERO_LAG', 'WARMUP', 'AUDIO_LEVEL_THROTTLE', 'OVERLOAD', 'TAIL_BATCH', 'MID_DECODE_CANCEL']) {
     expect(result).toContain(name + ':PASS');
   }
@@ -2250,8 +2250,8 @@ print("OTA_RECONCILE:PASS")
   const swiftFile = join(root, 'OtaReconcileTest.swift');
   const binFile = join(root, 'ota-reconcile-test');
   await writeFile(swiftFile, harness);
-  execFileSync(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { encoding: 'utf8', timeout: 120000 });
-  expect(execFileSync(binFile, [root], { encoding: 'utf8', timeout: 90000 }).trim()).toBe('OTA_RECONCILE:PASS');
+  await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { timeout: 120000 });
+  expect((await runNativeOrThrow(binFile, [root], { timeout: 90000 })).trim()).toBe('OTA_RECONCILE:PASS');
 }, 240_000);
 
 const swiftWindowCases = `
