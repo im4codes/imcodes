@@ -28,7 +28,10 @@ import {
 import {
   createPcAppElectronBuilderConfig,
   PC_APP_AFTER_SIGN_HOOK,
+  PC_APP_MAC_ICON,
   PC_APP_MAC_NESTED_BINARIES,
+  PC_APP_PNG_ICON,
+  PC_APP_WIN_ICON,
   PC_APP_WIN_SIGN_HOOK,
   resolveMacosSigningOptions,
 } from '../../apps/pc-app/electron-builder.config.mjs';
@@ -224,6 +227,18 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     expect(releaseCfg.win.target).toEqual([{ target: 'nsis', arch: ['x64'] }]);
     expect(releaseCfg.nsis.perMachine).toBe(false);
     expect(releaseCfg.win.signtoolOptions.sign).toBe(PC_APP_WIN_SIGN_HOOK);
+    expect(releaseCfg.mac.icon).toBe(PC_APP_MAC_ICON);
+    expect(releaseCfg.win.icon).toBe(PC_APP_WIN_ICON);
+    expect(releaseCfg.files).toContain('build/icon.png');
+
+    // Icon assets exist, carry valid magic headers (icns / ICO / PNG), and stay well under 2MB combined
+    const icnsBuf = readFileSync(PC_APP_MAC_ICON);
+    const icoBuf = readFileSync(PC_APP_WIN_ICON);
+    const pngBuf = readFileSync(PC_APP_PNG_ICON);
+    expect(icnsBuf.subarray(0, 4).toString('ascii')).toBe('icns');
+    expect(icoBuf.subarray(0, 4)).toEqual(Buffer.from([0x00, 0x00, 0x01, 0x00]));
+    expect(pngBuf.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    expect(icnsBuf.length + icoBuf.length + pngBuf.length).toBeLessThan(2 * 1024 * 1024);
 
     const localOpts = resolveMacosSigningOptions({});
     expect(localOpts).toEqual({ identity: '-', hardenedRuntime: false, mode: 'ad-hoc' });

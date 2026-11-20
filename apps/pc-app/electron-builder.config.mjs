@@ -12,6 +12,9 @@ export const PC_APP_AFTER_SIGN_HOOK = resolve(PC_APP_DIR, 'scripts', 'after-sign
 export const PC_APP_WIN_SIGN_HOOK = resolve(PC_APP_DIR, 'scripts', 'win-sign.mjs');
 export const PC_APP_MAC_ENTITLEMENTS = resolve(PC_APP_DIR, 'build', 'entitlements.mac.plist');
 export const PC_APP_MAC_ENTITLEMENTS_INHERIT = resolve(PC_APP_DIR, 'build', 'entitlements.mac.inherit.plist');
+export const PC_APP_MAC_ICON = resolve(PC_APP_DIR, 'build', 'icon.icns');
+export const PC_APP_WIN_ICON = resolve(PC_APP_DIR, 'build', 'icon.ico');
+export const PC_APP_PNG_ICON = resolve(PC_APP_DIR, 'build', 'icon.png');
 export const PC_APP_MAC_NESTED_BINARIES = Object.freeze([
   'Contents/Resources/bin/tmux',
   'Contents/Resources/imcodes',
@@ -88,10 +91,12 @@ export function createPcAppElectronBuilderConfig({
     },
     files: [
       'dist/src/**/*',
+      'build/icon.png',
       'package.json',
     ],
     afterSign: afterSignHook,
     mac: {
+      icon: PC_APP_MAC_ICON,
       category: 'public.app-category.developer-tools',
       target: [{ target: 'dmg', arch: [macArch] }],
       binaries: [...PC_APP_MAC_NESTED_BINARIES],
@@ -115,6 +120,7 @@ export function createPcAppElectronBuilderConfig({
       artifactName: 'IM.codes-${version}-${arch}.${ext}',
     },
     win: {
+      icon: PC_APP_WIN_ICON,
       target: [{ target: 'nsis', arch: [winArch] }],
       executableName: 'IM.codes',
       signtoolOptions: {
