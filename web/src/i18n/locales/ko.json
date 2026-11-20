@@ -740,7 +740,7 @@
     "send_placeholder": "{{name}}에게 전송…",
     "send_placeholder_mobile_voice": "길게 눌러 말하기",
     "send_placeholder_desktop_upload": "{{placeholder}} 여러 파일 붙여넣기 또는 드래그 빠른 업로드 지원",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 명령 · # 문구 · @ 파일/에이전트 · ; 별칭 · ^ 노드 · % 작업 · 파일 붙여넣기/드래그",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 명령 · # 문구 · @ 파일/에이전트 · ; 별칭 · ^ 노드 · % 작업 · & 클라우드 문서 · 파일 붙여넣기/드래그",
     "composer_target_label": "보낼 대상",
     "composer_target_aria": "메시지 대상: {{name}}",
     "actions": "세션 작업",

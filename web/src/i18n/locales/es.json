@@ -740,7 +740,7 @@
     "send_placeholder": "Enviar a {{name}}…",
     "send_placeholder_mobile_voice": "Mantén para hablar",
     "send_placeholder_desktop_upload": "{{placeholder}} Admite carga rápida pegando o arrastrando varios archivos",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · # frases · @ archivos/agentes · ; alias · ^ nodos · % tareas · pega o arrastra archivos",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · # frases · @ archivos/agentes · ; alias · ^ nodos · % tareas · & docs en la nube · pega o arrastra archivos",
     "composer_target_label": "Enviando a",
     "composer_target_aria": "Destino del mensaje: {{name}}",
     "actions": "Acciones de sesión",

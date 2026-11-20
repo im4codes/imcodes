@@ -70,10 +70,27 @@ describe('cloud_docs i18n translations across all 7 locales', () => {
       // Every non-English locale should translate the vast majority of strings (no bulk English copy).
       expect(untranslatedCount).toBeLessThanOrEqual(1);
 
-      const officeLeaves = flattenLeafStrings(loaded[locale].office_preview);
+      const loadedLocale = loaded[locale] as {
+        cloud_docs?: Record<string, unknown>;
+        office_preview?: Record<string, unknown>;
+        session?: Record<string, unknown>;
+      };
+      const officeLeaves = flattenLeafStrings(loadedLocale.office_preview);
       expect(Object.keys(officeLeaves).sort()).toEqual(enOfficeKeys);
       expect(officeLeaves['unavailable']?.trim().length).toBeGreaterThan(0);
       expect(officeLeaves['unavailable']).not.toBe(enOfficeLeaves['unavailable']);
     });
   }
+
+  it('includes & cloud docs shortcut hint in session.send_placeholder_desktop_shortcuts across all 7 locales', () => {
+    for (const locale of LOCALES) {
+      const data = loaded[locale] as { session?: { send_placeholder_desktop_shortcuts?: string } };
+      const hint = data.session?.send_placeholder_desktop_shortcuts;
+      expect(typeof hint).toBe('string');
+      expect(hint).toContain('{{placeholder}}\n');
+      for (const token of ['/', '#', '@', ';', '^', '%', '&']) {
+        expect(hint).toContain(token);
+      }
+    }
+  });
 });

@@ -740,7 +740,7 @@
     "send_placeholder": "Отправить в {{name}}…",
     "send_placeholder_mobile_voice": "Удерживайте для голоса",
     "send_placeholder_desktop_upload": "{{placeholder}} Поддерживается быстрая загрузка нескольких файлов вставкой или перетаскиванием",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ команды · # фразы · @ файлы/агенты · ; псевдонимы · ^ узлы · % задачи · вставка/перетаскивание файлов",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ команды · # фразы · @ файлы/агенты · ; псевдонимы · ^ узлы · % задачи · & облачные док. · вставка/перетаскивание файлов",
     "composer_target_label": "Отправка в",
     "composer_target_aria": "Получатель сообщения: {{name}}",
     "actions": "Действия с сессией",

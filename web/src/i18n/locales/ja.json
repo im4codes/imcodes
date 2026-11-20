@@ -740,7 +740,7 @@
     "send_placeholder": "{{name}} へ送信…",
     "send_placeholder_mobile_voice": "長押しで話す",
     "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付け/ドラッグによる高速アップロードに対応",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ コマンド · # フレーズ · @ ファイル/Agent · ; エイリアス · ^ ノード · % タスク · ファイルを貼り付け/ドラッグ",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ コマンド · # フレーズ · @ ファイル/Agent · ; エイリアス · ^ ノード · % タスク · & クラウド文書 · ファイルを貼り付け/ドラッグ",
     "composer_target_label": "送信先",
     "composer_target_aria": "メッセージの送信先: {{name}}",
     "actions": "セッション操作",
