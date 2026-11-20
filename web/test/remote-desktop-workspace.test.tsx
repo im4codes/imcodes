@@ -67,9 +67,46 @@ vi.mock('../src/components/ChatView.js', () => ({
 }));
 
 vi.mock('../src/components/StableSessionControls.js', () => ({
-  StableSessionControls: ({ activeSession }: { activeSession: { name: string } }) => (
-    <div data-testid="rd-mock-controls">{activeSession.name}</div>
+  StableSessionControls: ({ activeSession, quotes, onRemoveQuote, onSend }: {
+    activeSession: { name: string };
+    quotes?: string[];
+    onRemoveQuote?: (index: number) => void;
+    onSend?: (sessionName: string, text: string, meta?: { commandId: string }) => void;
+  }) => (
+    <div>
+      <div data-testid="rd-mock-controls">{activeSession.name}</div>
+      {(quotes ?? []).map((q, idx) => (
+        <span key={`${idx}-${q}`} data-testid={`rd-mock-quote-${idx}`}>
+          {q}
+          <button
+            type="button"
+            data-testid={`rd-mock-quote-remove-${idx}`}
+            onClick={() => onRemoveQuote?.(idx)}
+          >
+            ×
+          </button>
+        </span>
+      ))}
+      <button
+        type="button"
+        data-testid="rd-mock-send"
+        onClick={() => {
+          const quotePrefix = (quotes ?? []).map((q) => `> ${q}`).join('\n');
+          const fullText = quotePrefix ? `${quotePrefix}\n\ncheck screen` : 'check screen';
+          onSend?.(activeSession.name, fullText, { commandId: `cmd-${Date.now()}` });
+          for (let i = (quotes?.length ?? 0) - 1; i >= 0; i--) {
+            onRemoveQuote?.(i);
+          }
+        }}
+      >
+        Send
+      </button>
+    </div>
   ),
+}));
+
+const timelineSpies = vi.hoisted(() => ({
+  addOptimisticUserMessage: vi.fn(),
 }));
 
 vi.mock('../src/hooks/useTimeline.js', () => ({
@@ -84,7 +121,7 @@ vi.mock('../src/hooks/useTimeline.js', () => ({
     loadOlderEvents: vi.fn(),
     historyGap: false,
     loadMessageContext: vi.fn(),
-    addOptimisticUserMessage: vi.fn(),
+    addOptimisticUserMessage: timelineSpies.addOptimisticUserMessage,
     removeOptimisticMessage: vi.fn(),
     markOptimisticFailed: vi.fn(),
     retryOptimisticMessage: vi.fn(),
@@ -107,8 +144,10 @@ import type { SessionInfo } from '../src/types.js';
 import type { WsClient } from '../src/ws-client.js';
 import { __resetMachinesForTests } from '../src/hooks/useMachines.js';
 import {
+  REMOTE_DESKTOP_WALL_TAB_ID,
   REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS,
   REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
+  activateRemoteDesktopWorkspaceTab,
   createRemoteDesktopWorkspaceState,
   openRemoteDesktopWorkspaceHost,
 } from '../src/remote-desktop-workspace-state.js';
@@ -1025,5 +1064,151 @@ describe('RemoteDesktopWorkspace', () => {
       onCloseWorkspace={vi.fn()}
     />);
     expect(fab.classList.contains('is-entering')).toBe(true);
+  });
+
+  it('binds mini chat quote to the active remote desktop host, updates on tab switch without carrying dismissal, and attaches [RemoteDesktop: ...] on send', async () => {
+    localStorage.clear();
+    const hostA = {
+      ...machine('srv-alpha'),
+      nodeId: '6000000011',
+      displayName: 'Alpha [Lab] Node',
+    };
+    const hostB = {
+      ...machine('srv-beta'),
+      displayName: 'Beta Daemon | QA',
+    };
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, hostA);
+    state = openRemoteDesktopWorkspaceHost(state, hostB);
+    const { manager } = setupManager();
+    const sendSessionCommand = vi.fn();
+    const session: SessionInfo = {
+      name: 'deck_proj_brain',
+      label: 'MainBrain',
+      project: 'codedeck',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/repo',
+    };
+    const mainChat: CloudDocsMainChatContext = {
+      session,
+      sessions: [session],
+      subSessions: [],
+      ws: { connected: true, onMessage: () => () => {}, sendSessionCommand } as unknown as WsClient,
+      connected: true,
+      serverId: 'srv-1',
+      quickData: {
+        loaded: true,
+        history: [],
+        commands: [],
+        phrases: [],
+        reload: vi.fn(),
+        recordHistory: vi.fn(),
+        addCommand: vi.fn(),
+        updateCommand: vi.fn(),
+        removeCommand: vi.fn(),
+        addPhrase: vi.fn(),
+        removePhrase: vi.fn(),
+      } as unknown as CloudDocsMainChatContext['quickData'],
+    };
+
+    const view = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    await waitFor(() => expect(screen.getByTestId('rd-mock-quote-0')).toBeTruthy());
+    expect(screen.getByTestId('rd-mock-quote-0').textContent).toContain('[RemoteDesktop: Beta Daemon QA | id=srv-beta]');
+
+    // Dismissing on host B reveals reattach strip
+    fireEvent.click(screen.getByTestId('rd-mock-quote-remove-0'));
+    await waitFor(() => expect(screen.queryByTestId('rd-mock-quote-0')).toBeNull());
+    expect(screen.getByTestId('cloud-docs-mini-chat-reattach')).toBeTruthy();
+
+    // Switching to host A immediately binds host A's nodeId without carrying dismissal from host B
+    const hostAKey = state.orderedHostKeys[0]!;
+    view.rerender(<RemoteDesktopWorkspace
+      state={activateRemoteDesktopWorkspaceTab(state, hostAKey)}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    await waitFor(() => expect(screen.getByTestId('rd-mock-quote-0').textContent).toContain('[RemoteDesktop: Alpha Lab Node | id=6000000011]'));
+
+    // Sending prepends [RemoteDesktop: ...]
+    timelineSpies.addOptimisticUserMessage.mockClear();
+    fireEvent.click(screen.getByTestId('rd-mock-send'));
+    expect(timelineSpies.addOptimisticUserMessage).toHaveBeenCalledWith(
+      expect.stringContaining('[RemoteDesktop: Alpha Lab Node | id=6000000011]'),
+      expect.any(String),
+      expect.any(Object),
+    );
+
+    // Reattach host A's quote so it is actively attached before switching to Wall
+    fireEvent.click(screen.getByTestId('cloud-docs-mini-chat-reattach'));
+    await waitFor(() => expect(screen.getByTestId('rd-mock-quote-0').textContent).toContain('[RemoteDesktop: Alpha Lab Node | id=6000000011]'));
+
+    // Wall tab clears active host quote AND reattach strip while quote is active, sending no RemoteDesktop token
+    view.rerender(<RemoteDesktopWorkspace
+      state={activateRemoteDesktopWorkspaceTab(state, REMOTE_DESKTOP_WALL_TAB_ID)}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    await waitFor(() => expect(screen.queryByTestId('rd-mock-quote-0')).toBeNull());
+    expect(screen.queryByTestId('cloud-docs-mini-chat-reattach')).toBeNull();
+    timelineSpies.addOptimisticUserMessage.mockClear();
+    fireEvent.click(screen.getByTestId('rd-mock-send'));
+    expect(timelineSpies.addOptimisticUserMessage).toHaveBeenCalledWith(
+      'check screen',
+      expect.any(String),
+      expect.any(Object),
+    );
+
+    // Switching back to host A restores host A's RemoteDesktop quote immediately
+    view.rerender(<RemoteDesktopWorkspace
+      state={activateRemoteDesktopWorkspaceTab(state, hostAKey)}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    await waitFor(() => expect(screen.getByTestId('rd-mock-quote-0').textContent).toContain('[RemoteDesktop: Alpha Lab Node | id=6000000011]'));
+
+    // Even when dismissed on host A (reattach strip showing), switching to Wall clears reattach strip too
+    fireEvent.click(screen.getByTestId('rd-mock-quote-remove-0'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-mini-chat-reattach')).toBeTruthy());
+    view.rerender(<RemoteDesktopWorkspace
+      state={activateRemoteDesktopWorkspaceTab(state, REMOTE_DESKTOP_WALL_TAB_ID)}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    await waitFor(() => expect(screen.queryByTestId('cloud-docs-mini-chat-reattach')).toBeNull());
+    expect(screen.queryByTestId('rd-mock-quote-0')).toBeNull();
   });
 });

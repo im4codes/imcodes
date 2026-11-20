@@ -17,7 +17,11 @@ import {
 } from './shared-context-runtime-config.js';
 import { PROCESS_SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES } from './agent-types.js';
 import { PROVIDER_STATUS_REASON } from './provider-status-reasons.js';
-import { CLOUD_DOC_OUTPUT_CONTRACT_ID, FILE_OUTPUT_CONTRACT_ID } from './file-output-contract.js';
+import {
+  CLOUD_DOC_OUTPUT_CONTRACT_ID,
+  FILE_OUTPUT_CONTRACT_ID,
+  REMOTE_DESKTOP_OUTPUT_CONTRACT_ID,
+} from './file-output-contract.js';
 import {
   PEER_AUDIT_PROMPT_VERSION,
   isPeerAuditOpaqueId,
@@ -61,6 +65,7 @@ export const SUPERVISION_CONTRACT_IDS = {
   MESSAGING: 'supervision_messaging_v1',
   FILE_OUTPUT: FILE_OUTPUT_CONTRACT_ID,
   CLOUD_DOC_OUTPUT: CLOUD_DOC_OUTPUT_CONTRACT_ID,
+  REMOTE_DESKTOP_OUTPUT: REMOTE_DESKTOP_OUTPUT_CONTRACT_ID,
 } as const;
 
 export const SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND = 'supervision-audit-target-recovery' as const;
@@ -107,6 +112,7 @@ export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
   SUPERVISION_CONTRACT_IDS.MESSAGING,
   SUPERVISION_CONTRACT_IDS.FILE_OUTPUT,
   SUPERVISION_CONTRACT_IDS.CLOUD_DOC_OUTPUT,
+  SUPERVISION_CONTRACT_IDS.REMOTE_DESKTOP_OUTPUT,
 ] as const;
 
 /**

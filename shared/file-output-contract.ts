@@ -1,5 +1,7 @@
+import { REMOTE_DESKTOP_CHAT_CITATION_PATTERN } from './remote-desktop-reference.js';
+
 /**
- * Canonical model-facing contracts for file and Cloud Doc outputs.
+ * Canonical model-facing contracts for file, Cloud Doc, and Remote Desktop outputs.
  *
  * Keep these compact: they are delivered in the stable transport system
  * context and referenced by supervision preambles. Prompt builders must import
@@ -7,6 +9,7 @@
  */
 export const FILE_OUTPUT_CONTRACT_ID = 'file_output_v1' as const;
 export const CLOUD_DOC_OUTPUT_CONTRACT_ID = 'cloud_doc_output_v1' as const;
+export const REMOTE_DESKTOP_OUTPUT_CONTRACT_ID = 'remote_desktop_output_v1' as const;
 
 export const FILE_OUTPUT_CONTRACT = Object.freeze({
   contractId: FILE_OUTPUT_CONTRACT_ID,
@@ -39,10 +42,23 @@ export const CLOUD_DOC_OUTPUT_CONTRACT = Object.freeze({
   ],
 } as const);
 
+export const REMOTE_DESKTOP_OUTPUT_CONTRACT = Object.freeze({
+  contractId: REMOTE_DESKTOP_OUTPUT_CONTRACT_ID,
+  v: 1,
+  scope: 'remote_desktop_hosts_and_node_ids',
+  token: REMOTE_DESKTOP_CHAT_CITATION_PATTERN,
+  idSource: 'nodeId_or_serverId',
+  when: 'mention_remote_desktop_or_machine_id',
+} as const);
+
 export function buildFileOutputContract(): string {
   return JSON.stringify(FILE_OUTPUT_CONTRACT);
 }
 
 export function buildCloudDocOutputContract(): string {
   return JSON.stringify(CLOUD_DOC_OUTPUT_CONTRACT);
+}
+
+export function buildRemoteDesktopOutputContract(): string {
+  return JSON.stringify(REMOTE_DESKTOP_OUTPUT_CONTRACT);
 }

@@ -5577,6 +5577,8 @@
       "thinking": "思考中...",
       "reattach_doc": "{{name}} を添付",
       "reattach_doc_hint": "「{{name}}」を引用コンテキストとして再添付",
+      "reattach_remote_desktop": "{{name}} を添付",
+      "reattach_remote_desktop_hint": "リモートデスクトップ「{{name}}」を引用コンテキストとして再添付",
       "resize_height": "AI チャットの高さを調整"
     }
   },

@@ -850,4 +850,31 @@ describe('streaming render mode', () => {
       unmount();
     }
   });
+
+  it('renders [RemoteDesktop: <name> | id=<id>] tags in prose and codespans as clickable remote-desktop chips', () => {
+    const onRemoteDesktopClick = vi.fn();
+    const onPathClick = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text={[
+          '连接到 [RemoteDesktop: Mac Studio | id=6000000001]，也可用 `[RemoteDesktop: Prod Win | id=srv_win_01]`。',
+        ].join('\n\n')}
+        serverId="srv-1"
+        onPathClick={onPathClick}
+        onRemoteDesktopClick={onRemoteDesktopClick}
+      />,
+    );
+
+    const chips = Array.from(container.querySelectorAll('.chat-remote-desktop-chip'));
+    expect(chips).toHaveLength(2);
+    expect(chips[0]?.textContent).toContain('Mac Studio');
+    expect(chips[1]?.textContent).toContain('Prod Win');
+    expect(chips[0]?.textContent).not.toContain('[RemoteDesktop:');
+
+    fireEvent.click(chips[0]!);
+    fireEvent.click(chips[1]!);
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(1, '6000000001');
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(2, 'srv_win_01');
+    expect(onPathClick).not.toHaveBeenCalled();
+  });
 });

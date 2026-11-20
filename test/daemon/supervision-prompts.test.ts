@@ -44,21 +44,28 @@ import {
   CLOUD_DOC_OUTPUT_CONTRACT_ID,
   FILE_OUTPUT_CONTRACT,
   FILE_OUTPUT_CONTRACT_ID,
+  REMOTE_DESKTOP_OUTPUT_CONTRACT,
+  REMOTE_DESKTOP_OUTPUT_CONTRACT_ID,
   buildCloudDocOutputContract,
   buildFileOutputContract,
+  buildRemoteDesktopOutputContract,
 } from '../../shared/file-output-contract.js';
 
 describe('supervision prompts', () => {
-  it('keeps the canonical file-output and cloud-doc-output bodies in shared system context and only their ids in execution preambles', () => {
+  it('keeps the canonical file-output, cloud-doc-output, and remote-desktop-output bodies in shared system context and only their ids in execution preambles', () => {
     expect(JSON.parse(buildFileOutputContract())).toEqual(FILE_OUTPUT_CONTRACT);
     expect(JSON.parse(buildCloudDocOutputContract())).toEqual(CLOUD_DOC_OUTPUT_CONTRACT);
+    expect(JSON.parse(buildRemoteDesktopOutputContract())).toEqual(REMOTE_DESKTOP_OUTPUT_CONTRACT);
     expect(SUPERVISION_CONTRACT_IDS.FILE_OUTPUT).toBe(FILE_OUTPUT_CONTRACT_ID);
     expect(SUPERVISION_CONTRACT_IDS.CLOUD_DOC_OUTPUT).toBe(CLOUD_DOC_OUTPUT_CONTRACT_ID);
+    expect(SUPERVISION_CONTRACT_IDS.REMOTE_DESKTOP_OUTPUT).toBe(REMOTE_DESKTOP_OUTPUT_CONTRACT_ID);
     expect(SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS).toContain(FILE_OUTPUT_CONTRACT_ID);
     expect(SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS).toContain(CLOUD_DOC_OUTPUT_CONTRACT_ID);
+    expect(SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS).toContain(REMOTE_DESKTOP_OUTPUT_CONTRACT_ID);
     expect(buildFileOutputContract()).toContain('"repoRelative":"resolve_against_workspace_if_only_known"');
     expect(buildFileOutputContract()).toContain('"scope":"local_files_only_never_cloud_docs"');
     expect(buildCloudDocOutputContract()).toContain('[CloudDoc: <name> | id=<docId>]');
+    expect(buildRemoteDesktopOutputContract()).toContain('[RemoteDesktop: <name> | id=<id>]');
 
     for (const preamble of [
       buildSupervisionExecutionPreamble('en'),
@@ -66,9 +73,11 @@ describe('supervision prompts', () => {
     ]) {
       expect(preamble.match(/file_output_v1/g)).toHaveLength(1);
       expect(preamble.match(/cloud_doc_output_v1/g)).toHaveLength(1);
+      expect(preamble.match(/remote_desktop_output_v1/g)).toHaveLength(1);
       expect(preamble).not.toContain('"files":"produced_or_referenced"');
       expect(preamble).not.toContain('[display name](/absolute/full/path)');
       expect(preamble).not.toContain('[CloudDoc: <name> | id=<docId>]');
+      expect(preamble).not.toContain('[RemoteDesktop: <name> | id=<id>]');
     }
   });
 

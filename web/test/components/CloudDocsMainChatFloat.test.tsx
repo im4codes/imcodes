@@ -842,4 +842,59 @@ describe('CloudDocsMainChatFloat', () => {
       hideWorkflowControls: true,
     });
   });
+
+  it('auto-attaches remote_desktop activePreviewQuote, supports dismiss + reattach, switches cleanly across hosts, and forwards onRemoteDesktopClick', async () => {
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+    const onRemoteDesktopClick = vi.fn();
+
+    const { rerender } = render(
+      <CloudDocsMainChatFloat
+        mainChat={mainChat}
+        activePreviewQuote={{
+          kind: 'remote_desktop',
+          id: '6000000099',
+          serverId: 'srv-cn-99',
+          nodeId: '6000000099',
+          name: 'Studio [Mac]\n| 01',
+        }}
+        onRemoteDesktopClick={onRemoteDesktopClick}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    await waitFor(() => expect(screen.getByTestId('mini-quote-pill-0')).toBeTruthy());
+    expect(screen.getByTestId('mini-quote-pill-0').textContent).toContain('[RemoteDesktop: Studio Mac 01 | id=6000000099]');
+
+    fireEvent.click(screen.getByTestId('mini-quote-remove-0'));
+    await waitFor(() => expect(screen.queryByTestId('mini-quote-pill-0')).toBeNull());
+    const reattachBtn = screen.getByTestId('cloud-docs-mini-chat-reattach');
+    expect(reattachBtn.textContent).toContain('Studio Mac 01');
+
+    fireEvent.click(reattachBtn);
+    await waitFor(() => expect(screen.getByTestId('mini-quote-pill-0')).toBeTruthy());
+
+    fireEvent.click(screen.getByTestId('mock-mini-send'));
+    await waitFor(() => expect(screen.queryByTestId('mini-quote-pill-0')).toBeNull());
+    await waitFor(() => {
+      const lastEvents = (chatViewPropsSpy.mock.calls.at(-1)?.[0] as { events?: Array<{ payload?: { text?: string } }> })?.events ?? [];
+      expect(lastEvents.some((ev) => String(ev.payload?.text ?? '').includes('[RemoteDesktop: Studio Mac 01 | id=6000000099]'))).toBe(true);
+    });
+
+    // Switching to another remote desktop re-attaches without carrying over dismissal
+    rerender(
+      <CloudDocsMainChatFloat
+        mainChat={mainChat}
+        activePreviewQuote={{
+          kind: 'remote_desktop',
+          id: 'srv-win-02',
+          serverId: 'srv-win-02',
+          name: 'Win Server 02',
+        }}
+        onRemoteDesktopClick={onRemoteDesktopClick}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('mini-quote-pill-0').textContent).toContain('[RemoteDesktop: Win Server 02 | id=srv-win-02]'));
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]?.onRemoteDesktopClick).toBe(onRemoteDesktopClick);
+  });
 });

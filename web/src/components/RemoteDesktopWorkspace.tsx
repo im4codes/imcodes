@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { MachineListItem } from '../api/machines.js';
+import type { CloudDocQuoteTarget } from '../cloud-docs-reference.js';
 import type { WsClient } from '../ws-client.js';
 import {
   RemoteDesktopConnectionManager,
@@ -62,6 +63,8 @@ export interface RemoteDesktopWorkspaceProps {
   standalone?: boolean;
   quickData?: UseQuickDataResult;
   mainChat?: CloudDocsMainChatContext | null;
+  onOpenDoc?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
 }
 
 export function RemoteDesktopWorkspace({
@@ -83,6 +86,8 @@ export function RemoteDesktopWorkspace({
   standalone = false,
   quickData,
   mainChat = null,
+  onOpenDoc,
+  onRemoteDesktopClick,
 }: RemoteDesktopWorkspaceProps) {
   const { t } = useTranslation();
   const [maximized, setMaximized] = useState(false);
@@ -114,6 +119,22 @@ export function RemoteDesktopWorkspace({
   const addButtonRef = useRef<HTMLButtonElement | null>(null);
   const tabButtonsRef = useRef(new Map<RemoteDesktopWorkspaceTabId, HTMLButtonElement>());
   const hosts = remoteDesktopWorkspaceHosts(state);
+  const activeHost = state.activeTabId === REMOTE_DESKTOP_WALL_TAB_ID
+    ? null
+    : (hosts.find(({ hostKey }) => hostKey === state.activeTabId) ?? null);
+  const activeRemoteDesktopQuote = useMemo<CloudDocQuoteTarget | null>(() => {
+    if (!activeHost) return null;
+    const { machine } = activeHost;
+    const targetId = machine.nodeId?.trim() || machine.serverId?.trim() || '';
+    if (!targetId) return null;
+    return {
+      kind: 'remote_desktop',
+      id: targetId,
+      serverId: machine.serverId,
+      ...(machine.nodeId ? { nodeId: machine.nodeId } : {}),
+      name: machine.displayName,
+    };
+  }, [activeHost]);
 
   const atHostLimit = hosts.length >= REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS;
   const hostLimitNotice = t('remote_desktop.workspace_limit', { count: REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS });
@@ -341,6 +362,9 @@ export function RemoteDesktopWorkspace({
       {mainChat && (
         <CloudDocsMainChatFloat
           mainChat={mainChat}
+          activePreviewQuote={activeRemoteDesktopQuote}
+          onOpenDoc={onOpenDoc}
+          onRemoteDesktopClick={onRemoteDesktopClick}
           heightStorageKey={REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY}
           overlayClassName={REMOTE_DESKTOP_OVERLAY_CLASS}
           visible={!minimized}

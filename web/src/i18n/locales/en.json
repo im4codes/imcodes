@@ -5588,6 +5588,8 @@
       "thinking": "Thinking...",
       "reattach_doc": "Attach {{name}}",
       "reattach_doc_hint": "Re-attach \"{{name}}\" as quote context",
+      "reattach_remote_desktop": "Attach {{name}}",
+      "reattach_remote_desktop_hint": "Re-attach \"{{name}}\" as quote context",
       "resize_height": "Resize AI chat height"
     }
   },

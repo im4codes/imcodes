@@ -5588,6 +5588,8 @@
       "thinking": "思考中...",
       "reattach_doc": "关联 {{name}}",
       "reattach_doc_hint": "重新关联「{{name}}」作为引用上下文",
+      "reattach_remote_desktop": "关联 {{name}}",
+      "reattach_remote_desktop_hint": "重新关联远桌「{{name}}」作为引用上下文",
       "resize_height": "拖拽调整 AI 对话高度"
     }
   },

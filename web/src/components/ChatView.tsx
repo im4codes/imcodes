@@ -84,6 +84,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { canonicalizeChatFilePath } from '@shared/chat-local-path.js';
+import { REMOTE_DESKTOP_CITATION_PREFIX } from '@shared/remote-desktop-reference.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
@@ -225,6 +226,8 @@ interface Props {
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** When provided, clicking Cloud Doc links/chips opens that document in Cloud Docs. */
   onCloudDocClick?: (docId: string) => void;
+  /** When provided, clicking Remote Desktop citation chips opens that Remote Desktop window. */
+  onRemoteDesktopClick?: (targetId: string) => void;
   /** When provided, the right-side file panel is available. */
   ws?: WsClient | null;
   /** Called when user inserts a path via the FileBrowser opened from a chat message */
@@ -327,6 +330,7 @@ interface AssistantBlockProps {
   eventId?: string;
   onPathClick?: (p: string) => void;
   onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -2938,7 +2942,7 @@ function VirtualizedViewItems({ items, contentRevision, scrollRef, enabled, reve
 
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 
-function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, canManageFileShares = true, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false, hideFilePanel = false, hideTaskPairPanel = false }: Props) {
+function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, onRemoteDesktopClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, canManageFileShares = true, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false, hideFilePanel = false, hideTaskPairPanel = false }: Props) {
   recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
@@ -3472,6 +3476,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const cloudDocClickHandler = onCloudDocClick;
+  const remoteDesktopClickHandler = !preview ? onRemoteDesktopClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
   const imagePreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleImagePreview : undefined;
   const fileChangeOpenHandler = ws && !preview && onPreviewFile ? handleFileChangeOpen : undefined;
@@ -3501,6 +3506,10 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         closePreview();
         cloudDocClickHandler(docId);
       } : undefined}
+      onRemoteDesktopClick={remoteDesktopClickHandler ? (targetId) => {
+        closePreview();
+        remoteDesktopClickHandler(targetId);
+      } : undefined}
       onUrlClick={urlClickHandler ? (url) => {
         closePreview();
         urlClickHandler(url);
@@ -3513,7 +3522,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         onOpenLocalWebPreview(target);
       } : undefined}
     />
-  ), [cloudDocClickHandler, downloadHandler, htmlPreviewHandler, imagePreviewHandler, onOpenLocalWebPreview, pathClickHandler, urlClickHandler]);
+  ), [cloudDocClickHandler, downloadHandler, htmlPreviewHandler, imagePreviewHandler, onOpenLocalWebPreview, pathClickHandler, remoteDesktopClickHandler, urlClickHandler]);
 
   // Tool-call/detail visibility preference (shared cache via usePref). Tri-state:
   //   value === true  → developer view, show tool/file/thinking rows
@@ -5524,6 +5533,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
                   onCloudDocClick={cloudDocClickHandler}
+                  onRemoteDesktopClick={remoteDesktopClickHandler}
                   onUrlClick={urlClickHandler}
                   onDownload={downloadHandler}
                   onHtmlPreview={htmlPreviewHandler}
@@ -5535,18 +5545,18 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               );
             }
             if (item.type === 'tool-group') {
-              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
+              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onRemoteDesktopClick={remoteDesktopClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             if (item.type === 'tool-activity') {
-              return <ToolActivitySummary key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} chatFontSize={!preview ? scaledChatFontSize : undefined} chatFontFamily={!preview ? chatFontPrefs.family : undefined} />;
+              return <ToolActivitySummary key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onRemoteDesktopClick={remoteDesktopClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} chatFontSize={!preview ? scaledChatFontSize : undefined} chatFontFamily={!preview ? chatFontPrefs.family : undefined} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} visible={visible} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} visible={visible} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onRemoteDesktopClick={remoteDesktopClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} visible={visible} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} visible={visible} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onRemoteDesktopClick={remoteDesktopClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
@@ -5556,6 +5566,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                     sessions={sessions}
                     onPathClick={pathClickHandler}
                     onCloudDocClick={cloudDocClickHandler}
+                    onRemoteDesktopClick={remoteDesktopClickHandler}
                     onUrlClick={urlClickHandler}
                     onFileChangeOpen={fileChangeOpenHandler}
                     onDownload={downloadHandler}
@@ -6183,6 +6194,7 @@ function ToolActivitySummary({
   visible = true,
   onPathClick,
   onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
@@ -6196,6 +6208,7 @@ function ToolActivitySummary({
   visible?: boolean;
   onPathClick?: (p: string) => void;
   onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -6373,6 +6386,7 @@ function ToolActivitySummary({
                 event={event}
                 onPathClick={onPathClick}
                 onCloudDocClick={onCloudDocClick}
+                onRemoteDesktopClick={onRemoteDesktopClick}
                 onUrlClick={onUrlClick}
                 onDownload={onDownload}
                 onHtmlPreview={onHtmlPreview}
@@ -6407,6 +6421,7 @@ function ToolCallGroup({
   events,
   onPathClick,
   onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
@@ -6417,6 +6432,7 @@ function ToolCallGroup({
   events: TimelineEvent[];
   onPathClick?: (p: string) => void;
   onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -6436,18 +6452,18 @@ function ToolCallGroup({
 
   return (
     <div class="chat-tool-group">
-      <ChatEvent event={first} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />
+      <ChatEvent event={first} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />
       <div class="chat-tool-group-indent">
         {middle.length > 0 && (
           expanded ? (
-            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />)
+            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
               {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} showTime />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -6474,6 +6490,7 @@ const AssistantBlock = memo(function AssistantBlock({
   liveAssignmentStatuses,
   onPathClick,
   onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
@@ -6499,7 +6516,7 @@ const AssistantBlock = memo(function AssistantBlock({
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}${statusOnly ? ' chat-assistant-status-only' : ''}`}
       data-event-id={eventId}
     >
-      {text && <ChatMarkdown text={displayText} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
+      {text && <ChatMarkdown text={displayText} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
       {status && (
         <span
           class={`chat-execution-status-chip ${status.className}`}
@@ -6778,6 +6795,7 @@ const ChatEvent = memo(function ChatEvent({
   sessions,
   onPathClick,
   onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onFileChangeOpen,
   onDownload,
@@ -6794,6 +6812,7 @@ const ChatEvent = memo(function ChatEvent({
   sessions?: readonly { name: string; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
   onPathClick?: (p: string) => void;
   onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: ChatPathDownloadHandler;
@@ -6920,6 +6939,7 @@ const ChatEvent = memo(function ChatEvent({
               visible={visible}
               onPathClick={onPathClick}
               onCloudDocClick={onCloudDocClick}
+              onRemoteDesktopClick={onRemoteDesktopClick}
               onUrlClick={onUrlClick}
               onDownload={onDownload}
               onHtmlPreview={onHtmlPreview}
@@ -6989,7 +7009,7 @@ const ChatEvent = memo(function ChatEvent({
           {findingsPreview && (
             <details>
               <summary>{t('peerAuditResult.findingsPreview')}</summary>
-              <ChatMarkdown text={findingsPreview} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onOpenLocalWebPreview={onOpenLocalWebPreview} />
+              <ChatMarkdown text={findingsPreview} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onOpenLocalWebPreview={onOpenLocalWebPreview} />
             </details>
           )}
           <ChatTime ts={event.ts} />
@@ -7071,6 +7091,7 @@ const ChatEvent = memo(function ChatEvent({
                     text={result}
                     onPathClick={onPathClick}
                     onCloudDocClick={onCloudDocClick}
+                    onRemoteDesktopClick={onRemoteDesktopClick}
                     onUrlClick={onUrlClick}
                     onDownload={onDownload}
                     onHtmlPreview={onHtmlPreview}
@@ -7085,6 +7106,7 @@ const ChatEvent = memo(function ChatEvent({
                   text={result}
                   onPathClick={onPathClick}
                   onCloudDocClick={onCloudDocClick}
+                  onRemoteDesktopClick={onRemoteDesktopClick}
                   onUrlClick={onUrlClick}
                   onDownload={onDownload}
                   onHtmlPreview={onHtmlPreview}
@@ -7132,18 +7154,18 @@ const ChatEvent = memo(function ChatEvent({
                     <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                   </button>
                   <span class="chat-tool-name">{toolName}</span>
-                  {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>}
+                  {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}</span>}
                   {isMerged && <span class={`chat-tool-state${toolFailed ? ' is-failed' : ' is-complete'}`} aria-hidden="true">{toolFailed ? '×' : '✓'}</span>}
                   {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
                 </div>
                 {toolInputRemainingLines !== null && (
                   <div class="chat-event chat-tool chat-tool-fold-continuation">
-                    <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>
+                    <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}</span>
                   </div>
                 )}
                 {toolOutput && (
                   <div class="chat-event chat-tool chat-tool-result-preview">
-                    <span class="chat-tool-output">{splitPathsAndUrls(toolFoldDisplayText(toolOutput, expanded), onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>
+                    <span class="chat-tool-output">{splitPathsAndUrls(toolFoldDisplayText(toolOutput, expanded), onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}</span>
                   </div>
                 )}
                 {expanded && (
@@ -7193,12 +7215,12 @@ const ChatEvent = memo(function ChatEvent({
                   >
                     <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                   </button>
-                  <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>
+                  <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}</span>
                   {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
                 </div>
                 {resultRemainingLines !== null && (
                   <div class="chat-event chat-tool chat-tool-fold-continuation">
-                    <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>
+                    <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}</span>
                   </div>
                 )}
                 {expanded && <ToolResultDetailPanel detail={detail} payloadOutput={event.payload.output} />}
@@ -7746,6 +7768,7 @@ function UserMessageText({
   visible = true,
   onPathClick,
   onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
@@ -7758,6 +7781,7 @@ function UserMessageText({
   visible?: boolean;
   onPathClick?: (p: string) => void;
   onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -7826,7 +7850,7 @@ function UserMessageText({
           ref={contentRef}
           class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
         >
-          {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}
+          {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}
         </div>
         {(isAgent || shouldFold) && (shouldFold || footerRight) && (
           <div class="chat-user-footer">
@@ -7866,7 +7890,7 @@ const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
 const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}.\-~])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
-/** Split a plain-text segment into CloudDoc, URL, path, and plain-text tokens. */
+/** Split a plain-text segment into CloudDoc, RemoteDesktop, URL, path, and plain-text tokens. */
 function splitPathsAndUrls(
   text: string,
   onPathClick?: (p: string) => void,
@@ -7878,15 +7902,18 @@ function splitPathsAndUrls(
   htmlPreviewLabel = '',
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler,
   onCloudDocClick?: (docId: string) => void,
+  onRemoteDesktopClick?: (targetId: string) => void,
 ): h.JSX.Element[] {
   const hasCloudDocText = text.includes('[CloudDoc:') || text.includes('cdoc_');
-  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview && !onOpenLocalWebPreview && !onCloudDocClick && !hasCloudDocText) {
+  const hasRemoteDesktopText = text.includes(REMOTE_DESKTOP_CITATION_PREFIX);
+  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview && !onOpenLocalWebPreview && !onCloudDocClick && !onRemoteDesktopClick && !hasCloudDocText && !hasRemoteDesktopText) {
     return [<span>{text}</span>];
   }
   if (shouldSkipRichTextEnhancement(text)) return [<span>{text}</span>];
 
   return splitTextWithCloudDocsAndUrls(text, {
     onCloudDocClick,
+    onRemoteDesktopClick,
     onUrlClick,
     onOpenLocalWebPreview,
     renderPlainText: (chunkText, baseOffset) => {

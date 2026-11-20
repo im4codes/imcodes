@@ -11405,6 +11405,38 @@ html.imcodes-window-dragging iframe { pointer-events: none !important; }
 }
 .chat-cloud-doc-link.is-clickable { cursor: pointer; }
 .chat-cloud-doc-link.is-clickable:hover { color: #7dd3fc; }
+.chat-remote-desktop-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 2px 8px;
+  margin: 1px 2px;
+  border-radius: 6px;
+  border: 1px solid rgba(52, 211, 153, 0.42);
+  background: rgba(16, 185, 129, 0.14);
+  color: #d1fae5;
+  font: inherit;
+  font-size: 0.92em;
+  line-height: 1.35;
+  vertical-align: middle;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.chat-remote-desktop-chip:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 0.24);
+  border-color: rgba(52, 211, 153, 0.72);
+}
+.chat-remote-desktop-chip:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+.chat-remote-desktop-icon { flex-shrink: 0; color: #6ee7b7; }
+.chat-remote-desktop-label {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .chat-dl-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 0 2px; margin-left: 2px; vertical-align: middle; line-height: 1; }
 .chat-dl-btn:hover { color: #818cf8; }
 .chat-dl-btn:disabled { cursor: wait; opacity: 0.8; }

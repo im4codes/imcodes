@@ -123,6 +123,8 @@ export interface SessionPaneProps {
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   /** Open a Cloud Docs preview by document ID. */
   onCloudDocClick?: (docId: string) => void;
+  /** Open a Remote Desktop window by nodeId or serverId. */
+  onRemoteDesktopClick?: (targetId: string) => void;
   /** Mobile: whether the file browser overlay is open. */
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
@@ -177,6 +179,7 @@ export function SessionPane({
   onPreviewFile,
   onOpenLocalWebPreview,
   onCloudDocClick,
+  onRemoteDesktopClick,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
   onOpenNodeGroups,
@@ -509,6 +512,7 @@ export function SessionPane({
           onPreviewFile={onPreviewFile}
           onOpenLocalWebPreview={onOpenLocalWebPreview}
           onCloudDocClick={onCloudDocClick}
+          onRemoteDesktopClick={onRemoteDesktopClick}
           ws={connected ? ws : null}
           serverId={serverId}
           scopeFilesToSession={!!session.sharedState && session.sharedState.targetKind !== 'server'}

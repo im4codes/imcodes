@@ -596,7 +596,7 @@ vi.mock('../../src/components/ChatMarkdown.js', async () => {
   return {
     ChatMarkdown: (props: Parameters<typeof actual.ChatMarkdown>[0]) => {
       chatMarkdownRenderSpy(props.text);
-      if (props.onCloudDocClick) {
+      if (props.onCloudDocClick || props.onRemoteDesktopClick) {
         return <actual.ChatMarkdown {...props} />;
       }
       const { text, onUrlClick } = props;
@@ -3418,6 +3418,48 @@ describe('ChatView', () => {
     fireEvent.click(localLink!);
     expect(onPreviewFile).toHaveBeenCalledTimes(1);
     expect(onPreviewFile.mock.calls[0]?.[0]).toMatchObject({ path: '/tmp/local.xlsx' });
+  });
+
+  it('renders [RemoteDesktop: ...] chips in user and assistant messages and invokes onRemoteDesktopClick', () => {
+    const onRemoteDesktopClick = vi.fn();
+    const onPreviewFile = vi.fn();
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-rd',
+            type: 'user.message',
+            ts: new Date('2026-04-17T12:34:00Z').getTime(),
+            payload: { text: '[RemoteDesktop: Alpha Node | id=6000000001] 帮我检查桌面' },
+          },
+          {
+            eventId: 'evt-assistant-rd',
+            type: 'assistant.text',
+            ts: new Date('2026-04-17T12:35:00Z').getTime(),
+            payload: { text: '已打开 [RemoteDesktop: Beta Host | id=srv_beta_01] 并检查完成。' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        serverId="srv-1"
+        ws={{ fsReadFile: vi.fn() } as any}
+        onPreviewFile={onPreviewFile}
+        onRemoteDesktopClick={onRemoteDesktopClick}
+      />,
+    );
+
+    const userChip = container.querySelector('.chat-user .chat-remote-desktop-chip') as HTMLElement | null;
+    const assistantChip = container.querySelector('.chat-assistant .chat-remote-desktop-chip') as HTMLElement | null;
+    expect(userChip).toBeTruthy();
+    expect(assistantChip).toBeTruthy();
+    expect(userChip?.textContent).toContain('Alpha Node');
+    expect(assistantChip?.textContent).toContain('Beta Host');
+
+    fireEvent.click(userChip!);
+    fireEvent.click(assistantChip!);
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(1, '6000000001');
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(2, 'srv_beta_01');
+    expect(onPreviewFile).not.toHaveBeenCalled();
   });
 
   it('hides split file panel toggle and right file browser when hideFilePanel is true', () => {

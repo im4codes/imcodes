@@ -148,6 +148,8 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('"scope":"local_files_only_never_cloud_docs"');
     expect(payload.systemText).toContain('"contractId":"cloud_doc_output_v1"');
     expect(payload.systemText).toContain('[CloudDoc: <name> | id=<docId>]');
+    expect(payload.systemText).toContain('"contractId":"remote_desktop_output_v1"');
+    expect(payload.systemText).toContain('[RemoteDesktop: <name> | id=<id>]');
   });
 
   it('keeps the synchronized identity contract intact in stable session system text', () => {
