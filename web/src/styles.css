@@ -23295,14 +23295,46 @@ html.native-ios-mac .global-task-mode-entry-btn {
 .global-task-mode-filter-pill {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 4px 9px;
+  gap: 4px;
+  padding: 4px 8px;
   border-radius: 999px;
   border: 1px solid rgba(148, 163, 184, 0.22);
   background: rgba(15, 23, 42, 0.72);
   color: #cbd5e1;
   font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  flex-shrink: 0;
   cursor: pointer;
+}
+
+.global-task-mode-filter-icon,
+.global-task-server-filter-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.global-task-mode-filter-pill[data-filter="all"] .global-task-mode-filter-icon {
+  color: #94a3b8;
+}
+
+.global-task-mode-filter-pill[data-filter="attention"].has-attention .global-task-mode-filter-icon,
+.global-task-mode-filter-pill[data-filter="attention"].is-active .global-task-mode-filter-icon {
+  color: #fbbf24;
+}
+
+.global-task-mode-filter-pill[data-filter="working"] .global-task-mode-filter-icon {
+  color: #38bdf8;
+}
+
+.global-task-mode-filter-pill[data-filter="audit"] .global-task-mode-filter-icon {
+  color: #c084fc;
+}
+
+.global-task-mode-filter-pill[data-filter="done"] .global-task-mode-filter-icon {
+  color: #34d399;
 }
 
 .global-task-mode-filter-pill.is-active {
@@ -23312,9 +23344,14 @@ html.native-ios-mac .global-task-mode-entry-btn {
 }
 
 .global-task-mode-filter-count {
-  font-size: 11px;
-  color: #94a3b8;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #cbd5e1;
   font-variant-numeric: tabular-nums;
+}
+
+.global-task-mode-filter-pill.is-active .global-task-mode-filter-count {
+  color: #ccfbf1;
 }
 
 .global-task-mode-sync-badge {
@@ -23364,14 +23401,26 @@ html.native-ios-mac .global-task-mode-entry-btn {
 }
 
 .global-task-server-filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   height: 26px;
-  padding: 0 9px;
+  padding: 0 8px;
   border-radius: 6px;
   border: 1px solid rgba(148, 163, 184, 0.25);
   background: rgba(15, 23, 42, 0.72);
   color: #e2e8f0;
   font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  flex-shrink: 0;
   cursor: pointer;
+}
+
+.global-task-server-filter-count {
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 .global-task-server-filter-menu {
@@ -24081,12 +24130,10 @@ html.native-ios-mac .global-task-mode-entry-btn {
     display: none;
   }
   .global-task-server-filter-btn {
-    padding: 0 7px;
+    padding: 0 6px;
+    gap: 3px;
     font-size: 11px;
     height: 24px;
-    max-width: 132px;
-    overflow: hidden;
-    text-overflow: ellipsis;
     white-space: nowrap;
   }
   .global-task-mode-filters {
@@ -24096,7 +24143,8 @@ html.native-ios-mac .global-task-mode-entry-btn {
     gap: 5px;
   }
   .global-task-mode-filter-pill {
-    padding: 3px 8px;
+    padding: 3px 7px;
+    gap: 3px;
     font-size: 11.5px;
   }
   .global-task-quickbar-list {

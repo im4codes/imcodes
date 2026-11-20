@@ -1113,4 +1113,84 @@ describe('GlobalTaskModeView', () => {
     expect(spokenUtterances).toHaveLength(3);
     expect(spokenUtterances[2]!.text).toContain('Fresh live reply.');
   });
+
+  it('renders status filter pills and server filter button as icon + count only with localized title/aria-label and clean edge counts', async () => {
+    const { ws } = await mountWithSnapshot();
+
+    // Verify 0/0 server boundary and zero task counts first
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: 12_000,
+        servers: [],
+        brains: [],
+        tasks: [],
+        mutedServerIds: [],
+      });
+    });
+
+    const serverBtnEmpty = screen.getByTestId('task-mode-server-filter-btn');
+    expect(serverBtnEmpty.querySelector('svg')).not.toBeNull();
+    expect(serverBtnEmpty.textContent?.trim()).toBe('0/0');
+    expect(serverBtnEmpty.getAttribute('title')).toBeTruthy();
+    expect(serverBtnEmpty.getAttribute('aria-label')).toBe(serverBtnEmpty.getAttribute('title'));
+
+    // Emit snapshot with tasks across all statuses + 24 servers (12 muted -> 12/24)
+    const servers = Array.from({ length: 24 }, (_, idx) => ({
+      id: `srv-${idx + 1}`,
+      name: `Node-${idx + 1}`,
+      online: true,
+    }));
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: 13_000,
+        servers,
+        brains: [],
+        tasks: [
+          { serverId: 'srv-1', serverName: 'Node-1', serverOnline: true, projectName: 'p', brainSession: 'b1', brainLabel: 'B1', taskId: 't-att', title: 'Needs Decision', status: 'awaiting_brain_decision', flags: [], round: 1, checklist: { total: 1, implemented: 0, audited: 0 }, createdAt: 1, updatedAt: 100, isTerminal: false, needsAttention: true },
+          { serverId: 'srv-1', serverName: 'Node-1', serverOnline: true, projectName: 'p', brainSession: 'b1', brainLabel: 'B1', taskId: 't-work', title: 'Active Work', status: 'working', flags: [], round: 1, checklist: { total: 1, implemented: 0, audited: 0 }, createdAt: 2, updatedAt: 200, isTerminal: false, needsAttention: false },
+          { serverId: 'srv-1', serverName: 'Node-1', serverOnline: true, projectName: 'p', brainSession: 'b1', brainLabel: 'B1', taskId: 't-audit', title: 'In Audit', status: 'in_audit', flags: [], round: 1, checklist: { total: 1, implemented: 1, audited: 0 }, createdAt: 3, updatedAt: 300, isTerminal: false, needsAttention: false },
+          { serverId: 'srv-1', serverName: 'Node-1', serverOnline: true, projectName: 'p', brainSession: 'b1', brainLabel: 'B1', taskId: 't-done', title: 'Finished', status: 'done', flags: [], round: 1, checklist: { total: 1, implemented: 1, audited: 1 }, createdAt: 4, updatedAt: 400, isTerminal: true, needsAttention: false },
+        ],
+      });
+    });
+
+    const expectedChips: Array<{ id: string; count: string; label: string }> = [
+      { id: 'all', count: '4', label: 'All' },
+      { id: 'attention', count: '1', label: 'Attention' },
+      { id: 'working', count: '1', label: 'Working' },
+      { id: 'audit', count: '1', label: 'Audit' },
+      { id: 'done', count: '1', label: 'Done' },
+    ];
+    for (const chip of expectedChips) {
+      const btn = screen.getByTestId(`task-mode-filter-${chip.id}`);
+      expect(btn.querySelector('svg')).not.toBeNull();
+      expect(btn.textContent?.trim()).toBe(chip.count);
+      expect(btn.getAttribute('title')).toContain(`(${chip.count})`);
+      expect(btn.getAttribute('aria-label')).toBe(btn.getAttribute('title'));
+      expect(btn.getAttribute('data-filter')).toBe(chip.id);
+    }
+
+    const serverBtn = screen.getByTestId('task-mode-server-filter-btn');
+    expect(serverBtn.querySelector('svg')).not.toBeNull();
+    expect(serverBtn.textContent?.trim()).toBe('24/24');
+    expect(serverBtn.getAttribute('title')).toBeTruthy();
+    expect(serverBtn.getAttribute('aria-label')).toBe(serverBtn.getAttribute('title'));
+
+    // Clicking icon-only filter & server filter buttons still works identically
+    fireEvent.click(screen.getByTestId('task-mode-filter-audit'));
+    expect(screen.getByTestId('task-mode-filter-audit').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.queryByTestId('task-mode-card-t-audit')).not.toBeNull();
+    expect(screen.queryByTestId('task-mode-card-t-work')).toBeNull();
+
+    fireEvent.click(serverBtn);
+    expect(serverBtn.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByTestId('task-mode-server-filter-menu')).toBeTruthy();
+
+    for (let i = 13; i <= 24; i += 1) {
+      fireEvent.click(screen.getByTestId(`task-mode-server-toggle-srv-${i}`));
+    }
+    expect(serverBtn.textContent?.trim()).toBe('12/24');
+  });
 });

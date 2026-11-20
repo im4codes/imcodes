@@ -224,6 +224,48 @@ function formatUpdatedRelative(ts: number, locale: string): string {
   }
 }
 
+function StatusFilterIcon({ filter }: { filter: GlobalTaskStatusFilter }) {
+  switch (filter) {
+    case 'attention':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+          <line x1="12" y1="9" x2="12" y2="13" />
+          <line x1="12" y1="17" x2="12.01" y2="17" />
+        </svg>
+      );
+    case 'working':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+        </svg>
+      );
+    case 'audit':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" />
+          <path d="m9 12 2 2 4-4" />
+        </svg>
+      );
+    case 'done':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" />
+          <path d="m9 12 2 2 4-4" />
+        </svg>
+      );
+    case 'all':
+    default:
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polygon points="12 2 2 7 12 12 22 7 12 2" />
+          <polyline points="2 12 12 17 22 12" />
+          <polyline points="2 17 12 22 22 17" />
+        </svg>
+      );
+  }
+}
+
 export function GlobalTaskModeView({
   onExit,
   onJumpToSession,
@@ -918,6 +960,7 @@ export function GlobalTaskModeView({
 
   const totalServersCount = state.servers.length;
   const activeServersCount = state.servers.filter((s) => !mutedSet.has(s.id)).length;
+  const serverFilterLabel = t('taskMode.server_filter', { active: activeServersCount, total: totalServersCount });
   const syncLabel = state.connected
     ? t('taskMode.live_sync', 'Live sync')
     : state.connecting
@@ -956,19 +999,27 @@ export function GlobalTaskModeView({
           </div>
 
           <div class="global-task-mode-filters" role="group" aria-label={t('taskMode.status_filter_label', 'Status filter')}>
-            {filterChips.map((chip) => (
-              <button
-                key={chip.id}
-                type="button"
-                class={`global-task-mode-filter-pill${statusFilter === chip.id ? ' is-active' : ''}`}
-                data-testid={`task-mode-filter-${chip.id}`}
-                aria-pressed={statusFilter === chip.id}
-                onClick={() => setStatusFilter(chip.id)}
-              >
-                <span>{chip.label}</span>
-                <span class="global-task-mode-filter-count">{chip.count}</span>
-              </button>
-            ))}
+            {filterChips.map((chip) => {
+              const filterAria = `${chip.label} (${chip.count})`;
+              return (
+                <button
+                  key={chip.id}
+                  type="button"
+                  class={`global-task-mode-filter-pill${statusFilter === chip.id ? ' is-active' : ''}${chip.id === 'attention' && chip.count > 0 ? ' has-attention' : ''}`}
+                  data-filter={chip.id}
+                  data-testid={`task-mode-filter-${chip.id}`}
+                  title={filterAria}
+                  aria-label={filterAria}
+                  aria-pressed={statusFilter === chip.id}
+                  onClick={() => setStatusFilter(chip.id)}
+                >
+                  <span class="global-task-mode-filter-icon" aria-hidden="true">
+                    <StatusFilterIcon filter={chip.id} />
+                  </span>
+                  <span class="global-task-mode-filter-count">{chip.count}</span>
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -1036,10 +1087,20 @@ export function GlobalTaskModeView({
               type="button"
               class="global-task-server-filter-btn"
               data-testid="task-mode-server-filter-btn"
+              title={serverFilterLabel}
+              aria-label={serverFilterLabel}
               aria-expanded={serverMenuOpen}
               onClick={() => setServerMenuOpen((prev) => !prev)}
             >
-              {t('taskMode.server_filter', { active: activeServersCount, total: totalServersCount })}
+              <span class="global-task-server-filter-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="2" y="3" width="20" height="8" rx="2" />
+                  <rect x="2" y="13" width="20" height="8" rx="2" />
+                  <line x1="6" y1="7" x2="6.01" y2="7" />
+                  <line x1="6" y1="17" x2="6.01" y2="17" />
+                </svg>
+              </span>
+              <span class="global-task-server-filter-count">{activeServersCount}/{totalServersCount}</span>
             </button>
             {serverMenuOpen && (
               <div
