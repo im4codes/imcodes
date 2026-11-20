@@ -219,8 +219,15 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     expect(releaseCfg.mac.binaries).toEqual([
       'Contents/Resources/bin/tmux',
       'Contents/Resources/imcodes',
+      'Contents/Resources/imcodes-speech',
     ]);
     expect(PC_APP_MAC_NESTED_BINARIES).toEqual(releaseCfg.mac.binaries);
+    expect(releaseCfg.mac.extendInfo.NSMicrophoneUsageDescription).toBeTruthy();
+    expect(releaseCfg.mac.extendInfo.NSSpeechRecognitionUsageDescription).toBeTruthy();
+    const entitlementsMac = readFileSync('apps/pc-app/build/entitlements.mac.plist', 'utf8');
+    const entitlementsInherit = readFileSync('apps/pc-app/build/entitlements.mac.inherit.plist', 'utf8');
+    expect(entitlementsMac).toContain('com.apple.security.device.audio-input');
+    expect(entitlementsInherit).toContain('com.apple.security.device.audio-input');
     expect(releaseCfg.mac.identity).toBe(releaseSha1);
     expect(releaseCfg.mac.hardenedRuntime).toBe(true);
     expect(releaseCfg.mac.target).toEqual([{ target: 'dmg', arch: ['universal'] }]);
@@ -257,6 +264,8 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     const work = makeTempDir();
     const macExe = join(work, 'imcodes-node-macos');
     writeFileSync(macExe, '#!/bin/sh\necho 0.1.0\n', { mode: 0o755 });
+    const macSpeech = join(work, 'imcodes-speech');
+    writeFileSync(macSpeech, '#!/bin/sh\necho "{}"\n', { mode: 0o755 });
     const tmuxSrc = createTmuxFixture(join(work, 'tmux-src'));
     const macStage = join(work, 'stage-mac');
 
@@ -264,9 +273,11 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
       platform: 'darwin',
       nodeExePath: macExe,
       tmuxDir: tmuxSrc,
+      speechBinPath: macSpeech,
       stageDir: macStage,
     });
     expect(existsSync(stagedMac.imcodesPath)).toBe(true);
+    expect(existsSync(stagedMac.speechBinPath!)).toBe(true);
     expect(existsSync(stagedMac.tmuxBin)).toBe(true);
     expect(existsSync(join(stagedMac.licensesDir, 'tmux-ISC.txt'))).toBe(true);
 
@@ -308,6 +319,8 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     createTmuxFixture(resDir);
     const bundledImcodes = join(resDir, 'imcodes');
     writeFileSync(bundledImcodes, '#!/bin/sh\necho 0.1.0\n', { mode: 0o755 });
+    const bundledSpeech = join(resDir, 'imcodes-speech');
+    writeFileSync(bundledSpeech, '#!/bin/sh\necho "{}"\n', { mode: 0o755 });
 
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const mockExec = vi.fn((cmd: string, args: string[]) => {
@@ -329,6 +342,7 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     expect(report.daemonVersion).toBe('0.1.0');
     expect(calls.some((c) => c.cmd === 'codesign' && c.args.includes(join(resDir, 'bin', 'tmux')))).toBe(true);
     expect(calls.some((c) => c.cmd === 'codesign' && c.args.includes(bundledImcodes))).toBe(true);
+    expect(calls.some((c) => c.cmd === 'codesign' && c.args.includes(bundledSpeech))).toBe(true);
     expect(calls.some((c) => c.cmd === 'codesign' && c.args.includes('--deep') && c.args.includes(appPath))).toBe(true);
     expect(calls.some((c) => c.cmd === 'xcrun' && c.args[0] === 'stapler' && c.args[1] === 'validate')).toBe(true);
 

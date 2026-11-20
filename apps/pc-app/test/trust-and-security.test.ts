@@ -378,6 +378,52 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
     ).toBe(false);
   });
 
+  it('invokes onTrustedMediaPermissionRequest only for active trusted origin media permission requests', async () => {
+    const trusted = new Set(['https://app.im.codes']);
+    let activeOrigin: string | null = 'https://app.im.codes';
+    const session = new MockSession();
+    const wc = new MockWebContents(session);
+    wc.url = 'https://app.im.codes/home';
+    const onTrustedMediaPermissionRequest = vi.fn(async () => true);
+
+    attachWindowSecurityGuards({
+      webContents: wc,
+      session,
+      getActiveOrigin: () => activeOrigin,
+      getTrustedOrigins: () => trusted,
+      getCurrentTrustedOrigin: () =>
+        currentTrustedOrigin(
+          { isDestroyed: () => false, loadURL: () => {}, webContents: wc },
+          activeOrigin,
+          trusted,
+        ),
+      openExternal: vi.fn(),
+      promptSavePathSync: vi.fn(),
+      onTrustedMediaPermissionRequest,
+    });
+
+    const askAsync = (perm: string, requestingUrl: string, targetWc: unknown = wc) =>
+      new Promise<boolean>((resolve) => {
+        session.permissionRequestHandler!(targetWc, perm, resolve, { requestingUrl });
+      });
+
+    expect(await askAsync('media', 'https://app.im.codes/session')).toBe(true);
+    expect(onTrustedMediaPermissionRequest).toHaveBeenCalledTimes(1);
+
+    onTrustedMediaPermissionRequest.mockResolvedValueOnce(false);
+    expect(await askAsync('media', 'https://app.im.codes/session')).toBe(false);
+
+    // Untrusted frame / drifted URL / non-media must NEVER trigger onTrustedMediaPermissionRequest
+    onTrustedMediaPermissionRequest.mockClear();
+    expect(await askAsync('media', 'https://evil.example/mic')).toBe(false);
+    expect(await askAsync('media', 'https://app.im.codes/session', {})).toBe(false);
+    expect(await askAsync('clipboard-read', 'https://app.im.codes/session')).toBe(true);
+    activeOrigin = null;
+    wc.url = 'data:text/html,<h1>welcome</h1>';
+    expect(await askAsync('media', 'https://app.im.codes/session')).toBe(false);
+    expect(onTrustedMediaPermissionRequest).not.toHaveBeenCalled();
+  });
+
   it('rejects imcodes-welcome.local virtual actions when a remote origin is loaded or current page is not data:text/html welcome', async () => {
     const session = new MockSession();
     const wc = new MockWebContents(session);

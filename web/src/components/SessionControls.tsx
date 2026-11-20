@@ -118,7 +118,7 @@ import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
 import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
-import { isNativeMacDesktop } from '../native-platform.js';
+import { getPcAppBridge, isNativeMacDesktop, isPcAppDesktop } from '../native-platform.js';
 import { setBackgroundTransferKeepAliveLabels } from '../background-transfer-keepalive.js';
 import { getUploadBackgroundEpoch, isUploadEnvironmentSuspended } from '../upload-suspend-wait.js';
 import {
@@ -2235,14 +2235,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [macDesktop, setMacDesktop] = useState(() => isNativeMacDesktop());
   const macDesktopRef = useRef(macDesktop);
   macDesktopRef.current = macDesktop;
+  const [pcAppDesktop, setPcAppDesktop] = useState(() => isPcAppDesktop());
+  const inlineDesktopVoice = macDesktop || pcAppDesktop;
+  const inlineDesktopVoiceRef = useRef(inlineDesktopVoice);
+  inlineDesktopVoiceRef.current = inlineDesktopVoice;
   useEffect(() => subscribeDeviceLayoutChange(() => {
     setMacDesktop(isNativeMacDesktop());
+    setPcAppDesktop(isPcAppDesktop());
   }, { includeResize: false }), []);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [voiceOverlayInitialText, setVoiceOverlayInitialText] = useState<string | null>(null);
   const [voiceOverlayAutoStart, setVoiceOverlayAutoStart] = useState(true);
   const [inlineVoiceActive, setInlineVoiceActive] = useState(false);
   const [inlineVoiceRecognizing, setInlineVoiceRecognizing] = useState(false);
+  const [inlineVoicePermissionTarget, setInlineVoicePermissionTarget] = useState<'mic' | 'speech' | null>(null);
   const inlineVoiceActiveRef = useRef(false);
   const inlineVoiceTokenRef = useRef(0);
   const inlineVoiceRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -4469,7 +4475,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     const currentHasText = !!readComposerElementText(root).trim();
     const singleLineTrailingCount = serverId
-      ? (VoiceInput.isAvailable() && (macDesktopRef.current || !currentHasText) ? 2 : 1)
+      ? (VoiceInput.isAvailable() && (inlineDesktopVoiceRef.current || !currentHasText) ? 2 : 1)
       : 0;
     // Require real second-line clearance beyond single-line font/ascender/subpixel
     // variance (mobile 16px * 1.45 = 23.2px + 14px padding = 37.2px for 1 line vs
@@ -6505,6 +6511,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     inlineVoiceActiveRef.current = true;
     setInlineVoiceActive(true);
     setInlineVoiceRecognizing(false);
+    setInlineVoicePermissionTarget(null);
     primeVoiceInputGesture({ deferAudioPause: false });
 
     let started = false;
@@ -6568,8 +6575,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           abort: true,
           restoreCaret: typeof document !== 'undefined' && document.activeElement === divRef.current,
         });
-        if (err && err.trim()) {
-          showSendWarning(err);
+        const trimmedErr = err?.trim() ?? '';
+        if (trimmedErr && /permission_denied|not-allowed/i.test(trimmedErr)) {
+          setInlineVoicePermissionTarget(VoiceInput.getPcAppPermissionDeniedTarget?.() ?? 'mic');
+        } else if (trimmedErr) {
+          showSendWarning(trimmedErr);
         }
       },
     )).then((ok) => {
@@ -6604,9 +6614,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     syncMobileComposerMetrics,
   ]);
 
+  const handleQuickGrantVoicePermission = useCallback(async () => {
+    const bridge = getPcAppBridge();
+    if (!bridge?.voice) return;
+    const perms = await bridge.voice.requestPermissions?.().catch(() => null);
+    if (perms && perms.mic === 'granted' && (perms.speech === 'granted' || perms.speech === 'unavailable')) {
+      setInlineVoicePermissionTarget(null);
+      VoiceInput.clearPcAppPermissionDeniedTarget?.();
+      startInlineVoice();
+      return;
+    }
+    const target: 'microphone' | 'speech' = perms?.mic !== 'granted'
+      ? 'microphone'
+      : (inlineVoicePermissionTarget === 'speech' || perms?.speech !== 'granted' ? 'speech' : 'microphone');
+    await bridge.voice.openPrivacySettings?.(target).catch(() => false);
+  }, [inlineVoicePermissionTarget, startInlineVoice]);
+
   const handleVoiceButtonActivate = useCallback(() => {
     if (inputDisabledRef.current) return;
-    if (macDesktopRef.current || isNativeMacDesktop()) {
+    if (inlineDesktopVoiceRef.current || isNativeMacDesktop() || isPcAppDesktop()) {
       if (inlineVoiceActiveRef.current) {
         stopInlineVoice({ abort: true, restoreCaret: true });
       } else {
@@ -8903,7 +8929,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, [syncMobileComposerMetrics]);
-  const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && (macDesktop || !hasText);
+  const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && (inlineDesktopVoice || !hasText);
   const showMobileStackedAttachmentButton = isMobileLayout
     && isTransport
     && !!serverId
@@ -8958,7 +8984,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && !machinePickerOpen
     && !p2pOpen
     && !quickOpen;
-  const voiceHoldReady = isMobileLayout && !macDesktop && hasSession && connected && !inputDisabled && VoiceInput.isAvailable();
+  const voiceHoldReady = isMobileLayout && !inlineDesktopVoice && hasSession && connected && !inputDisabled && VoiceInput.isAvailable();
   voiceHoldReadyRef.current = voiceHoldReady;
   composerFocusedRef.current = composerFocused;
   mobileComposerExpandedRef.current = mobileComposerExpanded;
@@ -10246,6 +10272,54 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         </div>
       )}
 
+      {inlineVoicePermissionTarget && (
+        <div
+          data-testid="inline-voice-permission-banner"
+          class="voice-hold-error-banner"
+          role="alert"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '8px',
+            padding: '6px 12px',
+            fontSize: 12,
+            color: '#fecaca',
+            background: 'rgba(239,68,68,0.14)',
+            border: '1px solid rgba(239,68,68,0.3)',
+            borderRadius: 6,
+            margin: '0 8px 4px',
+          }}
+        >
+          <span>
+            {inlineVoicePermissionTarget === 'speech'
+              ? t('voice.speech_permission_failed')
+              : t('voice.mic_permission_failed')}
+          </span>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+            {(pcAppDesktop || getPcAppBridge()?.voice) && (
+              <button
+                type="button"
+                data-testid="inline-voice-grant-btn"
+                class="btn btn-secondary"
+                style={{ padding: '2px 8px', fontSize: 11 }}
+                onClick={() => { void handleQuickGrantVoicePermission(); }}
+              >
+                {t('voice.open_privacy_settings')}
+              </button>
+            )}
+            <button
+              type="button"
+              aria-label={t('common.close')}
+              style={{ background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', padding: '0 4px' }}
+              onClick={() => setInlineVoicePermissionTarget(null)}
+            >
+              ×
+            </button>
+          </span>
+        </div>
+      )}
+
       {/* Delegation target chip — separate from Team/P2P routing tokens. */}
       {pendingDelegateTarget && (
         <div class="attachment-badges">
@@ -11248,7 +11322,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     handleVoiceButtonActivate();
                   }}
                   disabled={inputDisabled}
-                  aria-pressed={macDesktop ? inlineVoiceActive : undefined}
+                  aria-pressed={inlineDesktopVoice ? inlineVoiceActive : undefined}
                   data-voice-trigger="embedded"
                   data-inline-voice-active={inlineVoiceActive ? 'true' : undefined}
                   data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
@@ -11332,7 +11406,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onPointerDown={(e) => e.preventDefault()}
             onClick={() => handleVoiceButtonActivate()}
             disabled={inputDisabled}
-            aria-pressed={macDesktop ? inlineVoiceActive : undefined}
+            aria-pressed={inlineDesktopVoice ? inlineVoiceActive : undefined}
             data-voice-trigger="desktop"
             data-inline-voice-active={inlineVoiceActive ? 'true' : undefined}
             data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}

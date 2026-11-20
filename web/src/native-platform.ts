@@ -29,12 +29,43 @@ export type NativeHostInfo = {
   scaleMode?: NativeHostScaleMode;
 };
 
+export type PcAppMediaAccessStatus = 'not-determined' | 'granted' | 'denied' | 'restricted' | 'unknown';
+
+export interface PcAppVoicePermissions {
+  mic: PcAppMediaAccessStatus;
+  speech: PcAppMediaAccessStatus | 'unavailable';
+  platform: string;
+  nativeSpeechAvailable: boolean;
+}
+
+export type PcAppVoiceEvent =
+  | { type: 'start' }
+  | { type: 'level'; value: number }
+  | { type: 'result'; text: string; isFinal: boolean }
+  | { type: 'error'; code: string; target?: 'mic' | 'speech'; message?: string }
+  | { type: 'end' };
+
+export interface PcAppBridge {
+  platform?: string;
+  isElectron?: boolean;
+  voice?: {
+    isNativeSpeechSupported?: () => boolean;
+    getPermissions?: () => Promise<PcAppVoicePermissions>;
+    requestPermissions?: () => Promise<PcAppVoicePermissions>;
+    openPrivacySettings?: (target: 'microphone' | 'speech') => Promise<boolean>;
+    startListening?: (options?: { locale?: string }) => Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }>;
+    stopListening?: (options?: { abort?: boolean }) => Promise<void>;
+    subscribe?: (listener: (event: PcAppVoiceEvent) => void) => () => void;
+  };
+}
+
 export type NativePlatformEnvironment = {
   capacitor?: CapacitorRuntime | null;
   navigator?: NavigatorLike | null;
   matchMedia?: MatchMediaLike | null;
   innerWidth?: number;
   nativeHost?: NativeHostInfo | null;
+  pcApp?: PcAppBridge | null;
 };
 
 export const NATIVE_HOST_EVENT = 'imcodes:native-host';
@@ -46,6 +77,7 @@ export function readNativePlatformEnvironment(): NativePlatformEnvironment {
   const runtime = globalThis as typeof globalThis & {
     Capacitor?: CapacitorRuntime;
     __IMCODES_NATIVE_HOST__?: NativeHostInfo;
+    __IMCODES_PC_APP__?: PcAppBridge;
   };
   return {
     capacitor: runtime.Capacitor,
@@ -55,7 +87,24 @@ export function readNativePlatformEnvironment(): NativePlatformEnvironment {
       : undefined,
     innerWidth: globalThis.innerWidth,
     nativeHost: runtime.__IMCODES_NATIVE_HOST__,
+    pcApp: runtime.__IMCODES_PC_APP__,
   };
+}
+
+/** Returns the Electron PC App preload bridge when running inside IM.codes desktop shell. */
+export function getPcAppBridge(env: NativePlatformEnvironment = readNativePlatformEnvironment()): PcAppBridge | null {
+  const bridge = env.pcApp;
+  if (!bridge || typeof bridge !== 'object') return null;
+  if (bridge.isElectron !== true && typeof bridge.voice !== 'object') return null;
+  return bridge;
+}
+
+/**
+ * Returns true when running inside the Electron PC App desktop shell (`apps/pc-app`),
+ * independent of Capacitor iOS/Mac Catalyst detection.
+ */
+export function isPcAppDesktop(env: NativePlatformEnvironment = readNativePlatformEnvironment()): boolean {
+  return getPcAppBridge(env) !== null;
 }
 
 function getNativePlatform(env: NativePlatformEnvironment): string | null {

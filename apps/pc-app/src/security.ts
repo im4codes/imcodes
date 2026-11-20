@@ -149,6 +149,7 @@ export interface WindowSecurityGuardOptions {
    * Electron's `DownloadItem.setSavePath()` is only honored synchronously within `will-download`.
    */
   promptSavePathSync: (suggestedFilename: string) => string | undefined | null;
+  onTrustedMediaPermissionRequest?: (details?: PermissionRequestDetailsLike) => Promise<boolean> | boolean;
   externalDocsHosts?: readonly string[];
 }
 
@@ -169,6 +170,7 @@ export function attachWindowSecurityGuards(options: WindowSecurityGuardOptions):
     getCurrentTrustedOrigin,
     openExternal,
     promptSavePathSync,
+    onTrustedMediaPermissionRequest,
     externalDocsHosts = DEFAULT_EXTERNAL_DOCS_HOSTS,
   } = options;
 
@@ -204,7 +206,18 @@ export function attachWindowSecurityGuards(options: WindowSecurityGuardOptions):
       trustedOrigins: getTrustedOrigins(),
       currentPageOrigin: getCurrentTrustedOrigin(),
     });
-    callback(granted);
+    if (!granted) {
+      callback(false);
+      return;
+    }
+    if (permission === 'media' && onTrustedMediaPermissionRequest) {
+      Promise.resolve(onTrustedMediaPermissionRequest(details)).then(
+        (allowed) => callback(Boolean(allowed)),
+        () => callback(false),
+      );
+      return;
+    }
+    callback(true);
   });
 
   session.setPermissionCheckHandler?.((wc, permission, requestingOrigin) => {

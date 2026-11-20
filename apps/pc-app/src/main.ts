@@ -5,9 +5,11 @@ import {
   app,
   BrowserWindow,
   dialog,
+  ipcMain,
   Menu,
   Notification,
   shell,
+  systemPreferences,
   type MenuItemConstructorOptions,
 } from 'electron';
 import { createPcAppShell } from './shell.js';
@@ -19,6 +21,12 @@ function resolveRuntimeIconPath(): string | undefined {
     join(process.resourcesPath ?? '', 'build', 'icon.png'),
   ];
   return candidates.find((p) => existsSync(p));
+}
+
+function resolveRuntimePreloadPath(): string | undefined {
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const candidate = resolve(moduleDir, 'preload.cjs');
+  return existsSync(candidate) ? candidate : undefined;
 }
 
 export async function startPcApp(): Promise<void> {
@@ -34,6 +42,18 @@ export async function startPcApp(): Promise<void> {
     appName: 'IM.codes',
     userDataDir: app.getPath('userData'),
     welcomeLocale: app.getLocale(),
+    preloadPath: resolveRuntimePreloadPath(),
+    ipcMain,
+    voiceDeps: {
+      resourcesPath: process.resourcesPath,
+      getMediaAccessStatus: process.platform === 'darwin'
+        ? (mediaType) => systemPreferences.getMediaAccessStatus(mediaType)
+        : undefined,
+      askForMediaAccess: process.platform === 'darwin'
+        ? (mediaType) => systemPreferences.askForMediaAccess(mediaType)
+        : undefined,
+      openSystemUrl: (url) => shell.openExternal(url),
+    },
     createMainWindow: (opts) =>
       new BrowserWindow({
         ...opts,

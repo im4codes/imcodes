@@ -18,6 +18,7 @@ export const PC_APP_PNG_ICON = resolve(PC_APP_DIR, 'build', 'icon.png');
 export const PC_APP_MAC_NESTED_BINARIES = Object.freeze([
   'Contents/Resources/bin/tmux',
   'Contents/Resources/imcodes',
+  'Contents/Resources/imcodes-speech',
 ]);
 
 /**
@@ -102,6 +103,10 @@ export function createPcAppElectronBuilderConfig({
       binaries: [...PC_APP_MAC_NESTED_BINARIES],
       entitlements: PC_APP_MAC_ENTITLEMENTS,
       entitlementsInherit: PC_APP_MAC_ENTITLEMENTS_INHERIT,
+      extendInfo: {
+        NSMicrophoneUsageDescription: 'IM.codes needs microphone access for voice dictation and audio input.',
+        NSSpeechRecognitionUsageDescription: 'IM.codes needs speech recognition access to transcribe your voice in chat.',
+      },
       hardenedRuntime: macSigning.hardenedRuntime,
       ...(macSigning.identity !== undefined ? { identity: macSigning.identity } : {}),
       gatekeeperAssess: false,

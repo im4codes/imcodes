@@ -1577,6 +1577,8 @@
     "stop_voice": "停止语音输入",
     "send": "发送",
     "mic_permission_failed": "启动失败 — 请在设置中检查麦克风/语音识别权限",
+    "speech_permission_failed": "语音识别权限未开启 — 请在系统设置中授权语音识别",
+    "open_privacy_settings": "立即授权 / 打开系统设置",
     "error": "语音错误：{{error}}",
     "retry": "重试",
     "notepad": "记事本",

@@ -1577,6 +1577,8 @@
     "stop_voice": "音声入力を停止",
     "send": "送信",
     "mic_permission_failed": "開始に失敗しました — 設定でマイク/音声認識の権限を確認してください",
+    "speech_permission_failed": "音声認識の権限が必要です — システム設定で許可してください",
+    "open_privacy_settings": "許可 / システム設定を開く",
     "error": "音声エラー：{{error}}",
     "retry": "再試行",
     "notepad": "メモ",

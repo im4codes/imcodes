@@ -1577,6 +1577,8 @@
     "stop_voice": "Detener entrada de voz",
     "send": "Enviar",
     "mic_permission_failed": "Error al iniciar — verifica los permisos de micrófono/reconocimiento de voz en Ajustes",
+    "speech_permission_failed": "Se requiere permiso de reconocimiento de voz — actívalo en Ajustes del sistema",
+    "open_privacy_settings": "Autorizar / Abrir Ajustes",
     "error": "Error de voz: {{error}}",
     "retry": "Reintentar",
     "notepad": "Notas",

@@ -41,6 +41,8 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(SCRIPT_DIR, '..');
 export const DEFAULT_NODE_EXE_DIR = join(REPO_ROOT, 'dist-node-exe');
 export const DEFAULT_TMUX_DIR = join(DEFAULT_NODE_EXE_DIR, 'bundled-tmux-macos');
+export const DEFAULT_SPEECH_SWIFT_SRC = join(PC_APP_DIR, 'native', 'imcodes-speech.swift');
+export const DEFAULT_SPEECH_BIN_DIR = join(DEFAULT_NODE_EXE_DIR, 'speech-helper-macos');
 export const DEFAULT_STAGE_ROOT = join(REPO_ROOT, '.pc-app-stage');
 export const DEFAULT_PC_APP_OUT_DIR = join(PC_APP_DIR, 'release');
 
@@ -128,14 +130,56 @@ export function resolveElectronBuilderMacAppPath(outDir, arch, productName = 'IM
 }
 
 /**
+ * Compile `apps/pc-app/native/imcodes-speech.swift` into a macOS binary (`universal`, `arm64`, or `x64`).
+ */
+export function buildMacosSpeechHelper({
+  srcPath = DEFAULT_SPEECH_SWIFT_SRC,
+  outPath = join(DEFAULT_SPEECH_BIN_DIR, 'imcodes-speech'),
+  arch = 'universal',
+  execFn = execFileSync,
+} = {}) {
+  if (!existsSync(srcPath)) {
+    throw new Error(`Swift speech helper source missing at ${srcPath}`);
+  }
+  const absOut = resolve(outPath);
+  mkdirSync(dirname(absOut), { recursive: true });
+  const targetArchs = arch === 'universal'
+    ? ['arm64', 'x86_64']
+    : [arch === 'x64' ? 'x86_64' : 'arm64'];
+  if (targetArchs.length === 1) {
+    execFn('swiftc', ['-O', '-target', `${targetArchs[0]}-apple-macosx12.0`, srcPath, '-o', absOut], {
+      stdio: 'inherit',
+    });
+    chmodSync(absOut, 0o755);
+    return absOut;
+  }
+  const workDir = mkdtempSync(join(tmpdir(), 'imcodes-speech-build-'));
+  try {
+    const thinBins = targetArchs.map((targetArch) => {
+      const binPath = join(workDir, `imcodes-speech-${targetArch}`);
+      execFn('swiftc', ['-O', '-target', `${targetArch}-apple-macosx12.0`, srcPath, '-o', binPath], {
+        stdio: 'inherit',
+      });
+      return binPath;
+    });
+    execFn('lipo', ['-create', ...thinBins, '-output', absOut], { stdio: 'inherit' });
+    chmodSync(absOut, 0o755);
+    return absOut;
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+/**
  * Stage `extraResources` for macOS or Windows prior to `electron-builder` packing/signing.
- * - macOS: `imcodes`, `bin/tmux`, `terminfo/`, `licenses/`
+ * - macOS: `imcodes`, `imcodes-speech` (when provided), `bin/tmux`, `terminfo/`, `licenses/`
  * - Windows: `imcodes.exe`
  */
 export function stagePcAppResources({
   platform,
   nodeExePath,
   tmuxDir,
+  speechBinPath,
   stageDir,
 }) {
   if (!nodeExePath || !existsSync(nodeExePath)) {
@@ -151,6 +195,17 @@ export function stagePcAppResources({
     cpSync(nodeExePath, destExe);
     chmodSync(destExe, 0o755);
 
+    let destSpeech = null;
+    if (speechBinPath) {
+      if (!existsSync(speechBinPath)) {
+        throw new Error(`Speech helper binary missing at ${speechBinPath}`);
+      }
+      accessSync(speechBinPath, fsConstants.X_OK);
+      destSpeech = join(absStageDir, 'imcodes-speech');
+      cpSync(speechBinPath, destSpeech);
+      chmodSync(destSpeech, 0o755);
+    }
+
     const layout = validateBundledTmuxLayout(tmuxDir);
     const destBinDir = join(absStageDir, 'bin');
     const destTmux = join(destBinDir, 'tmux');
@@ -163,6 +218,7 @@ export function stagePcAppResources({
     return {
       stageDir: absStageDir,
       imcodesPath: destExe,
+      ...(destSpeech ? { speechBinPath: destSpeech } : {}),
       tmuxBin: destTmux,
       terminfoDir: join(absStageDir, 'terminfo'),
       licensesDir: join(absStageDir, 'licenses'),
@@ -210,11 +266,18 @@ export function verifyPackagedMacosApp(
   }
   accessSync(bundledImcodes, fsConstants.X_OK);
 
+  const bundledSpeech = join(resourcesDir, 'imcodes-speech');
+  if (!existsSync(bundledSpeech)) {
+    throw new Error(`Bundled imcodes-speech helper missing at ${bundledSpeech}`);
+  }
+  accessSync(bundledSpeech, fsConstants.X_OK);
+
   const tmuxReport = verifyBundledTmux(resourcesDir, { execFn });
 
   // Gate 3: verify nested Mach-O binaries explicitly, then deep-verify outer .app seal.
   execFn('codesign', ['--verify', '--strict', '--verbose=2', tmuxReport.tmuxBin], { stdio: 'pipe' });
   execFn('codesign', ['--verify', '--strict', '--verbose=2', bundledImcodes], { stdio: 'pipe' });
+  execFn('codesign', ['--verify', '--strict', '--verbose=2', bundledSpeech], { stdio: 'pipe' });
   execFn('codesign', ['--verify', '--deep', '--strict', '--verbose=2', absApp], { stdio: 'pipe' });
 
   if (requireNotarized) {
@@ -403,11 +466,15 @@ export async function runBuildPcApp(opts) {
 
   const nodeExePath = ensureBuiltNodeExe(opts);
   const tmuxDir = opts.platform === 'darwin' ? await ensureBuiltBundledTmux(opts) : '';
+  const speechBinPath = opts.platform === 'darwin'
+    ? buildMacosSpeechHelper({ arch: opts.arch })
+    : undefined;
 
   const staged = stagePcAppResources({
     platform: opts.platform,
     nodeExePath,
     tmuxDir,
+    speechBinPath,
     stageDir: opts.stageDir,
   });
 

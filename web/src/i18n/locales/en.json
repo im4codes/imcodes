@@ -1577,6 +1577,8 @@
     "stop_voice": "Stop voice input",
     "send": "Send",
     "mic_permission_failed": "Failed to start — check microphone/speech permissions in Settings",
+    "speech_permission_failed": "Speech recognition permission required — enable it in System Settings",
+    "open_privacy_settings": "Authorize / Open Settings",
     "error": "Voice error: {{error}}",
     "retry": "Retry",
     "notepad": "Notepad",

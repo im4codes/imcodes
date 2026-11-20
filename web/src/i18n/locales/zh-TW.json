@@ -1577,6 +1577,8 @@
     "stop_voice": "停止語音輸入",
     "send": "傳送",
     "mic_permission_failed": "啟動失敗 — 請在設定中檢查麥克風/語音辨識權限",
+    "speech_permission_failed": "語音辨識權限未開啟 — 請在系統設定中授權語音辨識",
+    "open_privacy_settings": "立即授權 / 打開系統設定",
     "error": "語音錯誤：{{error}}",
     "retry": "重試",
     "notepad": "記事本",

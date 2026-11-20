@@ -11,8 +11,10 @@ import {
   IOS_MAC_TERMINAL_FONT_SIZE,
   NATIVE_HOST_EVENT,
   applyNativePlatformClasses,
+  getPcAppBridge,
   isDesignedForIpadMac,
   isNativeMacDesktop,
+  isPcAppDesktop,
   shouldUseIosMacTextScale,
   type NativePlatformEnvironment,
 } from '../src/native-platform';
@@ -279,5 +281,38 @@ describe('native platform detection and uniform UI scaling', () => {
     expect(androidSection).toContain('html[data-native-platform="android"] .chat-bubble-content');
     expect(androidSection).not.toMatch(/\bzoom\s*:/);
     expect(styles).toContain('html.native-ios-mac {\n  -webkit-text-size-adjust: 115%;\n  text-size-adjust: 115%;\n}');
+  });
+
+  it('detects Electron PC App desktop via __IMCODES_PC_APP__ bridge without triggering Capacitor iOS/Mac classes or zoom', () => {
+    const pcEnv: NativePlatformEnvironment = {
+      capacitor: undefined,
+      navigator: {
+        platform: 'MacIntel',
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/156.0.0.0 Electron/45.3.3 Safari/537.36',
+        maxTouchPoints: 0,
+      },
+      pcApp: {
+        platform: 'darwin',
+        isElectron: true,
+        voice: {
+          isNativeSpeechSupported: () => true,
+        },
+      },
+    };
+    expect(isPcAppDesktop(pcEnv)).toBe(true);
+    expect(getPcAppBridge(pcEnv)?.platform).toBe('darwin');
+    expect(isNativeMacDesktop(pcEnv)).toBe(false);
+    expect(isDesignedForIpadMac(pcEnv)).toBe(false);
+    expect(shouldUseIosMacTextScale(pcEnv)).toBe(false);
+
+    const root = document.createElement('html');
+    applyNativePlatformClasses(root, pcEnv);
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(false);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
+    expect(root.dataset.nativePlatform).toBeUndefined();
+
+    // Normal web browser without __IMCODES_PC_APP__ returns false
+    expect(isPcAppDesktop({ navigator: { platform: 'MacIntel', userAgent: 'Safari' } })).toBe(false);
+    expect(getPcAppBridge({ navigator: { platform: 'MacIntel' } })).toBeNull();
   });
 });

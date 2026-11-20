@@ -33,6 +33,11 @@ import {
 } from './server-prompt.js';
 import { normalizeServerOrigin, ServerStore } from './servers.js';
 import { TrustedOriginController, type TrustedWindowLike } from './trust.js';
+import {
+  createPcAppVoiceController,
+  type PcAppIpcMainLike,
+  type PcAppVoiceControllerDeps,
+} from './voice-ipc.js';
 
 export const DOCS_HELP_URL = 'https://docs.im.codes';
 
@@ -54,6 +59,7 @@ export interface ShellWindowLike extends TrustedWindowLike {
     reloadIgnoringCache(): void;
     toggleDevTools(): void;
     executeJavaScript?(code: string, userGesture?: boolean): Promise<unknown>;
+    send?(channel: string, ...args: unknown[]): void;
   };
 }
 
@@ -61,13 +67,29 @@ export interface PcAppShellDeps {
   platform: NodeJS.Platform;
   appName: string;
   userDataDir: string;
+  preloadPath?: string;
+  ipcMain?: PcAppIpcMainLike;
+  voiceDeps?: Partial<
+    Pick<
+      PcAppVoiceControllerDeps,
+      | 'resourcesPath'
+      | 'speechHelperPath'
+      | 'getMediaAccessStatus'
+      | 'askForMediaAccess'
+      | 'openSystemUrl'
+      | 'runHelperSync'
+      | 'runHelperAsync'
+      | 'spawnHelper'
+      | 'buildDevHelper'
+    >
+  >;
   createMainWindow: (options: {
     width: number;
     height: number;
     minWidth: number;
     minHeight: number;
     title: string;
-    webPreferences: typeof MAIN_WINDOW_WEB_PREFERENCES;
+    webPreferences: typeof MAIN_WINDOW_WEB_PREFERENCES & { preload?: string };
   }) => ShellWindowLike;
   createPromptWindow: PromptWindowFactory;
   setApplicationMenu: (template: MenuItemOptionsLike[]) => void;
@@ -107,6 +129,7 @@ export interface PcAppShellInstance {
   store: ServerStore;
   controller: TrustedOriginController;
   bind: BindCoordinator;
+  voice: ReturnType<typeof createPcAppVoiceController>;
   getLocale: () => PcAppLocale;
   getWindow: () => ShellWindowLike | null;
   ensureWindow: () => Promise<ShellWindowLike>;
@@ -364,6 +387,26 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     deps.setApplicationMenu(template);
   };
 
+  const voice = createPcAppVoiceController({
+    platform: deps.platform,
+    userDataDir: deps.userDataDir,
+    resourcesPath: deps.voiceDeps?.resourcesPath ?? deps.bindDeps?.resourcesPath,
+    isMainWebContents: (sender) => Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents === sender),
+    getCurrentTrustedOrigin: () => controller.currentTrustedOrigin(),
+    getActiveOrigin: () => controller.getActiveOrigin(),
+    getTrustedOrigins: () => store.trustedOrigins(),
+    getSenderUrl: () => (mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.getURL() : ''),
+    sendToRenderer: (channel, payload) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send?.(channel, payload);
+      }
+    },
+    ...(deps.voiceDeps ?? {}),
+  });
+  if (deps.ipcMain) {
+    voice.registerIpc(deps.ipcMain);
+  }
+
   const ensureWindow = async (): Promise<ShellWindowLike> => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       return mainWindow;
@@ -375,7 +418,9 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       minWidth: 800,
       minHeight: 560,
       title: deps.appName,
-      webPreferences: MAIN_WINDOW_WEB_PREFERENCES,
+      webPreferences: deps.preloadPath
+        ? { ...MAIN_WINDOW_WEB_PREFERENCES, preload: deps.preloadPath }
+        : MAIN_WINDOW_WEB_PREFERENCES,
     });
     mainWindow = win;
 
@@ -390,6 +435,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
         if (!mainWindow || mainWindow.isDestroyed()) return null;
         return deps.showSaveDialogSync(mainWindow, suggestedFilename) ?? null;
       },
+      onTrustedMediaPermissionRequest: () => voice.ensureMediaAccessOnWebPermissionRequest(),
       externalDocsHosts: deps.externalDocsHosts,
     });
 
@@ -470,6 +516,9 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
 
     win.webContents.on('did-navigate', () => {
       controller.notifyDidNavigate();
+      if (!controller.currentTrustedOrigin()) {
+        void voice.stopListening({ abort: true });
+      }
       rebuildMenu();
     });
 
@@ -506,6 +555,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     });
 
     win.on('closed', () => {
+      void voice.dispose();
       if (mainWindow === win) {
         mainWindow = null;
       }
@@ -533,6 +583,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     store,
     controller,
     bind,
+    voice,
     getLocale: () => activeLocale,
     getWindow: () => mainWindow,
     ensureWindow,

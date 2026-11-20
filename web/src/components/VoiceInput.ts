@@ -20,6 +20,7 @@ import {
   type VoiceRecognitionEngine,
 } from '../voice-recognition-backend.js';
 import type { PluginListenerHandle } from '@capacitor/core';
+import { getPcAppBridge, type PcAppBridge, type PcAppVoiceEvent } from '../native-platform.js';
 import { stopSpeaking } from '../tts.js';
 
 export {
@@ -31,7 +32,7 @@ export {
 };
 
 export function canSwitchVoiceEngine(): boolean {
-  return isNative() && isStreamingSpeechAvailable();
+  return isCapacitorNative() && isStreamingSpeechAvailable();
 }
 
 export type VoiceLanguageMode = 'follow' | 'auto';
@@ -130,8 +131,17 @@ export function pickWebLocale(preferredLang?: string): string {
   return mapWebLocaleTag(resolvePreferredLanguageTag(preferredLang), false);
 }
 
-function isNative(): boolean {
+function isCapacitorNative(): boolean {
   return !!(globalThis as any).Capacitor?.isNativePlatform?.();
+}
+
+export function isPcAppNativeSpeech(): boolean {
+  if (isCapacitorNative()) return false;
+  return getPcAppBridge()?.voice?.isNativeSpeechSupported?.() === true;
+}
+
+function isNative(): boolean {
+  return isCapacitorNative() || isPcAppNativeSpeech();
 }
 
 function getWebSpeechCtor(): any {
@@ -145,6 +155,126 @@ function isWebSpeechAvailable(): boolean {
 
 export function isAvailable(): boolean {
   return isNative() || isWebSpeechAvailable();
+}
+
+let _pcAppDeniedTarget: 'mic' | 'speech' | null = null;
+
+export function getPcAppPermissionDeniedTarget(): 'mic' | 'speech' | null {
+  return _pcAppDeniedTarget;
+}
+
+export function clearPcAppPermissionDeniedTarget(): void {
+  _pcAppDeniedTarget = null;
+}
+
+function createPcAppSpeechRecognition(bridge: PcAppBridge): NativeSpeechRecognition & {
+  checkPermissions: () => Promise<{ speechRecognition: 'granted' | 'denied' | 'prompt' }>;
+} {
+  const voice = bridge.voice!;
+  const listeners = new Map<string, Set<(data: any) => void>>();
+  let ipcUnsub: (() => void) | null = null;
+
+  const dispatch = (eventName: string, payload: unknown) => {
+    const set = listeners.get(eventName);
+    if (!set) return;
+    for (const fn of [...set]) {
+      fn(payload);
+    }
+  };
+
+  const ensureSubscribed = () => {
+    if (ipcUnsub || typeof voice.subscribe !== 'function') return;
+    ipcUnsub = voice.subscribe((ev: PcAppVoiceEvent) => {
+      if (!ev || typeof ev.type !== 'string') return;
+      if (ev.type === 'start') {
+        dispatch('listeningState', { status: 'started' });
+      } else if (ev.type === 'result') {
+        dispatch('partialResults', { matches: [ev.text], isFinal: ev.isFinal });
+      } else if (ev.type === 'level') {
+        dispatch('audioLevel', { level: ev.value });
+      } else if (ev.type === 'error') {
+        if (ev.code === 'permission_denied') {
+          _pcAppDeniedTarget = ev.target ?? 'mic';
+          dispatch('recognitionError', { message: 'permission_denied' });
+        } else {
+          dispatch('recognitionError', { message: ev.message || ev.code || 'Speech recognition failed' });
+        }
+      } else if (ev.type === 'end') {
+        dispatch('listeningState', { status: 'stopped' });
+      }
+    });
+  };
+
+  const mapPerms = (perms?: { mic?: string; speech?: string } | null): 'granted' | 'denied' | 'prompt' => {
+    if (!perms) return 'denied';
+    if (perms.mic === 'granted' && perms.speech === 'granted') {
+      _pcAppDeniedTarget = null;
+      return 'granted';
+    }
+    if (perms.mic === 'not-determined' || perms.speech === 'not-determined') {
+      return 'prompt';
+    }
+    _pcAppDeniedTarget = perms.mic !== 'granted' ? 'mic' : 'speech';
+    return 'denied';
+  };
+
+  return {
+    available: async () => ({ available: voice.isNativeSpeechSupported?.() === true }),
+    checkPermissions: async () => {
+      const perms = await voice.getPermissions?.();
+      return { speechRecognition: mapPerms(perms) };
+    },
+    requestPermissions: async () => {
+      const perms = await voice.requestPermissions?.();
+      const mapped = mapPerms(perms);
+      return { speechRecognition: mapped === 'granted' ? 'granted' : 'denied' };
+    },
+    start: async (options?: { language?: string }) => {
+      ensureSubscribed();
+      const res = await voice.startListening?.({ locale: options?.language });
+      if (!res || res.ok !== true) {
+        if (res?.error === 'permission_denied') {
+          _pcAppDeniedTarget = res.target ?? 'mic';
+          throw new Error('permission_denied');
+        }
+        throw new Error(res?.error || 'Speech recognition failed to start');
+      }
+      _pcAppDeniedTarget = null;
+      return { matches: [] };
+    },
+    stop: async () => {
+      await voice.stopListening?.({ abort: false });
+      ipcUnsub?.();
+      ipcUnsub = null;
+    },
+    addListener: async (eventName: string, listenerFunc: (data: any) => void) => {
+      ensureSubscribed();
+      let set = listeners.get(eventName);
+      if (!set) {
+        set = new Set();
+        listeners.set(eventName, set);
+      }
+      set.add(listenerFunc);
+      return {
+        remove: async () => {
+          set?.delete(listenerFunc);
+          let hasAny = false;
+          for (const s of listeners.values()) {
+            if (s.size > 0) {
+              hasAny = true;
+              break;
+            }
+          }
+          if (!hasAny) {
+            ipcUnsub?.();
+            ipcUnsub = null;
+          }
+        },
+      };
+    },
+  } as unknown as NativeSpeechRecognition & {
+    checkPermissions: () => Promise<{ speechRecognition: 'granted' | 'denied' | 'prompt' }>;
+  };
 }
 
 interface CaptureOwner {
@@ -569,7 +699,15 @@ async function attachSessionListeners(
   }
 }
 
-async function resolveUsableFallbackRecognizer(
+function resolveUsableFallbackRecognizer(
+  primary: NativeSpeechRecognition,
+  requestPermission = false,
+): Promise<NativeSpeechRecognition | null> {
+  if (isPcAppNativeSpeech()) return Promise.resolve(null);
+  return resolveUsableFallbackRecognizerInner(primary, requestPermission);
+}
+
+async function resolveUsableFallbackRecognizerInner(
   primary: NativeSpeechRecognition,
   requestPermission = true,
 ): Promise<NativeSpeechRecognition | null> {
@@ -649,7 +787,9 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
   const requestPermission = options?.requestPermission !== false;
   let recognition: NativeSpeechRecognition;
   try {
-    recognition = getNativeSpeechRecognition();
+    recognition = isPcAppNativeSpeech()
+      ? createPcAppSpeechRecognition(getPcAppBridge()!)
+      : getNativeSpeechRecognition();
   } catch {
     return;
   }
@@ -1447,7 +1587,7 @@ function cancelNativeGesturePrime(): void {
  * Caller adopts via `startListening()` or aborts silently via `cancelVoiceGesturePrime()`.
  */
 export function primeVoiceGesture(options?: { deferAudioPause?: boolean }): boolean {
-  if (!isAvailable()) return false;
+  if (!isAvailable() || isPcAppNativeSpeech()) return false;
   return isNative() ? primeNativeGesture(options) : primeWebGesture(options);
 }
 
@@ -1466,7 +1606,7 @@ export function cancelVoiceGesturePrime(): void {
  * falling back cleanly to `navigator.vibrate`. Never throws.
  */
 export async function triggerHapticFeedback(durationMs = 20): Promise<void> {
-  if (isNative()) {
+  if (isCapacitorNative()) {
     try {
       const cap = (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor;
       const platform = cap?.getPlatform?.();
@@ -1773,11 +1913,14 @@ export async function startListening(
   }
 
   _primedOutcome = null;
+  const recognition = isPcAppNativeSpeech()
+    ? createPcAppSpeechRecognition(getPcAppBridge()!)
+    : getNativeSpeechRecognition();
   const generation = ++_generation;
   const session: NativeSession = {
     generation,
     owner,
-    recognition: getNativeSpeechRecognition(),
+    recognition,
     text: null,
     final: false,
     aborted: false,
