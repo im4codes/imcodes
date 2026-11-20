@@ -9,12 +9,12 @@ import {
   verifyAuthenticationResponse,
 } from '@simplewebauthn/server';
 import type { Env } from '../env.js';
-import { createUser, getUserById, getUserByUsername } from '../db/queries.js';
+import { createUser, getUserById, getUserByUsername, withTransaction } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, hashPassword } from '../security/crypto.js';
-import { alignedSessionIssuedAt, loadUserAccess } from '../security/user-status.js';
+import { alignedSessionIssuedAt, evaluateUserAccess } from '../security/user-status.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
-import { issueAuthNonce, logAuthAudit, scheduleAuthNonceCleanup } from './auth.js';
+import { DOC_RELAY_TICKET_ID_PREFIX, issueAuthNonce, logAuthAudit, scheduleAuthNonceCleanup } from './auth.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
 
@@ -59,14 +59,6 @@ function setSessionCookies(c: Context<HonoEnv>, accessToken: string, refreshToke
   setCookie(c, COOKIE_SESSION, accessToken, { httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600 });
   setCookie(c, 'rcc_refresh', refreshToken, { httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400 });
   setCookie(c, 'rcc_csrf', randomHex(32), { httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400 });
-}
-
-async function storeRefreshToken(db: Env['DB'], userId: string, refreshHash: string): Promise<void> {
-  const now = Date.now();
-  await db.execute(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-    [randomHex(16), userId, refreshHash, randomHex(16), now + 30 * 24 * 3600 * 1000, now],
-  );
 }
 
 /**
@@ -163,7 +155,7 @@ interface StoredPasskeyCredential {
   transports: string | null;
 }
 
-const DOC_RELAY_TICKET_PURPOSE = 'doc-relay-ticket';
+const DOC_RELAY_TICKET_ID_LIKE = `${DOC_RELAY_TICKET_ID_PREFIX}%`;
 
 async function saveChallenge(
   db: Env['DB'],
@@ -177,17 +169,17 @@ async function saveChallenge(
     'INSERT INTO passkey_challenges (id, challenge, user_id, display_name, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
     [id, challenge, userId, displayName, now + 5 * 60 * 1000, now],
   );
-  // Clean up expired passkey challenges opportunistically without touching other purposes
+  // Clean up expired passkey challenges opportunistically without touching doc-relay-ticket rows (keyed by id prefix).
   await db.execute(
-    'DELETE FROM passkey_challenges WHERE expires_at < $1 AND display_name != $2',
-    [now, DOC_RELAY_TICKET_PURPOSE],
+    'DELETE FROM passkey_challenges WHERE expires_at < $1 AND id NOT LIKE $2',
+    [now, DOC_RELAY_TICKET_ID_LIKE],
   );
 }
 
 async function getChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
   const row = await db.queryOne<{ challenge: string; user_id: string | null; display_name: string }>(
-    'SELECT challenge, user_id, display_name FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND display_name != $3',
-    [id, Date.now(), DOC_RELAY_TICKET_PURPOSE],
+    'SELECT challenge, user_id, display_name FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND id NOT LIKE $3',
+    [id, Date.now(), DOC_RELAY_TICKET_ID_LIKE],
   );
   if (!row) return null;
   return { challenge: row.challenge, userId: row.user_id, displayName: row.display_name };
@@ -195,8 +187,8 @@ async function getChallenge(db: Env['DB'], id: string): Promise<PendingChallenge
 
 async function consumeChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
   const row = await db.queryOne<{ challenge: string; user_id: string | null; display_name: string }>(
-    'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND display_name != $3 RETURNING challenge, user_id, display_name',
-    [id, Date.now(), DOC_RELAY_TICKET_PURPOSE],
+    'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND id NOT LIKE $3 RETURNING challenge, user_id, display_name',
+    [id, Date.now(), DOC_RELAY_TICKET_ID_LIKE],
   );
   if (!row) return null;
   return { challenge: row.challenge, userId: row.user_id, displayName: row.display_name };
@@ -441,15 +433,31 @@ passkeyRoutes.post('/register/complete', async (c) => {
     return issueNativeAuthRedirect(c, userId, nativeCallback, { keyLabel: 'mobile-app' });
   }
 
-  const accessInfo = await loadUserAccess(c.env.DB, userId);
-  const accessToken = signJwt(
-    { sub: userId, iat: alignedSessionIssuedAt(accessInfo?.sessionsValidAfter ?? 0) },
-    c.env.JWT_SIGNING_KEY,
-    4 * 3600,
-  );
   const refreshToken = randomHex(32);
-  await storeRefreshToken(c.env.DB, userId, sha256Hex(refreshToken));
-  setSessionCookies(c, accessToken, refreshToken);
+  const refreshHash = sha256Hex(refreshToken);
+  const sessionTx = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{ status: string; sessions_valid_after: string | number }>(
+      'SELECT status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    const decision = evaluateUserAccess(
+      lockedUser ? { status: lockedUser.status, sessionsValidAfter: Number(lockedUser.sessions_valid_after ?? 0) || 0 } : null,
+    );
+    if (!decision.ok) return { ok: false as const, code: decision.code };
+    const txNow = Date.now();
+    await tx.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [randomHex(16), userId, refreshHash, randomHex(16), txNow + 30 * 24 * 3600 * 1000, txNow],
+    );
+    const token = signJwt(
+      { sub: userId, iat: alignedSessionIssuedAt(Number(lockedUser!.sessions_valid_after ?? 0) || 0, txNow) },
+      c.env.JWT_SIGNING_KEY,
+      4 * 3600,
+    );
+    return { ok: true as const, token };
+  });
+  if (!sessionTx.ok) return c.json({ error: sessionTx.code }, 403);
+  setSessionCookies(c, sessionTx.token, refreshToken);
 
   return c.json({ ok: true, userId });
 });
@@ -572,15 +580,31 @@ passkeyRoutes.post('/login/complete', async (c) => {
     return c.json({ ok: true, userId: user.id, nonce, apiKey: rawKey, keyId });
   }
 
-  const accessInfo = await loadUserAccess(c.env.DB, user.id);
-  const accessToken = signJwt(
-    { sub: user.id, iat: alignedSessionIssuedAt(accessInfo?.sessionsValidAfter ?? 0) },
-    c.env.JWT_SIGNING_KEY,
-    4 * 3600,
-  );
   const refreshToken = randomHex(32);
-  await storeRefreshToken(c.env.DB, user.id, sha256Hex(refreshToken));
-  setSessionCookies(c, accessToken, refreshToken);
+  const refreshHash = sha256Hex(refreshToken);
+  const sessionTx = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{ status: string; sessions_valid_after: string | number }>(
+      'SELECT status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [user.id],
+    );
+    const decision = evaluateUserAccess(
+      lockedUser ? { status: lockedUser.status, sessionsValidAfter: Number(lockedUser.sessions_valid_after ?? 0) || 0 } : null,
+    );
+    if (!decision.ok) return { ok: false as const, code: decision.code };
+    const txNow = Date.now();
+    await tx.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [randomHex(16), user.id, refreshHash, randomHex(16), txNow + 30 * 24 * 3600 * 1000, txNow],
+    );
+    const token = signJwt(
+      { sub: user.id, iat: alignedSessionIssuedAt(Number(lockedUser!.sessions_valid_after ?? 0) || 0, txNow) },
+      c.env.JWT_SIGNING_KEY,
+      4 * 3600,
+    );
+    return { ok: true as const, token };
+  });
+  if (!sessionTx.ok) return c.json({ error: sessionTx.code }, 403);
+  setSessionCookies(c, sessionTx.token, refreshToken);
 
   return c.json({ ok: true });
 });
@@ -672,8 +696,8 @@ passkeyRoutes.post('/password/setup', async (c) => {
   try {
     await c.env.DB.transaction(async (tx) => {
       const deleted = await tx.execute(
-        'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND user_id = $3 AND display_name != $4',
-        [challengeId, Date.now(), userId, DOC_RELAY_TICKET_PURPOSE],
+        'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND user_id = $3 AND id NOT LIKE $4',
+        [challengeId, Date.now(), userId, DOC_RELAY_TICKET_ID_LIKE],
       );
       if (deleted.changes === 0) throw new Error('challenge_expired');
       const counterUpdate = await tx.execute(

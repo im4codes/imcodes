@@ -805,13 +805,16 @@ export async function verifyAndBindExternalShareDevice(
       return { ok: false, status: 401, error: 'passkey_assertion_required' };
     }
     const challengeRow = await db.queryOne<{ challenge: string }>(
-      'SELECT challenge FROM passkey_challenges WHERE id = $1 AND expires_at > $2',
-      [input.passkeyChallengeId.trim(), now],
+      'SELECT challenge FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND id NOT LIKE $3',
+      [input.passkeyChallengeId.trim(), now, 'doc-relay-ticket:%'],
     );
     if (!challengeRow) {
       return { ok: false, status: 401, error: 'passkey_challenge_expired' };
     }
-    await db.execute('DELETE FROM passkey_challenges WHERE id = $1', [input.passkeyChallengeId.trim()]);
+    await db.execute('DELETE FROM passkey_challenges WHERE id = $1 AND id NOT LIKE $2', [
+      input.passkeyChallengeId.trim(),
+      'doc-relay-ticket:%',
+    ]);
 
     const respId = typeof input.passkeyResponse.id === 'string'
       ? input.passkeyResponse.id

@@ -11,7 +11,7 @@ import {
   DESKTOP_SETUP_CALLBACK_QUERY_PARAM,
   parseDesktopSetupCallbackUrl,
 } from '../../../shared/desktop-setup-auth.js';
-import { alignedSessionIssuedAt, isUserActive, nextPasswordChangeValidAfter } from '../security/user-status.js';
+import { alignedSessionIssuedAt, isUserActive, nextSessionValidAfter } from '../security/user-status.js';
 import { isUserStatusActive } from '../../../shared/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
@@ -29,7 +29,8 @@ export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string;
 const AUTH_NONCE_TTL_MS = 60_000;
 const AUTH_NONCE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const OAUTH_RELAY_KEY_ID = 'oauth-relay';
-const DOC_RELAY_TICKET_PURPOSE = 'doc-relay-ticket';
+export const DOC_RELAY_TICKET_PURPOSE = 'doc-relay-ticket';
+export const DOC_RELAY_TICKET_ID_PREFIX = `${DOC_RELAY_TICKET_PURPOSE}:`;
 
 let authNonceCleanupDb: Database | null = null;
 let authNonceCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -1049,7 +1050,7 @@ authRoutes.post('/password/change', async (c) => {
 
     const txNow = Date.now();
     const prevValidAfter = Number(lockedUser.sessions_valid_after ?? 0) || 0;
-    const newValidAfter = nextPasswordChangeValidAfter(prevValidAfter, txNow);
+    const newValidAfter = nextSessionValidAfter(prevValidAfter, txNow);
 
     await tx.execute(
       'UPDATE users SET password_hash = $1, password_must_change = false, sessions_valid_after = GREATEST(sessions_valid_after, $3) WHERE id = $2',
@@ -1406,14 +1407,14 @@ authRoutes.post('/relay/verify', async (c) => {
   }
 
   // Persist single-use JTI consumption across all replicas using a purpose-isolated, server-keyed
-  // passkey_challenges row (no passkey endpoint may read or delete display_name='doc-relay-ticket').
+  // passkey_challenges row (id prefixed by DOC_RELAY_TICKET_ID_PREFIX; passkey flows ignore that prefix).
   // Retain the marker until (exp + 1) * 1000 because verifyJwt accepts tokens throughout their exp second.
-  const ticketChallengeId = `${DOC_RELAY_TICKET_PURPOSE}:${sha256Hex(`${c.env.JWT_SIGNING_KEY}:${DOC_RELAY_TICKET_PURPOSE}:${jti}`)}`;
+  const ticketChallengeId = `${DOC_RELAY_TICKET_ID_PREFIX}${sha256Hex(`${c.env.JWT_SIGNING_KEY}:${DOC_RELAY_TICKET_PURPOSE}:${jti}`)}`;
   const now = Date.now();
   const expiresAt = typeof payload.exp === 'number' ? (payload.exp + 1) * 1000 : now + 5 * 60 * 1000;
   await c.env.DB.execute(
-    'DELETE FROM passkey_challenges WHERE display_name = $1 AND expires_at < $2',
-    [DOC_RELAY_TICKET_PURPOSE, now],
+    'DELETE FROM passkey_challenges WHERE id LIKE $1 AND expires_at < $2',
+    [`${DOC_RELAY_TICKET_ID_PREFIX}%`, now],
   );
   const insertedTicket = await c.env.DB.queryOne<{ id: string }>(
     'INSERT INTO passkey_challenges (id, challenge, user_id, display_name, expires_at, created_at) VALUES ($1, $2, NULL, $3, $4, $5) ON CONFLICT (id) DO NOTHING RETURNING id',

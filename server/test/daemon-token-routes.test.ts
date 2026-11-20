@@ -93,15 +93,22 @@ describe('daemon credentials are admitted only on explicitly called routes', () 
     expect((await app.request('/api/aliases', { headers }, environment(NODE_ROLE.FULL, 1))).status).toBe(401);
   });
 
-  it('account cookie/JWT/API-key flows are unaffected, including incidental server headers', async () => {
+  it('account cookie/JWT/API-key flows are unaffected, including incidental server headers, and Authorization never falls back to cookie', async () => {
     const app = buildApp(environment());
     const jwt = signJwt({ sub: 'user-1', role: 'owner' }, signingKey, 60);
     for (const userHeaders of [
       { Authorization: `Bearer ${jwt}` }, { Authorization: `Bearer ${key}` },
       { Authorization: `Bearer ${jwt}`, [SERVER_ID_HEADER]: 'srv-1' },
       { Authorization: `Bearer ${key}`, [SERVER_ID_HEADER]: 'srv-1' },
-      { Cookie: `${COOKIE_SESSION}=${jwt}` }, { Cookie: `${COOKIE_SESSION}=${jwt}`, ...headers },
+      { Cookie: `${COOKIE_SESSION}=${jwt}` },
+      { Cookie: `${COOKIE_SESSION}=${jwt}`, [SERVER_ID_HEADER]: 'srv-1' },
     ]) expect((await app.request('/api/auth/user/me', { headers: userHeaders })).status).toBe(200);
+    // Single-credential selection: daemon Authorization + X-Server-Id on an account-only route must refuse with 403 even when a valid session cookie is attached.
+    const mixedDaemonCookie = await app.request('/api/auth/user/me', {
+      headers: { Cookie: `${COOKIE_SESSION}=${jwt}`, ...headers },
+    });
+    expect(mixedDaemonCookie.status).toBe(403);
+    expect(await mixedDaemonCookie.json()).toEqual({ error: 'forbidden', reason: DAEMON_TOKEN_ROUTE_NOT_ALLOWED });
     expect((await app.request('/api/team', { headers: { Authorization: 'Bearer invalid', [SERVER_ID_HEADER]: 'srv-1' } })).status).toBe(401);
   });
 

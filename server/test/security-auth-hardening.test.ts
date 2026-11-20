@@ -133,6 +133,10 @@ function createHardeningDb() {
         const u = users.get(String(params[0]));
         return u ? ({ status: u.status, sessions_valid_after: u.sessions_valid_after } as T) : null;
       }
+      if (s.includes('select sessions_valid_after from users where id = $1')) {
+        const u = users.get(String(params[0]));
+        return u ? ({ sessions_valid_after: u.sessions_valid_after } as T) : null;
+      }
       if (s.includes('from users where id = $1')) {
         return (users.get(String(params[0])) ?? null) as T | null;
       }
@@ -182,14 +186,15 @@ function createHardeningDb() {
         const id = String(params[0]);
         const row = passkeyChallenges.get(id);
         if (!row || row.expires_at <= Number(params[1])) return null;
-        if (s.includes('display_name != $3') && row.display_name === String(params[2])) return null;
+        if (s.includes('id not like $3') && id.startsWith(String(params[2]).replace(/%$/, ''))) return null;
         passkeyChallenges.delete(id);
         return { challenge: row.challenge, user_id: row.user_id, display_name: row.display_name } as T;
       }
       if (s.includes('from passkey_challenges where id = $1 and expires_at > $2')) {
-        const row = passkeyChallenges.get(String(params[0]));
+        const id = String(params[0]);
+        const row = passkeyChallenges.get(id);
         if (!row || row.expires_at <= Number(params[1])) return null;
-        if (s.includes('display_name != $3') && row.display_name === String(params[2])) return null;
+        if (s.includes('id not like $3') && id.startsWith(String(params[2]).replace(/%$/, ''))) return null;
         return { challenge: row.challenge, user_id: row.user_id, display_name: row.display_name } as T;
       }
       if (s.includes('insert into passkey_challenges') && s.includes('on conflict (id) do nothing returning id')) {
@@ -349,6 +354,11 @@ function createHardeningDb() {
           grace_expires_at: null,
           created_at: Number(params[params.length - 1]),
         });
+      } else if (s.startsWith('update api_keys set revoked_at = $1 where user_id = $2')) {
+        const now = Number(params[0]);
+        for (const k of apiKeys.values()) {
+          if (k.user_id === params[1] && k.revoked_at === null) k.revoked_at = now;
+        }
       } else if (s.startsWith('insert into refresh_tokens')) {
         refreshTokens.set(String(params[0]), {
           id: String(params[0]),
@@ -381,6 +391,8 @@ function createHardeningDb() {
         }
       } else if (s.startsWith('delete from auth_nonces where key_id =')) {
         for (const [k, v] of authNonces) if (v.key_id === params[0] && v.expires_at < Number(params[1])) authNonces.delete(k);
+      } else if (s.startsWith('delete from auth_nonces where user_id = $1')) {
+        for (const [k, v] of authNonces) if (v.user_id === params[0]) authNonces.delete(k);
       } else if (s.startsWith('insert into passkey_challenges')) {
         passkeyChallenges.set(String(params[0]), {
           id: String(params[0]),
@@ -390,27 +402,25 @@ function createHardeningDb() {
           expires_at: Number(params[4]),
           created_at: Number(params[5]),
         });
-      } else if (s.startsWith('delete from passkey_challenges where display_name = $1 and expires_at < $2')) {
-        const purpose = String(params[0]);
+      } else if (s.startsWith('delete from passkey_challenges where id like $1 and expires_at < $2')) {
+        const prefix = String(params[0]).replace(/%$/, '');
         const cutoff = Number(params[1]);
-        for (const [k, v] of passkeyChallenges) if (v.display_name === purpose && v.expires_at < cutoff) passkeyChallenges.delete(k);
+        for (const [k, v] of passkeyChallenges) if (k.startsWith(prefix) && v.expires_at < cutoff) passkeyChallenges.delete(k);
       } else if (s.startsWith('delete from passkey_challenges where expires_at < $1')) {
         const cutoff = Number(params[0]);
-        const excludePurpose = s.includes('display_name != $2') ? String(params[1]) : null;
+        const excludePrefix = s.includes('id not like $2') ? String(params[1]).replace(/%$/, '') : null;
         for (const [k, v] of passkeyChallenges) {
-          if (v.expires_at < cutoff && (excludePurpose === null || v.display_name !== excludePurpose)) passkeyChallenges.delete(k);
+          if (v.expires_at < cutoff && (excludePrefix === null || !k.startsWith(excludePrefix))) passkeyChallenges.delete(k);
         }
       } else if (s.startsWith('delete from passkey_challenges where id = $1')) {
-        const row = passkeyChallenges.get(String(params[0]));
+        const id = String(params[0]);
+        const row = passkeyChallenges.get(id);
         if (!row) return { changes: 0 };
         if (s.includes('expires_at > $2') && row.expires_at <= Number(params[1])) return { changes: 0 };
         if (s.includes('user_id = $3') && row.user_id !== String(params[2])) return { changes: 0 };
-        if (s.includes('display_name != $4') && row.display_name === String(params[3])) return { changes: 0 };
-        passkeyChallenges.delete(String(params[0]));
+        if (s.includes('id not like $4') && id.startsWith(String(params[3]).replace(/%$/, ''))) return { changes: 0 };
+        passkeyChallenges.delete(id);
         return { changes: 1 };
-      } else if (s.startsWith('delete from passkey_challenges where id like')) {
-        const cutoff = Number(params[1]);
-        for (const [k, v] of passkeyChallenges) if (k.startsWith('doc-relay-ticket:') && v.expires_at < cutoff) passkeyChallenges.delete(k);
       } else if (s.startsWith('insert into passkey_credentials')) {
         passkeyCreds.set(String(params[0]), {
           id: String(params[0]),
@@ -722,7 +732,7 @@ describe('security hardening (tsk_3b375f8d07)', () => {
     }, env);
     expect(memberAllowed.status).toBe(200);
 
-    // Unsafe POST with genuine daemon token + session cookie MUST still fail closed on non-daemon routes
+    // Unsafe POST AND safe GET with genuine daemon token + session cookie MUST both fail closed on non-daemon routes (no cookie fallback)
     const daemonCookiePost = await app.request('/api/team', {
       method: 'POST',
       headers: {
@@ -734,6 +744,38 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       body: JSON.stringify({ name: 'Daemon CSRF Attempt' }),
     });
     expect(daemonCookiePost.status).toBe(403);
+
+    const daemonCookieGet = await app.request('/api/auth/user/me', {
+      method: 'GET',
+      headers: {
+        Cookie: `${COOKIE_SESSION}=${encodeURIComponent(sessionJwt)}`,
+        Authorization: 'Bearer full-tok',
+        [SERVER_ID_HEADER]: 'srv-full',
+      },
+    });
+    expect(daemonCookieGet.status).toBe(403);
+    expect(await daemonCookieGet.json()).toMatchObject({ reason: DAEMON_TOKEN_ROUTE_NOT_ALLOWED });
+
+    // Restricted doc_collaborator Bearer JWT on non-doc route MUST fail closed with 403, never falling back to owner cookie
+    const docCollabJwt = signJwt({ sub: 'u1', type: 'web', scope: 'doc_collaborator' }, env.JWT_SIGNING_KEY, 3600);
+    const docCollabCookieGet = await app.request('/api/team', {
+      method: 'GET',
+      headers: {
+        Cookie: `${COOKIE_SESSION}=${encodeURIComponent(sessionJwt)}`,
+        Authorization: `Bearer ${docCollabJwt}`,
+      },
+    });
+    expect(docCollabCookieGet.status).toBe(403);
+
+    // Cookie-only + incidental X-Server-Id without Authorization still succeeds cleanly
+    const cookieIncidentalServer = await app.request('/api/auth/user/me', {
+      method: 'GET',
+      headers: {
+        Cookie: `${COOKIE_SESSION}=${encodeURIComponent(sessionJwt)}`,
+        [SERVER_ID_HEADER]: 'srv-full',
+      },
+    });
+    expect(cookieIncidentalServer.status).toBe(200);
   });
 
   it('AC3: enforces registration_enabled, require_approval, origin-bound single-use relay_token, and redacts relay_token logs', async () => {
@@ -1258,10 +1300,15 @@ describe('security hardening (tsk_3b375f8d07)', () => {
     });
     const bearerJwt = signJwt({ sub: 'u-login-race', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
 
+    let sawUsernameLookup = false;
     let changedDuringVerify = false;
     store.setBeforeSqlHook(async (s) => {
-      // Runs after getUserByUsername reads the old password_hash and before /password/login enters tx/lock.
-      if (!changedDuringVerify && s.includes('from auth_lockout') && store.users.get('u-login-race')?.password_hash === oldHash) {
+      if (s.includes('from users where username = $1')) {
+        sawUsernameLookup = true;
+        return;
+      }
+      // Runs AFTER getUserByUsername has already read oldHash (on user: lockout check before verifyPassword & FOR UPDATE tx).
+      if (sawUsernameLookup && !changedDuringVerify && s.includes('from auth_lockout') && store.users.get('u-login-race')?.password_hash === oldHash) {
         changedDuringVerify = true;
         store.setBeforeSqlHook(null);
         const pwRes = await app.request('/api/auth/password/change', {
@@ -1278,9 +1325,94 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: 'loginrace', password: 'OldLoginPass1!', native: true }),
     });
+    expect(sawUsernameLookup).toBe(true);
+    expect(changedDuringVerify).toBe(true);
     expect(loginRes.status).toBe(401);
     expect(store.refreshTokens.size).toBe(0);
     expect(store.apiKeys.size).toBe(0);
+  });
+
+  it('P0-2d: rotated cookie from password change does not survive immediate admin disable and re-enable, while new login succeeds', async () => {
+    vi.useFakeTimers();
+    const t0 = new Date('2026-11-20T12:00:00.200Z').getTime();
+    vi.setSystemTime(t0);
+
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+    const pwHash = await hashPassword('StartPass1!');
+    store.users.set('u-admin', {
+      id: 'u-admin', username: 'admin', display_name: 'Admin', password_hash: null, password_must_change: false,
+      is_admin: true, status: 'active', sessions_valid_after: 0, created_at: t0,
+    });
+    store.users.set('u-victim', {
+      id: 'u-victim', username: 'victim', display_name: 'Victim', password_hash: pwHash, password_must_change: false,
+      is_admin: false, status: 'active', sessions_valid_after: 0, created_at: t0,
+    });
+    const adminJwt = signJwt({ sub: 'u-admin', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
+    const initialJwt = signJwt({ sub: 'u-victim', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
+
+    // 1. User changes password and receives rotated rcc_session cookie (iat = sec + 1)
+    const chRes = await app.request('/api/auth/password/change', {
+      method: 'POST',
+      headers: {
+        Cookie: `${COOKIE_SESSION}=${encodeURIComponent(initialJwt)}; ${COOKIE_CSRF}=csrf1`,
+        [HEADER_CSRF]: 'csrf1',
+        Origin: 'https://app.im.codes',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ oldPassword: 'StartPass1!', newPassword: 'RotatedPass2!' }),
+    });
+    expect(chRes.status).toBe(200);
+    const rotatedMatch = (chRes.headers.get('set-cookie') ?? '').match(/rcc_session=([^;]+)/);
+    expect(rotatedMatch).toBeTruthy();
+    const rotatedCookie = decodeURIComponent(rotatedMatch![1]);
+    expect((await app.request('/api/auth/user/me', { headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(rotatedCookie)}` } })).status).toBe(200);
+
+    // 2. Same second (+200ms): admin disables user, then re-enables user (+300ms)
+    vi.setSystemTime(t0 + 200);
+    const disRes = await app.request('/api/admin/users/u-victim/disable', {
+      method: 'POST',
+      headers: {
+        Cookie: `${COOKIE_SESSION}=${encodeURIComponent(adminJwt)}; ${COOKIE_CSRF}=csrfA`,
+        [HEADER_CSRF]: 'csrfA',
+        Origin: 'https://app.im.codes',
+      },
+    });
+    expect(disRes.status).toBe(200);
+
+    vi.setSystemTime(t0 + 300);
+    const appRes = await app.request('/api/admin/users/u-victim/approve', {
+      method: 'POST',
+      headers: {
+        Cookie: `${COOKIE_SESSION}=${encodeURIComponent(adminJwt)}; ${COOKIE_CSRF}=csrfA`,
+        [HEADER_CSRF]: 'csrfA',
+        Origin: 'https://app.im.codes',
+      },
+    });
+    expect(appRes.status).toBe(200);
+
+    // 3. Rotated cookie issued before disable MUST remain permanently revoked even after approve
+    const staleAfterApprove = await app.request('/api/auth/user/me', {
+      headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(rotatedCookie)}` },
+    });
+    expect(staleAfterApprove.status).toBe(401);
+
+    // 4. Fresh login after approve succeeds immediately and issues a valid session
+    vi.setSystemTime(t0 + 400);
+    const freshLogin = await app.request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'victim', password: 'RotatedPass2!' }),
+    });
+    expect(freshLogin.status).toBe(200);
+    const freshMatch = (freshLogin.headers.get('set-cookie') ?? '').match(/rcc_session=([^;]+)/);
+    expect(freshMatch).toBeTruthy();
+    const freshCookie = decodeURIComponent(freshMatch![1]);
+    const freshMe = await app.request('/api/auth/user/me', {
+      headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(freshCookie)}` },
+    });
+    expect(freshMe.status).toBe(200);
   });
 
   it('P0-3a: /refresh returns 429 under user lockout without consuming the refresh token, then succeeds after lockout clears', async () => {
@@ -1444,8 +1576,32 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       body: JSON.stringify({ relayToken: docTicket, expectedAudience: 'https://self.example.com' }),
     });
     expect(vRes.status).toBe(200);
-    const docRow = [...store.passkeyChallenges.values()].find((r) => r.display_name === 'doc-relay-ticket')!;
+    const docRow = [...store.passkeyChallenges.values()].find((r) => r.id.startsWith('doc-relay-ticket:'))!;
     expect(docRow).toBeTruthy();
+
+    // Passkey registration with displayName === 'doc-relay-ticket' succeeds normally (type isolated by id prefix, not displayName)
+    verifyRegistrationResponseMock.mockResolvedValue({
+      verified: true,
+      registrationInfo: {
+        credentialID: 'cred-doc-name',
+        credentialPublicKey: Buffer.from('pk-doc-name'),
+        counter: 0,
+      },
+    });
+    const beginSameName = await app.request('/api/auth/passkey/register/begin', {
+      method: 'POST',
+      headers: { host: 'localhost', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ displayName: 'doc-relay-ticket' }),
+    });
+    expect(beginSameName.status).toBe(200);
+    const { challengeId: sameNameChallengeId } = await beginSameName.json() as { challengeId: string };
+    expect(sameNameChallengeId.startsWith('doc-relay-ticket:')).toBe(false);
+    const completeSameName = await app.request('/api/auth/passkey/register/complete', {
+      method: 'POST',
+      headers: { host: 'localhost', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challengeId: sameNameChallengeId, response: { response: {} }, displayName: 'doc-relay-ticket' }),
+    });
+    expect(completeSameName.status).toBe(200);
 
     // Passkey login/complete attempting to consume docRow.id must NOT consume it
     const crossConsume = await app.request('/api/auth/passkey/login/complete', {
@@ -1478,11 +1634,11 @@ describe('security hardening (tsk_3b375f8d07)', () => {
     expect(store.passkeyChallenges.has('pk-expired')).toBe(true);
 
     // Re-insert expired doc-relay-ticket row and confirm passkey begin cleanup leaves it alone
-    store.passkeyChallenges.set('doc-exp-probe', {
-      id: 'doc-exp-probe', challenge: 'x', user_id: null, display_name: 'doc-relay-ticket', expires_at: now - 10, created_at: now - 100,
+    store.passkeyChallenges.set('doc-relay-ticket:exp-probe', {
+      id: 'doc-relay-ticket:exp-probe', challenge: 'x', user_id: null, display_name: 'doc-relay-ticket', expires_at: now - 10, created_at: now - 100,
     });
     await app.request('/api/auth/passkey/login/begin', { method: 'POST', headers: { host: 'localhost' } });
-    expect(store.passkeyChallenges.has('doc-exp-probe')).toBe(true);
+    expect(store.passkeyChallenges.has('doc-relay-ticket:exp-probe')).toBe(true);
     expect(store.passkeyChallenges.has('pk-expired')).toBe(false);
 
     // auth_nonces purpose isolation: /token-exchange cannot consume or delete an oauth-relay nonce
@@ -1556,5 +1712,73 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       body: JSON.stringify({ relayToken: ticket, expectedAudience: 'https://self.example.com' }),
     });
     expect(replayAtBoundary.status).toBe(401);
+  });
+
+  it('P0-4c: OAuth relay redemption ignores pod-local rateLimiter saturation and aligns DB nonce expiry with signed exp across second boundaries', async () => {
+    vi.useFakeTimers();
+    const startMs = new Date('2026-11-20T12:00:00.990Z').getTime();
+    vi.setSystemTime(startMs);
+
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === 'https://github.com/login/oauth/access_token') {
+        return new Response(JSON.stringify({ access_token: 'gh-tok' }), { status: 200 });
+      }
+      if (url === 'https://api.github.com/user') {
+        return new Response(JSON.stringify({ id: 991002, login: 'crosssec' }), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    // Advance system clock across a second boundary during auth_nonces insert (before signJwt runs)
+    let crossedSecond = false;
+    store.setBeforeSqlHook(async (s) => {
+      if (!crossedSecond && s.startsWith('insert into auth_nonces')) {
+        crossedSecond = true;
+        store.setBeforeSqlHook(null);
+        vi.setSystemTime(startMs + 20); // .990 -> .010 of next second
+      }
+    });
+
+    const state = signJwt({ nonce: 'st-cross', origin: 'https://hk.im.codes', provider: 'github' }, env.JWT_SIGNING_KEY, 300);
+    const relayEmit = await app.request(`https://app.im.codes/api/auth/github/callback?code=c-cross&state=${encodeURIComponent(state)}`, {
+      headers: { host: 'app.im.codes', cookie: 'oauth_state=st-cross' },
+    });
+    expect(crossedSecond).toBe(true);
+    expect(relayEmit.status).toBe(302);
+    const relayToken = new URL(relayEmit.headers.get('location')!).searchParams.get('relay_token')!;
+    expect(relayToken).toBeTruthy();
+
+    // Decode signed exp directly from JWT
+    const payload = JSON.parse(Buffer.from(relayToken.split('.')[1], 'base64url').toString('utf8')) as { exp: number };
+
+    // Simulate pod-local rateLimiter JTI cache saturation returning false for a fresh JTI:
+    // PostgreSQL conditional DELETE is sole arbiter, so valid redemption MUST still succeed once.
+    vi.spyOn(rateLimiter, 'consumeJti').mockReturnValue(false);
+
+    // Move inside the exact signed exp second (payload.exp * 1000 + 500ms): both verifyJwt and DB nonce MUST still accept
+    vi.setSystemTime(payload.exp * 1000 + 500);
+    const redeemRes = await app.request(`https://hk.im.codes/api/auth/github/callback?relay_token=${encodeURIComponent(relayToken)}`, {
+      headers: { host: 'hk.im.codes' },
+    });
+    expect(redeemRes.status).toBe(302);
+    expect(store.refreshTokens.size).toBe(1);
+
+    // Replaying the same relay_token still inside exp second MUST fail with 401 from DB conditional DELETE
+    const replayRes = await app.request(`https://hk.im.codes/api/auth/github/callback?relay_token=${encodeURIComponent(relayToken)}`, {
+      headers: { host: 'hk.im.codes' },
+    });
+    expect(replayRes.status).toBe(401);
+
+    // At (exp + 1) * 1000ms, verifyJwt itself expires
+    vi.setSystemTime((payload.exp + 1) * 1000);
+    const expiredRes = await app.request(`https://hk.im.codes/api/auth/github/callback?relay_token=${encodeURIComponent(relayToken)}`, {
+      headers: { host: 'hk.im.codes' },
+    });
+    expect(expiredRes.status).toBe(401);
   });
 });

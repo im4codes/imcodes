@@ -698,11 +698,12 @@ function createInMemoryDb() {
         if (r) r.revoked_at = now;
         return { changes: r ? 1 : 0 };
       }
-      if (normSql.startsWith('DELETE FROM passkey_challenges WHERE display_name = $1 AND expires_at < $2')) {
-        const [displayName, cutoff] = params as [string, number];
+      if (normSql.startsWith('DELETE FROM passkey_challenges WHERE id LIKE $1 AND expires_at < $2')) {
+        const prefix = String(params[0]).replace(/%$/, '');
+        const cutoff = Number(params[1]);
         let deleted = 0;
         for (const [id, row] of passkeyChallenges.entries()) {
-          if ((row as { display_name?: string }).display_name === displayName && row.expires_at < Number(cutoff)) {
+          if (id.startsWith(prefix) && row.expires_at < Number(cutoff)) {
             passkeyChallenges.delete(id);
             deleted++;
           }
@@ -710,7 +711,11 @@ function createInMemoryDb() {
         return { changes: deleted };
       }
       if (normSql.startsWith('DELETE FROM passkey_challenges WHERE id = $1')) {
-        passkeyChallenges.delete(params[0] as string);
+        const id = String(params[0]);
+        if (normSql.includes('id NOT LIKE $2') && id.startsWith(String(params[1]).replace(/%$/, ''))) {
+          return { changes: 0 };
+        }
+        passkeyChallenges.delete(id);
         return { changes: 1 };
       }
       if (normSql.startsWith('UPDATE passkey_credentials SET counter = $1')) {

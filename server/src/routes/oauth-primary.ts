@@ -6,7 +6,6 @@ import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import type { Env } from '../env.js';
 import { createUser, getSetting, getUserByPlatformId, updateUserStatus, upsertPlatformIdentity, withTransaction } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
-import { rateLimiter } from '../security/lockout.js';
 import { alignedSessionIssuedAt, evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
 import logger from '../util/logger.js';
 
@@ -154,7 +153,13 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
         if (!consumedNonce || consumedNonce.user_id !== payload.sub) {
           return { ok: false as const, status: 401 as const, error: 'relay_token_replayed' };
         }
-        const access = await loadUserAccess(tx, payload.sub);
+        const lockedUser = await tx.queryOne<{ status: string; sessions_valid_after: string | number }>(
+          'SELECT status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+          [payload.sub],
+        );
+        const access = lockedUser
+          ? { status: lockedUser.status, sessionsValidAfter: Number(lockedUser.sessions_valid_after ?? 0) || 0 }
+          : null;
         const relayDecision = evaluateUserAccess(access);
         if (!relayDecision.ok) {
           return { ok: false as const, status: 403 as const, error: relayDecision.code };
@@ -172,9 +177,6 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
       });
       if (!relayResult.ok) {
         return c.json({ error: relayResult.error }, relayResult.status);
-      }
-      if (!rateLimiter.consumeJti(relayNonce, 120_000)) {
-        return c.json({ error: 'relay_token_replayed' }, 401);
       }
       userId = payload.sub;
       accessToken = relayResult.token;
@@ -250,9 +252,11 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
       if (isCrossDomain && targetOrigin) {
         const jti = randomHex(16);
         const now = Date.now();
+        const issuedSec = Math.floor(now / 1000);
+        const relayExpSec = issuedSec + 120;
         const relayNonce = `${OAUTH_RELAY_KEY_ID}:${jti}`;
-        // Cover the full integer-second verifyJwt acceptance window for a 120s token.
-        const nonceExpiresAt = (Math.floor(now / 1000) + 121) * 1000;
+        // Cover the full verifyJwt validity window of the signed exp claim even if the transaction crosses a second boundary.
+        const nonceExpiresAt = (relayExpSec + 1) * 1000;
         await withTransaction(c.env.DB, async (tx) => {
           await tx.execute(
             'DELETE FROM auth_nonces WHERE key_id = $1 AND expires_at < $2',
@@ -264,7 +268,15 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
           );
         });
         const relay = signJwt(
-          { sub: userId, type: 'auth-relay', origin: targetOrigin, jti, ...(desktopCallback ? { desktopCallback } : {}) },
+          {
+            sub: userId,
+            type: 'auth-relay',
+            origin: targetOrigin,
+            jti,
+            iat: issuedSec,
+            exp: relayExpSec,
+            ...(desktopCallback ? { desktopCallback } : {}),
+          },
           c.env.JWT_SIGNING_KEY,
           120,
         );
@@ -274,16 +286,29 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
         return c.redirect(relayUrl.toString());
       }
 
-      const now = Date.now();
-      await c.env.DB.execute(
-        'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-        [refreshId, userId, refreshHash, familyId, now + 30 * 24 * 3600 * 1000, now],
-      );
-      accessToken = signJwt(
-        { sub: userId, type: ACCOUNT_SESSION_JWT_TYPE, iat: alignedSessionIssuedAt(loginAccess?.sessionsValidAfter ?? 0, now) },
-        c.env.JWT_SIGNING_KEY,
-        4 * 3600,
-      );
+      const sessionTx = await withTransaction(c.env.DB, async (tx) => {
+        const lockedUser = await tx.queryOne<{ status: string; sessions_valid_after: string | number }>(
+          'SELECT status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+          [userId],
+        );
+        const txDecision = evaluateUserAccess(
+          lockedUser ? { status: lockedUser.status, sessionsValidAfter: Number(lockedUser.sessions_valid_after ?? 0) || 0 } : null,
+        );
+        if (!txDecision.ok) return { ok: false as const, code: txDecision.code };
+        const txNow = Date.now();
+        await tx.execute(
+          'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+          [refreshId, userId, refreshHash, familyId, txNow + 30 * 24 * 3600 * 1000, txNow],
+        );
+        const token = signJwt(
+          { sub: userId, type: ACCOUNT_SESSION_JWT_TYPE, iat: alignedSessionIssuedAt(Number(lockedUser!.sessions_valid_after ?? 0) || 0, txNow) },
+          c.env.JWT_SIGNING_KEY,
+          4 * 3600,
+        );
+        return { ok: true as const, token };
+      });
+      if (!sessionTx.ok) return c.json({ error: sessionTx.code }, 403);
+      accessToken = sessionTx.token;
     }
 
     const isSecure = c.env.NODE_ENV === 'production';

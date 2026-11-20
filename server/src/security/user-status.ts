@@ -53,11 +53,13 @@ export function alignedSessionIssuedAt(sessionsValidAfter: number, nowMs = Date.
 }
 
 /**
- * Next `sessions_valid_after` timestamp (ms) for a password change.
- * Advances strictly past both the current second and any prior second-rounded token boundary
- * so consecutive same-second password changes invalidate prior replacement JWTs.
+ * Next `sessions_valid_after` timestamp (ms) for a session-ending event
+ * (password change or admin user disable).
+ * Advances strictly past both the current second and any prior second-rounded
+ * issued token boundary so neither existing sessions nor same-second rotated/minted
+ * sessions survive the revocation boundary.
  */
-export function nextPasswordChangeValidAfter(previousValidAfter: number, nowMs = Date.now()): number {
+export function nextSessionValidAfter(previousValidAfter: number, nowMs = Date.now()): number {
   const nowSec = Math.floor(nowMs / 1000);
   const minAfterPrevBoundary = previousValidAfter > 0 ? Math.ceil(previousValidAfter / 1000) * 1000 + 1 : 0;
   return Math.max(nowMs, nowSec * 1000 + 1, minAfterPrevBoundary);

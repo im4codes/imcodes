@@ -11,6 +11,7 @@ import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
 import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
 import { deleteTokenUsageFactsForServer } from './token-usage-queries.js';
 import { insertControlledServerWithNodeId } from '../services/controlled-node-identity.js';
+import { nextSessionValidAfter } from '../security/user-status.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -285,9 +286,15 @@ export interface DisabledUserSessionsEnded {
  */
 export async function disableUserEndingSessions(db: Database, userId: string, now: number): Promise<DisabledUserSessionsEnded> {
   return db.transaction(async (tx) => {
+    const lockedUser = await tx.queryOne<{ sessions_valid_after: string | number }>(
+      'SELECT sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    const prevValidAfter = Number(lockedUser?.sessions_valid_after ?? 0) || 0;
+    const nextValidAfter = nextSessionValidAfter(prevValidAfter, now);
     await tx.execute(
       'UPDATE users SET status = $1, sessions_valid_after = GREATEST(sessions_valid_after, $2) WHERE id = $3',
-      [USER_STATUS.DISABLED, now, userId],
+      [USER_STATUS.DISABLED, nextValidAfter, userId],
     );
     const keys = await tx.execute('UPDATE api_keys SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL', [now, userId]);
     const refresh = await tx.execute('UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL', [now, userId]);

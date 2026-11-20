@@ -30,7 +30,7 @@ export function signJwt(payload: Record<string, unknown>, signingKey: string, ex
   const claims = b64url(JSON.stringify({
     ...payload,
     iat: typeof payload.iat === 'number' ? payload.iat : nowSec,
-    exp: nowSec + expiresInSecs,
+    exp: typeof payload.exp === 'number' ? payload.exp : nowSec + expiresInSecs,
   }));
   const signingInput = `${header}.${claims}`;
   const sig = createHmac('sha256', signingKey).update(signingInput).digest();
