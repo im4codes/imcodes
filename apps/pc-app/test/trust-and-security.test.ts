@@ -258,16 +258,47 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
     expect(askPermission('clipboard-read', 'https://app.im.codes/chat')).toBe(true);
     expect(askPermission('clipboard-sanitized-write', 'https://app.im.codes/chat')).toBe(true);
     expect(askPermission('media', 'https://app.im.codes/call')).toBe(true);
+    expect(askPermission('fullscreen', 'https://app.im.codes/remote-desktop')).toBe(true);
+    expect(askPermission('keyboardLock', 'https://app.im.codes/remote-desktop')).toBe(true);
     expect(askPermission('geolocation', 'https://app.im.codes/chat')).toBe(false);
     expect(askPermission('notifications', 'https://app.im.codes/chat')).toBe(false);
+    expect(askPermission('openExternal', 'https://app.im.codes/chat')).toBe(false);
     expect(askPermission('clipboard-read', 'https://evil.example/frame')).toBe(false);
+    expect(askPermission('fullscreen', 'https://evil.example/frame')).toBe(false);
+    expect(askPermission('keyboardLock', 'https://evil.example/frame')).toBe(false);
+    expect(askPermission('fullscreen', 'https://second.im.codes/frame')).toBe(false);
+    expect(askPermission('keyboardLock', 'https://second.im.codes/frame')).toBe(false);
     expect(askPermission('clipboard-read', 'https://app.im.codes/chat', {})).toBe(false);
+    expect(askPermission('fullscreen', 'https://app.im.codes/remote-desktop', {})).toBe(false);
+    expect(askPermission('keyboardLock', 'https://app.im.codes/remote-desktop', {})).toBe(false);
     expect(session.permissionCheckHandler!(wc, 'clipboard-read', 'https://app.im.codes')).toBe(true);
+    expect(session.permissionCheckHandler!(wc, 'fullscreen', 'https://app.im.codes')).toBe(true);
+    expect(session.permissionCheckHandler!(wc, 'keyboardLock', 'https://app.im.codes')).toBe(true);
+    expect(session.permissionCheckHandler!(wc, 'fullscreen', 'https://evil.example')).toBe(false);
+    expect(session.permissionCheckHandler!(wc, 'keyboardLock', 'https://evil.example')).toBe(false);
+    expect(session.permissionCheckHandler!({}, 'fullscreen', 'https://app.im.codes')).toBe(false);
+    expect(session.permissionCheckHandler!({}, 'keyboardLock', 'https://app.im.codes')).toBe(false);
     expect(session.permissionCheckHandler!(wc, 'geolocation', 'https://app.im.codes')).toBe(false);
+    expect(session.permissionCheckHandler!(wc, 'openExternal', 'https://app.im.codes')).toBe(false);
 
     // If active page drifted to untrusted URL, permission check/request denies
     wc.url = 'https://evil.example';
     expect(askPermission('clipboard-read', 'https://app.im.codes/chat')).toBe(false);
+    expect(askPermission('fullscreen', 'https://app.im.codes/remote-desktop')).toBe(false);
+    expect(askPermission('keyboardLock', 'https://app.im.codes/remote-desktop')).toBe(false);
+    expect(session.permissionCheckHandler!(wc, 'fullscreen', 'https://app.im.codes')).toBe(false);
+    expect(session.permissionCheckHandler!(wc, 'keyboardLock', 'https://app.im.codes')).toBe(false);
+    wc.url = 'https://app.im.codes/home';
+
+    // On welcome screen (activeOrigin === null), fullscreen & keyboardLock are denied
+    const prevActiveOrigin = activeOrigin;
+    activeOrigin = null;
+    wc.url = 'data:text/html;charset=utf-8,<h1>welcome</h1>';
+    expect(askPermission('fullscreen', 'https://app.im.codes/remote-desktop')).toBe(false);
+    expect(askPermission('keyboardLock', 'https://app.im.codes/remote-desktop')).toBe(false);
+    expect(session.permissionCheckHandler!(wc, 'fullscreen', 'https://app.im.codes')).toBe(false);
+    expect(session.permissionCheckHandler!(wc, 'keyboardLock', 'https://app.im.codes')).toBe(false);
+    activeOrigin = prevActiveOrigin;
     wc.url = 'https://app.im.codes/home';
 
     // 5. will-download synchronously prompts save dialog & cancels on reject/cancel
@@ -311,6 +342,33 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
         currentPageOrigin: 'https://app.im.codes',
       }),
     ).toBe(true);
+    expect(
+      isAllowedPermissionRequest({
+        requestingUrl: 'https://app.im.codes',
+        permission: 'fullscreen',
+        activeOrigin: 'https://app.im.codes',
+        trustedOrigins: trusted,
+        currentPageOrigin: 'https://app.im.codes',
+      }),
+    ).toBe(true);
+    expect(
+      isAllowedPermissionRequest({
+        requestingUrl: 'https://app.im.codes',
+        permission: 'keyboardLock',
+        activeOrigin: 'https://app.im.codes',
+        trustedOrigins: trusted,
+        currentPageOrigin: 'https://app.im.codes',
+      }),
+    ).toBe(true);
+    expect(
+      isAllowedPermissionRequest({
+        requestingUrl: 'https://app.im.codes',
+        permission: 'fullscreen',
+        activeOrigin: null,
+        trustedOrigins: trusted,
+        currentPageOrigin: 'https://app.im.codes',
+      }),
+    ).toBe(false);
   });
 
   it('rejects imcodes-welcome.local virtual actions when a remote origin is loaded or current page is not data:text/html welcome', async () => {
