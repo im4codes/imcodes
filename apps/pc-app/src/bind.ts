@@ -1,7 +1,8 @@
 import { execFile, spawn, type SpawnOptions } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { normalizeServerOrigin } from './servers.js';
 
 /** Matches shared/cookie-names.ts COOKIE_SESSION without breaking pc-app's rootDir. */
 export const COOKIE_SESSION = 'rcc_session';
@@ -113,6 +114,15 @@ export interface BindCoordinatorDeps {
   runCli?: CliRunner;
   mintTimeoutMs?: number;
   cliTimeoutMs?: number;
+  keptBindingStorePath?: string;
+}
+
+export function tryNormalizeServerOrigin(raw: string): string | null {
+  try {
+    return normalizeServerOrigin(raw);
+  } catch {
+    return null;
+  }
 }
 
 export interface BundledTmuxEnvResult {
@@ -540,6 +550,8 @@ export class BindCoordinator {
   private readonly runCli: CliRunner;
   private readonly mintTimeoutMs: number;
   private readonly cliTimeoutMs: number;
+  private readonly keptBindingStorePath: string | null;
+  private keptBindings: Record<string, string>;
 
   constructor(private readonly deps: BindCoordinatorDeps) {
     this.baseEnv = deps.env ?? process.env;
@@ -552,10 +564,72 @@ export class BindCoordinator {
     this.runCli = deps.runCli ?? defaultRunCli;
     this.mintTimeoutMs = deps.mintTimeoutMs ?? 15_000;
     this.cliTimeoutMs = deps.cliTimeoutMs ?? 120_000;
+    this.keptBindingStorePath = deps.keptBindingStorePath?.trim() || null;
+    this.keptBindings = this.loadPersistedKeptBindings();
 
     deps.onDidNavigateTrustedOrigin((origin) => {
       void this.maybeBind(origin);
     });
+  }
+
+  private loadPersistedKeptBindings(): Record<string, string> {
+    if (!this.keptBindingStorePath) return {};
+    try {
+      if (!this.checkExists(this.keptBindingStorePath)) return {};
+      const raw = this.readFile(this.keptBindingStorePath, 'utf8');
+      const parsed = JSON.parse(raw) as { version?: unknown; kept?: unknown } | null;
+      if (!parsed || typeof parsed !== 'object' || parsed.version !== 1 || !parsed.kept || typeof parsed.kept !== 'object') {
+        return {};
+      }
+      const result: Record<string, string> = {};
+      for (const [targetOrigin, existingOrigin] of Object.entries(parsed.kept as Record<string, unknown>)) {
+        if (typeof targetOrigin === 'string' && targetOrigin && typeof existingOrigin === 'string' && existingOrigin) {
+          result[targetOrigin] = existingOrigin;
+        }
+      }
+      return result;
+    } catch {
+      return {};
+    }
+  }
+
+  private persistKeptBindings(): void {
+    if (!this.keptBindingStorePath) return;
+    const dir = path.dirname(this.keptBindingStorePath);
+    const tmpPath = `${this.keptBindingStorePath}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writeFileSync(
+        tmpPath,
+        JSON.stringify({ version: 1, kept: this.keptBindings }, null, 2),
+        { encoding: 'utf8', mode: 0o600 },
+      );
+      renameSync(tmpPath, this.keptBindingStorePath);
+    } catch {
+      try {
+        rmSync(tmpPath, { force: true });
+      } catch {
+        // Ignore cleanup failure when storage dir is unwritable.
+      }
+    }
+  }
+
+  private hasPersistedKeptBinding(existingKey: string, targetOrigin: string): boolean {
+    if (!this.keptBindingStorePath) return false;
+    return this.keptBindings[targetOrigin] === existingKey;
+  }
+
+  private recordPersistedKeptBinding(existingKey: string, targetOrigin: string): void {
+    if (!this.keptBindingStorePath) return;
+    this.keptBindings[targetOrigin] = existingKey;
+    this.persistKeptBindings();
+  }
+
+  private clearPersistedKeptBinding(targetOrigin: string): void {
+    if (!this.keptBindingStorePath) return;
+    if (!(targetOrigin in this.keptBindings)) return;
+    delete this.keptBindings[targetOrigin];
+    this.persistKeptBindings();
   }
 
   getBoundSummary(): BoundServerSummary | null {
@@ -573,6 +647,8 @@ export class BindCoordinator {
   clearAskedState(origin: string): void {
     this.clearEpochs.set(origin, (this.clearEpochs.get(origin) ?? 0) + 1);
     this.askedThisLogin.delete(origin);
+    const targetOrigin = tryNormalizeServerOrigin(origin) ?? origin;
+    this.clearPersistedKeptBinding(targetOrigin);
   }
 
   hasAskedThisLogin(origin: string): boolean {
@@ -590,12 +666,16 @@ export class BindCoordinator {
     if (this.attachedSessions.has(cookies)) return;
     this.attachedSessions.add(cookies);
 
-    cookies.on('changed', (_event, cookie, _cause, removed) => {
+    cookies.on('changed', (_event, cookie, cause, removed) => {
       const origin = this.deps.getCurrentTrustedOrigin();
       if (!origin) return;
       if (!sameOriginCookie(cookie, origin)) return;
       if (removed) {
-        this.clearAskedState(origin);
+        // Chromium dispatches (removed: true, cause: 'overwrite') right before
+        // (removed: false, cause: 'explicit') on sliding Set-Cookie renewals.
+        if (cause !== 'overwrite') {
+          this.clearAskedState(origin);
+        }
         return;
       }
       void this.maybeBind(origin, cookies);
@@ -675,15 +755,27 @@ export class BindCoordinator {
         readFileSync: this.readFile,
       });
 
+      const targetOrigin = tryNormalizeServerOrigin(origin) ?? origin;
       if (existing) {
-        if (!opts.manual && this.askedThisLogin.has(origin)) {
+        const existingOrigin = tryNormalizeServerOrigin(existing.workerUrl);
+        if (!opts.manual && existingOrigin !== null && existingOrigin === targetOrigin) {
+          return { status: 'kept_existing' };
+        }
+        const existingKey = existingOrigin ?? existing.workerUrl;
+        if (
+          !opts.manual &&
+          (this.askedThisLogin.has(origin) || this.hasPersistedKeptBinding(existingKey, targetOrigin))
+        ) {
           return { status: 'already_asked' };
         }
         const clearEpochAtPrompt = this.clearEpochs.get(origin) ?? 0;
         const replace = await this.askReplaceBinding(existing, origin);
-        // Only record asked state if a logout (`removed: true`) did not clear this login meanwhile.
+        // Only record asked state if a logout (`removed: true`, non-overwrite) did not clear this login meanwhile.
         if ((this.clearEpochs.get(origin) ?? 0) === clearEpochAtPrompt) {
           this.askedThisLogin.add(origin);
+          if (!replace) {
+            this.recordPersistedKeptBinding(existingKey, targetOrigin);
+          }
         }
         if (!replace) {
           return { status: 'kept_existing' };
@@ -691,6 +783,7 @@ export class BindCoordinator {
       }
 
       await this.performBind(origin, authoritative.value);
+      this.clearPersistedKeptBinding(targetOrigin);
       return { status: 'bound' };
     } catch (err) {
       const bindErr =

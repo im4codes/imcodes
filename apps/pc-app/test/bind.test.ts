@@ -23,7 +23,7 @@ import { MAIN_WINDOW_WEB_PREFERENCES } from '../src/security.js';
 import { createPcAppShell, type ShellWindowLike } from '../src/shell.js';
 
 function createFakeCookies(initial: Record<string, CookieLike[]> = {}): CookiesChangeEventLike & {
-  emitChanged: (cookie: CookieLike, removed: boolean) => void;
+  emitChanged: (cookie: CookieLike, removed: boolean, cause?: unknown) => void;
   setCookie: (url: string, cookie: CookieLike | null) => void;
   getCalls: Array<{ url: string; name: string }>;
 } {
@@ -39,8 +39,8 @@ function createFakeCookies(initial: Record<string, CookieLike[]> = {}): CookiesC
       const list = byUrl.get(filter.url) ?? [];
       return list.filter((c) => c.name === filter.name);
     },
-    emitChanged: (cookie, removed) => {
-      emitter.emit('changed', {}, cookie, 'explicit', removed);
+    emitChanged: (cookie, removed, cause = 'explicit') => {
+      emitter.emit('changed', {}, cookie, cause, removed);
     },
     setCookie: (url, cookie) => {
       if (cookie === null) {
@@ -994,5 +994,254 @@ describe('PC App V1 Phase B: bind flow, replace prompt, bundled tmux, and Launch
     const raceOutcome = await pendingPrompt;
     expect(raceOutcome.status).toBe('kept_existing');
     expect(coordLogoutRace.hasAskedThisLogin('https://spawn.im.codes')).toBe(false);
+  });
+
+  it('never prompts automatically when already bound to the same normalized origin, while still allowing manual rebind', async () => {
+    const serverJsonPath = path.join(imcodesHome, 'server.json');
+    writeFileSync(
+      serverJsonPath,
+      JSON.stringify({
+        serverId: 'srv_same',
+        token: 'tok_same',
+        workerUrl: 'https://im.zhinet.work/',
+        serverName: 'M3',
+        boundAt: 1000,
+      }),
+    );
+
+    const cookies = createFakeCookies({
+      'https://im.zhinet.work': [{ name: COOKIE_SESSION, value: 'jwt-same' }],
+    });
+    const prompts: BindMessageBoxOptions[] = [];
+    const fetchSpy = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ id: 'k_same', apiKey: 'deck_same_1' }), { status: 201 }),
+    );
+    const cliSpy = vi.fn(async (): Promise<CliRunResult> => ({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+    }));
+
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir,
+      createMainWindow: (opts) => createFakeShellWindow({ webPreferences: opts.webPreferences, cookies }),
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: () => {},
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async (_win, opts) => {
+        prompts.push(opts);
+        return { response: 1 };
+      },
+      bindDeps: {
+        imcodesHome,
+        resourcesPath,
+        plistPath,
+        hostname: () => 'M3',
+        probeSystemTmux: () => true,
+        fetch: fetchSpy as unknown as typeof globalThis.fetch,
+        runCli: cliSpy,
+      },
+    });
+
+    await shell.addAndSelectServer('https://im.zhinet.work:443');
+
+    // Auto cookie event & renewal + explicit maybeBind must emit 0 prompts and return kept_existing.
+    cookies.emitChanged({ name: COOKIE_SESSION, domain: 'im.zhinet.work', path: '/' }, false);
+    cookies.emitChanged({ name: COOKIE_SESSION, domain: 'im.zhinet.work', path: '/' }, true, 'overwrite');
+    cookies.emitChanged({ name: COOKIE_SESSION, domain: 'im.zhinet.work', path: '/' }, false, 'explicit');
+    await vi.waitFor(() => {
+      expect(shell.bind.isInFlight('https://im.zhinet.work')).toBe(false);
+    });
+    const autoOutcome = await shell.bind.maybeBind('https://im.zhinet.work');
+    expect(autoOutcome.status).toBe('kept_existing');
+    expect(prompts).toHaveLength(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Even if server.json has default :443 port and trailing slash variants, same-origin check stays silent.
+    writeFileSync(
+      serverJsonPath,
+      JSON.stringify({
+        serverId: 'srv_same',
+        token: 'tok_same',
+        workerUrl: 'https://im.zhinet.work:443',
+        serverName: 'M3',
+        boundAt: 1000,
+      }),
+    );
+    expect((await shell.bind.maybeBind('https://im.zhinet.work')).status).toBe('kept_existing');
+    expect(prompts).toHaveLength(0);
+
+    // Malformed existing workerUrl falls back safely without throwing.
+    writeFileSync(
+      serverJsonPath,
+      JSON.stringify({
+        serverId: 'srv_bad',
+        token: 'tok_bad',
+        workerUrl: 'not-a-valid-url',
+        serverName: 'Bad',
+        boundAt: 1000,
+      }),
+    );
+    await expect(shell.bind.maybeBind('https://im.zhinet.work')).resolves.toEqual({ status: 'bound' });
+    expect(prompts).toHaveLength(1);
+
+    // Restore valid same-origin server.json and verify explicit manual menu bind still prompts.
+    writeFileSync(
+      serverJsonPath,
+      JSON.stringify({
+        serverId: 'srv_same',
+        token: 'tok_same',
+        workerUrl: 'https://im.zhinet.work',
+        serverName: 'M3',
+        boundAt: 1000,
+      }),
+    );
+    const manualOutcome = await shell.bind.triggerManualBind();
+    expect(manualOutcome.status).toBe('bound');
+    expect(prompts).toHaveLength(2);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves Keep Existing across Set-Cookie overwrite renewals and app restarts, and degrades gracefully on bad store', async () => {
+    const serverJsonPath = path.join(imcodesHome, 'server.json');
+    const initialServerJson = JSON.stringify({
+      serverId: 'srv_a',
+      token: 'tok_a',
+      workerUrl: 'https://server-a.example',
+      serverName: 'BoxA',
+      boundAt: 1000,
+    });
+    writeFileSync(serverJsonPath, initialServerJson);
+
+    const cookies = createFakeCookies({
+      'https://server-b.example': [{ name: COOKIE_SESSION, value: 'jwt-b' }],
+    });
+    const prompts1: BindMessageBoxOptions[] = [];
+    const shell1 = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir,
+      createMainWindow: (opts) => createFakeShellWindow({ webPreferences: opts.webPreferences, cookies }),
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: () => {},
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async (_win, opts) => {
+        prompts1.push(opts);
+        return { response: 0 }; // Keep Existing
+      },
+      bindDeps: {
+        imcodesHome,
+        resourcesPath,
+        plistPath,
+      },
+    });
+
+    await shell1.addAndSelectServer('https://server-b.example');
+    cookies.emitChanged({ name: COOKIE_SESSION, domain: 'server-b.example', path: '/' }, false, 'explicit');
+    await vi.waitFor(() => {
+      expect(prompts1).toHaveLength(1);
+    });
+    expect(shell1.bind.hasAskedThisLogin('https://server-b.example')).toBe(true);
+
+    // Chromium sliding Set-Cookie renewal: (removed: true, cause: 'overwrite') then (removed: false, cause: 'explicit')
+    cookies.emitChanged({ name: COOKIE_SESSION, domain: 'server-b.example', path: '/' }, true, 'overwrite');
+    expect(shell1.bind.hasAskedThisLogin('https://server-b.example')).toBe(true);
+    cookies.emitChanged({ name: COOKIE_SESSION, domain: 'server-b.example', path: '/' }, false, 'explicit');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(prompts1).toHaveLength(1);
+    expect((await shell1.bind.maybeBind('https://server-b.example')).status).toBe('already_asked');
+
+    // Real logout (removed: true, cause: 'explicit') clears both in-memory and persisted Keep Existing state.
+    cookies.emitChanged({ name: COOKIE_SESSION, domain: 'server-b.example', path: '/' }, true, 'explicit');
+    expect(shell1.bind.hasAskedThisLogin('https://server-b.example')).toBe(false);
+
+    // Re-prompt once on fresh login after real logout, then Keep Existing persists again for restart check.
+    expect((await shell1.bind.maybeBind('https://server-b.example')).status).toBe('kept_existing');
+    expect(prompts1).toHaveLength(2);
+
+    // Simulated app restart (new BindCoordinator reading kept-bindings.json in userDataDir): still no prompt, server.json untouched.
+    const prompts2: BindMessageBoxOptions[] = [];
+    const shell2 = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir,
+      createMainWindow: (opts) => createFakeShellWindow({ webPreferences: opts.webPreferences, cookies }),
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: () => {},
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async (_win, opts) => {
+        prompts2.push(opts);
+        return { response: 0 };
+      },
+      bindDeps: {
+        imcodesHome,
+        resourcesPath,
+        plistPath,
+      },
+    });
+    await shell2.ensureWindow();
+    expect((await shell2.bind.maybeBind('https://server-b.example')).status).toBe('already_asked');
+    expect(prompts2).toHaveLength(0);
+    expect(readFileSync(serverJsonPath, 'utf8')).toBe(initialServerJson);
+
+    // If machine rebinds to server-c, persisted (server-a -> server-b) does not suppress prompting for (server-c -> server-b).
+    writeFileSync(
+      serverJsonPath,
+      JSON.stringify({
+        serverId: 'srv_c',
+        token: 'tok_c',
+        workerUrl: 'https://server-c.example',
+        serverName: 'BoxC',
+        boundAt: 2000,
+      }),
+    );
+    expect((await shell2.bind.maybeBind('https://server-b.example')).status).toBe('kept_existing');
+    expect(prompts2).toHaveLength(1);
+
+    // Corrupt or unwritable kept-bindings.json path degrades silently to in-memory dedupe without throwing.
+    const blockedDirAsFile = path.join(tempRoot, 'not-a-directory');
+    writeFileSync(blockedDirAsFile, 'blocker');
+    const corruptCoord = new BindCoordinator({
+      platform: 'darwin',
+      imcodesHome,
+      resourcesPath,
+      plistPath,
+      keptBindingStorePath: path.join(blockedDirAsFile, 'kept-bindings.json'),
+      getCurrentTrustedOrigin: () => 'https://server-b.example',
+      onDidNavigateTrustedOrigin: () => () => {},
+      showMessageBox: async () => ({ response: 0 }),
+      showNotification: () => {},
+    });
+    expect((await corruptCoord.maybeBind('https://server-b.example', cookies)).status).toBe('kept_existing');
+    expect((await corruptCoord.maybeBind('https://server-b.example', cookies)).status).toBe('already_asked');
+
+    const corruptJsonPath = path.join(tempRoot, 'corrupt-kept.json');
+    writeFileSync(corruptJsonPath, '{corrupt json');
+    const corruptJsonCoord = new BindCoordinator({
+      platform: 'darwin',
+      imcodesHome,
+      resourcesPath,
+      plistPath,
+      keptBindingStorePath: corruptJsonPath,
+      getCurrentTrustedOrigin: () => 'https://server-b.example',
+      onDidNavigateTrustedOrigin: () => () => {},
+      showMessageBox: async () => ({ response: 0 }),
+      showNotification: () => {},
+    });
+    expect((await corruptJsonCoord.maybeBind('https://server-b.example', cookies)).status).toBe('kept_existing');
   });
 });

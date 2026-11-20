@@ -1,3 +1,4 @@
+import path from 'node:path';
 import {
   BindCoordinator,
   type BindCoordinatorDeps,
@@ -107,6 +108,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
   let mainWindow: ShellWindowLike | null = null;
   const controller = new TrustedOriginController(store, () => mainWindow);
   const bind = new BindCoordinator({
+    keptBindingStorePath: path.join(deps.userDataDir, 'kept-bindings.json'),
     ...(deps.bindDeps ?? {}),
     platform: deps.platform,
     getCurrentTrustedOrigin: () => controller.currentTrustedOrigin(),
