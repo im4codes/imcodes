@@ -1843,14 +1843,14 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         el.blur();
       });
 
-      // 2. Slide-hold (>=65ms move, >100ms promote) whose startListening resolves false MUST still focus composer so real typing succeeds
+      // 2. Slide-hold (>=90ms move, >145ms promote) whose startListening resolves false MUST still focus composer so real typing succeeds
       await page.evaluate(async ({ x, y }) => {
         (window as any).__voiceCalls.nextStartResult = false;
         const el = document.querySelector('.controls-input')!;
         el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 70));
+        await new Promise((r) => setTimeout(r, 100));
         el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x + 22, clientY: y + 1, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 45));
+        await new Promise((r) => setTimeout(r, 58));
         el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x + 22, clientY: y + 1, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
       }, { x: cx, y: cy });
 
@@ -1883,9 +1883,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         (window as any).__voiceCalls.nextStartResult = true;
         const el = document.querySelector('.controls-input')!;
         el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 70));
+        await new Promise((r) => setTimeout(r, 100));
         el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x + 20, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 45));
+        await new Promise((r) => setTimeout(r, 58));
         el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x - 110, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
         el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x - 110, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
         await new Promise((r) => setTimeout(r, 20));
@@ -1934,7 +1934,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         const stopsBeforeHold = (window as any).__voiceCalls.stop;
         (window as any).__voiceCalls.nextStartResult = true;
         el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 5, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 120));
+        await new Promise((r) => setTimeout(r, 195));
         el.dispatchEvent(new PointerEvent('lostpointercapture', { bubbles: true, pointerId: 5, pointerType: 'touch', buttons: 0 }));
         await new Promise((r) => setTimeout(r, 90));
         const hudWhileHolding = !!document.querySelector('.voice-hold-hud');
@@ -2010,7 +2010,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
           pendingShadow,
         };
 
-        // 5b. Rapid Tap1 (25ms) -> Tap2 (85ms) -> immediate Hold3 (125ms) with buffered transcript replay & instant HUD backdrop
+        // 5b. Rapid Tap1 (25ms) -> Tap2 (85ms) -> immediate Hold3 (195ms) with buffered transcript replay & instant HUD backdrop
         (window as any).__sentCommands = [];
         const haptic0 = (window as any).__voiceCalls.haptic;
         for (const [pid, dur] of [[11, 25], [12, 85]] as const) {
@@ -2026,7 +2026,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         (window as any).__voiceCalls.nextStartResult = true;
         (window as any).__voiceCalls.nextBufferedText = '首字秒出';
         el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 13, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 125));
+        await new Promise((r) => setTimeout(r, 195));
         const hud = document.querySelector('.voice-hold-hud') as HTMLElement | null;
         const hudPhase = hud?.getAttribute('data-phase');
         const hudTransition = hud ? getComputedStyle(hud).transitionProperty : '';
@@ -2040,7 +2040,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         await new Promise((r) => setTimeout(r, 20));
         (window as any).__voiceCalls.nextBufferedText = '右滑编辑';
         el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 14, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 125));
+        await new Promise((r) => setTimeout(r, 195));
         window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x + 75, clientY: y, pointerId: 14, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
         await new Promise((r) => setTimeout(r, 20));
         const editZone = document.querySelector('.voice-hold-hud')?.getAttribute('data-zone');
