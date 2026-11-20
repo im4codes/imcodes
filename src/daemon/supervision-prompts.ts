@@ -777,7 +777,7 @@ export function buildSupervisionMessagingContract(): string {
       materialize: 'once_after_open_audit',
       eligibility: SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
       recovery: 'boot_sweep',
-      failure: 'Brain_same_object_manual_exact_route',
+      failure: 'Brain_same_object_exact',
       successChatter: false,
     },
     blocker: { immediateReply: true, fields: AGENT_DELEGATION_BLOCKER_REPORT_FIELDS },
@@ -806,7 +806,7 @@ export function buildSupervisionMessagingContract(): string {
       needsInput: 'only_when_brain_also_lacks_external_information',
     },
     determinate: {
-      direct: ['exact_pass_or_rework', 'unique_auditor_delivery', 'evidence_determined_repair'],
+      direct: ['exact_pass_or_rework', 'unique_auditor', 'evidence_repair'],
       brainChatter: false,
     },
     heartbeat: {
