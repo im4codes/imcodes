@@ -23509,18 +23509,18 @@ html.native-ios-mac .global-task-mode-entry-btn {
   overflow-y: auto;
   overscroll-behavior-x: none;
   touch-action: pan-y;
-  padding: 12px 14px 20px;
+  padding: 8px 10px 14px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 8px;
 }
 
 .global-task-quickbar {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 6px;
-  padding: 8px 10px;
+  gap: 4px;
+  padding: 5px 8px;
   border-radius: 10px;
   border: 1px solid rgba(148, 163, 184, 0.16);
   background: rgba(15, 23, 42, 0.68);
@@ -23548,8 +23548,8 @@ html.native-ios-mac .global-task-mode-entry-btn {
 .global-task-quickbar-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  gap: 6px;
-  max-height: 76px;
+  gap: 4px;
+  max-height: 58px;
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
@@ -23564,12 +23564,12 @@ html.native-ios-mac .global-task-mode-entry-btn {
   min-width: 0;
   width: 100%;
   box-sizing: border-box;
-  padding: 4px 8px;
-  border-radius: 8px;
+  padding: 3px 6px;
+  border-radius: 7px;
   border: 1px solid rgba(148, 163, 184, 0.22);
   background: rgba(30, 41, 59, 0.72);
   color: #e2e8f0;
-  font-size: 12px;
+  font-size: 11px;
   cursor: pointer;
   user-select: none;
 }
@@ -23622,7 +23622,7 @@ html.native-ios-mac .global-task-mode-entry-btn {
 .global-task-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 6px;
   min-width: 0;
   max-width: 100%;
   box-sizing: border-box;
@@ -23630,8 +23630,8 @@ html.native-ios-mac .global-task-mode-entry-btn {
 
 .global-task-mode-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+  gap: 6px;
   min-width: 0;
   max-width: 100%;
   box-sizing: border-box;
@@ -23640,9 +23640,9 @@ html.native-ios-mac .global-task-mode-entry-btn {
 .global-task-card {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 12px;
-  border-radius: 10px;
+  gap: 4px;
+  padding: 7px 9px;
+  border-radius: 8px;
   border: 1px solid rgba(148, 163, 184, 0.18);
   background: rgba(15, 23, 42, 0.85);
   min-width: 0;
@@ -23661,13 +23661,14 @@ html.native-ios-mac .global-task-mode-entry-btn {
 
 .global-task-card.is-terminal {
   opacity: 0.78;
+  padding: 6px 9px;
 }
 
 .global-task-card-main {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
   max-width: 100%;
 }
@@ -23677,33 +23678,68 @@ html.native-ios-mac .global-task-mode-entry-btn {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 3px;
 }
 
 .global-task-card-meta {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 6px;
-  font-size: 11px;
+  overflow: hidden;
+  gap: 4px;
+  font-size: 10.5px;
+  min-width: 0;
 }
 
 .global-task-server-tag,
 .global-task-brain-tag,
 .global-task-round-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 6px;
+  padding: 1px 5px;
   border-radius: 5px;
   background: rgba(30, 41, 59, 0.85);
   color: #cbd5e1;
 }
 
+.global-task-server-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-task-tag-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-task-brain-tag {
+  display: block;
+  min-width: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-task-round-badge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .global-task-status-badge {
-  padding: 2px 6px;
+  flex-shrink: 0;
+  padding: 1px 5px;
   border-radius: 5px;
   font-weight: 600;
+  white-space: nowrap;
   background: rgba(56, 189, 248, 0.16);
   color: #7dd3fc;
 }
@@ -23724,26 +23760,38 @@ html.native-ios-mac .global-task-mode-entry-btn {
 }
 
 .global-task-card-title {
-  font-size: 14px;
+  font-size: 12.5px;
+  line-height: 1.3;
   font-weight: 600;
   color: #f8fafc;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   word-break: break-word;
   overflow-wrap: anywhere;
 }
 
+.global-task-card.is-expanded .global-task-card-title {
+  -webkit-line-clamp: unset;
+  display: block;
+}
+
 .global-task-progress-wrap {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
 .global-task-progress-labels {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 11px;
+  gap: 6px;
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -23757,7 +23805,9 @@ html.native-ios-mac .global-task-mode-entry-btn {
 
 .global-task-progress-track {
   position: relative;
-  height: 6px;
+  flex: 1 1 auto;
+  min-width: 48px;
+  height: 4px;
   border-radius: 999px;
   background: rgba(51, 65, 85, 0.72);
   overflow: hidden;
@@ -23782,22 +23832,31 @@ html.native-ios-mac .global-task-mode-entry-btn {
 }
 
 .global-task-live-summary {
-  font-size: 12px;
+  font-size: 11px;
   color: #94a3b8;
-  line-height: 1.4;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   overflow-wrap: anywhere;
+}
+
+.global-task-card.is-expanded .global-task-live-summary {
+  -webkit-line-clamp: unset;
+  display: block;
 }
 
 .global-task-brain-preview {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
   max-width: 100%;
   box-sizing: border-box;
-  padding: 6px 8px;
-  border-radius: 7px;
+  padding: 3px 6px;
+  border-radius: 6px;
   border: 1px solid rgba(148, 163, 184, 0.14);
   background: rgba(2, 6, 23, 0.55);
 }
@@ -23805,14 +23864,19 @@ html.native-ios-mac .global-task-mode-entry-btn {
 .global-task-brain-preview-text {
   flex: 1 1 auto;
   min-width: 0;
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1.3;
   color: #cbd5e1;
   display: -webkit-box;
-  -webkit-line-clamp: 2;
+  -webkit-line-clamp: 1;
   -webkit-box-orient: vertical;
   overflow: hidden;
   word-break: break-word;
   overflow-wrap: anywhere;
+}
+
+.global-task-card.is-expanded .global-task-brain-preview-text {
+  -webkit-line-clamp: 6;
 }
 
 .global-task-speak-btn {
@@ -23820,8 +23884,8 @@ html.native-ios-mac .global-task-mode-entry-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
   border-radius: 6px;
   border: 1px solid rgba(148, 163, 184, 0.22);
   background: rgba(30, 41, 59, 0.7);
@@ -23841,13 +23905,13 @@ html.native-ios-mac .global-task-mode-entry-btn {
 .global-task-reply-btn {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 6px 10px;
-  border-radius: 8px;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 7px;
   border: 1px solid rgba(45, 212, 191, 0.4);
   background: rgba(20, 184, 166, 0.14);
   color: #99f6e4;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   cursor: pointer;
   user-select: none;
@@ -24152,6 +24216,7 @@ html.native-ios-mac .global-task-mode-entry-btn {
   }
   .global-task-mode-grid {
     grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
   }
   .global-task-add-fields {
     grid-template-columns: minmax(0, 1fr);

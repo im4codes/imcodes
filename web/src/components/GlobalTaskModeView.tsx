@@ -846,18 +846,18 @@ export function GlobalTaskModeView({
         <div class="global-task-card-main">
           <div class="global-task-card-content">
             <div class="global-task-card-meta">
-              <span class={`global-task-server-tag${task.serverOnline ? ' is-online' : ' is-offline'}`}>
+              <span class={`global-task-server-tag${task.serverOnline ? ' is-online' : ' is-offline'}`} title={task.serverName}>
                 <span class="global-task-dot" aria-hidden="true" />
-                {task.serverName}
+                <span class="global-task-tag-text">{task.serverName}</span>
               </span>
-              <span class="global-task-brain-tag">{task.brainLabel || task.brainSession}</span>
+              <span class="global-task-brain-tag" title={task.brainLabel || task.brainSession}>{task.brainLabel || task.brainSession}</span>
               <span class={`global-task-status-badge is-${tone}`}>{renderTaskStatusLabel(task)}</span>
               {task.round > 0 && (
                 <span class="global-task-round-badge">R{task.round}</span>
               )}
             </div>
 
-            <div class="global-task-card-title">{task.title}</div>
+            <div class="global-task-card-title" title={task.title}>{task.title}</div>
 
             {total > 0 && (
               <div class="global-task-progress-wrap" data-testid={`task-mode-progress-${task.taskId}`}>
@@ -877,7 +877,7 @@ export function GlobalTaskModeView({
             )}
 
             {task.liveSummary && (
-              <div class="global-task-live-summary">{task.liveSummary}</div>
+              <div class="global-task-live-summary" title={task.liveSummary}>{task.liveSummary}</div>
             )}
 
             {latestBrainEvent && (
@@ -886,7 +886,7 @@ export function GlobalTaskModeView({
                 data-testid={`task-mode-brain-preview-${task.taskId}`}
                 onClick={(e) => e.stopPropagation()}
               >
-                <span class="global-task-brain-preview-text">{latestBrainEvent.text}</span>
+                <span class="global-task-brain-preview-text" title={latestBrainEvent.text}>{latestBrainEvent.text}</span>
                 <button
                   type="button"
                   class={`global-task-speak-btn${isSpeakingThisCard ? ' is-speaking' : ''}`}

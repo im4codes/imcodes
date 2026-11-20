@@ -723,7 +723,7 @@ describe('GlobalTaskModeView', () => {
     const css = readFileSync(resolve(process.cwd().endsWith('/web') ? process.cwd() : resolve(process.cwd(), 'web'), 'src/styles.css'), 'utf8');
     expect(css).toMatch(/\.global-task-mode-body\s*\{[^}]*overflow-x:\s*hidden;[^}]*overscroll-behavior-x:\s*none;/s);
     expect(css).toMatch(/\.global-task-card-title\s*\{[^}]*overflow-wrap:\s*anywhere;/s);
-    expect(css).toMatch(/\.global-task-quickbar-list\s*\{[^}]*max-height:\s*76px;[^}]*overflow-y:\s*auto;[^}]*overflow-x:\s*hidden;/s);
+    expect(css).toMatch(/\.global-task-quickbar-list\s*\{[^}]*max-height:\s*58px;[^}]*overflow-y:\s*auto;[^}]*overflow-x:\s*hidden;/s);
     expect(css).toMatch(/\.global-task-brain-pill-text\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
     const mobileBlock = css.slice(css.lastIndexOf('@media (max-width: 720px)'));
     expect(mobileBlock).toMatch(/\.global-task-mode-topbar-left\s*\{\s*display:\s*contents;/);
@@ -1365,5 +1365,108 @@ describe('GlobalTaskModeView', () => {
     expect(ws.sent.map((s) => JSON.parse(s))).toEqual([
       { type: GLOBAL_TASK_MODE_MSG.SET_FILTER, mutedServerIds: [] },
     ]);
+  });
+
+  it('clamps verbose card text with full hover titles when collapsed and expands cleanly on click', async () => {
+    const longTitle = 'A very long task title that should clamp to one line when collapsed and expand on click';
+    const longSummary = 'Very verbose live summary detailing multiple steps that must stay one line until expanded';
+    const longBrainText = 'Detailed Brain update message that should clamp to 1 line collapsed and expand to 6 lines';
+
+    const { ws } = await mountWithSnapshot();
+    const now = Date.now();
+
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: now,
+        servers: [{ id: 'srv-1', name: 'extremely-long-server-hostname-01', online: true }],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'extremely-long-server-hostname-01',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_very_long_brain_session_name',
+            brainLabel: 'Extremely Long Brain Label Name',
+            taskId: 'tsk_compact_1',
+            title: longTitle,
+            status: 'working',
+            flags: [],
+            round: 2,
+            checklist: { total: 4, implemented: 2, audited: 1 },
+            liveSummary: longSummary,
+            createdAt: now - 5_000,
+            updatedAt: now,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'extremely-long-server-hostname-01',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_very_long_brain_session_name',
+            brainLabel: 'Extremely Long Brain Label Name',
+            taskId: 'tsk_no_check',
+            title: 'No checklist task',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 0, implemented: 0, audited: 0 },
+            createdAt: now - 5_000,
+            updatedAt: now,
+            isTerminal: false,
+            needsAttention: false,
+          },
+        ],
+        mutedServerIds: [],
+      });
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
+        event: {
+          serverId: 'srv-1',
+          serverName: 'extremely-long-server-hostname-01',
+          sessionName: 'deck_very_long_brain_session_name',
+          projectName: 'imcodes',
+          eventId: 'evt-compact-1',
+          text: longBrainText,
+          ts: now,
+        },
+      });
+    });
+
+    const card = screen.getByTestId('task-mode-card-tsk_compact_1');
+    expect(card.className).not.toContain('is-expanded');
+    expect(card.querySelector('.global-task-card-title')?.getAttribute('title')).toBe(longTitle);
+    expect(card.querySelector('.global-task-live-summary')?.getAttribute('title')).toBe(longSummary);
+    expect(card.querySelector('.global-task-brain-preview-text')?.getAttribute('title')).toBe(longBrainText);
+    expect(card.querySelector('.global-task-server-tag')?.getAttribute('title')).toBe('extremely-long-server-hostname-01');
+    expect(card.querySelector('.global-task-brain-tag')?.getAttribute('title')).toBe('Extremely Long Brain Label Name');
+
+    // Progress bar renders when total > 0 and stays hidden when checklist.total === 0
+    expect(screen.queryByTestId('task-mode-progress-tsk_compact_1')).not.toBeNull();
+    expect(screen.queryByTestId('task-mode-progress-tsk_no_check')).toBeNull();
+
+    // Clicking the card toggles is-expanded and reveals detail metadata
+    fireEvent.click(card);
+    expect(card.className).toContain('is-expanded');
+    expect(screen.queryByTestId('task-mode-details-tsk_compact_1')).not.toBeNull();
+
+    // Verify CSS compactness, 1-line collapsed clamping, expansion unclamping, and mobile containment
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const css = readFileSync(resolve(process.cwd().endsWith('/web') ? process.cwd() : resolve(process.cwd(), 'web'), 'src/styles.css'), 'utf8');
+    expect(css).toMatch(/\.global-task-mode-grid\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(310px,\s*1fr\)\);[^}]*gap:\s*6px;/s);
+    expect(css).toMatch(/\.global-task-card-meta\s*\{[^}]*flex-wrap:\s*nowrap;[^}]*overflow:\s*hidden;/s);
+    expect(css).toMatch(/\.global-task-card-title\s*\{[^}]*-webkit-line-clamp:\s*1;[^}]*overflow:\s*hidden;/s);
+    expect(css).toMatch(/\.global-task-card\.is-expanded\s+\.global-task-card-title\s*\{[^}]*-webkit-line-clamp:\s*unset;[^}]*display:\s*block;/s);
+    expect(css).toMatch(/\.global-task-live-summary\s*\{[^}]*-webkit-line-clamp:\s*1;[^}]*overflow:\s*hidden;/s);
+    expect(css).toMatch(/\.global-task-card\.is-expanded\s+\.global-task-live-summary\s*\{[^}]*-webkit-line-clamp:\s*unset;[^}]*display:\s*block;/s);
+    expect(css).toMatch(/\.global-task-brain-preview-text\s*\{[^}]*-webkit-line-clamp:\s*1;[^}]*overflow:\s*hidden;/s);
+    expect(css).toMatch(/\.global-task-card\.is-expanded\s+\.global-task-brain-preview-text\s*\{[^}]*-webkit-line-clamp:\s*6;/s);
+    expect(css).toMatch(/\.global-task-progress-wrap\s*\{[^}]*flex-direction:\s*row;[^}]*align-items:\s*center;/s);
+    const mobileBlock = css.slice(css.lastIndexOf('@media (max-width: 720px)'));
+    expect(mobileBlock).toMatch(/\.global-task-mode-grid\s*\{\s*grid-template-columns:\s*minmax\(0,\s*1fr\);/s);
   });
 });
