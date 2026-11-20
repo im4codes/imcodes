@@ -312,11 +312,12 @@ export function resolveQuickDispatchBrains(
     if (mutedSet.has(entry.serverId)) return;
     const key = brainKey(entry.serverId, entry.sessionName);
     if (seen.has(key)) return;
+    const isServerPinned = Boolean(pinCtx?.pinnedServerIds?.has(entry.serverId));
+    const isSessionPinned = pinnedFlag || Boolean(pinCtx?.pinnedSessionNames?.has(entry.sessionName));
+    if (!isSessionPinned) return;
     seen.add(key);
     const live = liveByKey.get(key);
     const recentEntry = recentByKey.get(key);
-    const isServerPinned = Boolean(pinCtx?.pinnedServerIds?.has(entry.serverId));
-    const isSessionPinned = pinnedFlag || Boolean(pinCtx?.pinnedSessionNames?.has(entry.sessionName));
     candidates.push({
       serverId: entry.serverId,
       serverName: live?.serverName ?? entry.serverId,
@@ -358,8 +359,7 @@ export function resolveQuickDispatchBrains(
     const ses = Boolean(item.sessionPinned);
     if (srv && ses) return 0;
     if (ses) return 1;
-    if (srv) return 2;
-    return 3;
+    return 2;
   };
 
   candidates.sort((a, b) => {

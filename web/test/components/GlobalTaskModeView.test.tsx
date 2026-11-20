@@ -406,14 +406,19 @@ describe('GlobalTaskModeView', () => {
   it('supports pinning Brains, quick dispatch modal, tap reply composer with task title, and long-press VoiceOverlay reuse without scroll misfires', async () => {
     await mountWithSnapshot();
 
-    // Pin IM Brain in quick bar
+    // Unpinned snapshot sessions do NOT appear in quickbar by default; quickbar stays compact with + button
+    expect(screen.getByTestId('task-mode-quickbar')).toBeTruthy();
+    expect(screen.queryByTestId('task-mode-quickbar-list')).toBeNull();
+    expect(screen.queryByTestId('task-mode-brain-pill-srv-1-deck_imcodes_brain')).toBeNull();
+
+    // Open + Add / Dispatch modal: manually lists unpinned servers/brains and lets user pin IM Brain into quickbar
+    fireEvent.click(screen.getByTestId('task-mode-add-brain-btn'));
+    const pinToggle = screen.getByTestId('task-mode-add-pin-toggle');
+    fireEvent.click(pinToggle);
     const pinBtn = screen.getByTestId('task-mode-brain-pin-srv-1-deck_imcodes_brain');
-    expect(pinBtn.getAttribute('aria-pressed')).toBe('false');
-    fireEvent.click(pinBtn);
     expect(pinBtn.getAttribute('aria-pressed')).toBe('true');
 
     // + Add / Dispatch modal sends raw instruction (no task title prefix)
-    fireEvent.click(screen.getByTestId('task-mode-add-brain-btn'));
     fireEvent.input(screen.getByTestId('task-mode-add-input'), { target: { value: 'Start audit cleanup' } });
     fireEvent.click(screen.getByTestId('task-mode-add-submit-btn'));
 
@@ -683,10 +688,22 @@ describe('GlobalTaskModeView', () => {
       sessionName: `deck_brain_${idx + 1}`,
       label: `Brain-${idx + 1}`,
       projectName: `proj-${idx + 1}`,
+      state: 'idle',
+      agentType: 'claude-code',
     }));
 
-    const { ws } = await mountWithSnapshot();
+    const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+    render(
+      <GlobalTaskModeView
+        onExit={vi.fn()}
+        onJumpToSession={vi.fn()}
+        pinnedSessionNames={new Set(brains.map((b) => b.sessionName))}
+      />,
+    );
+    await waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
+    const ws = MockWebSocket.instances[0]!;
     await act(async () => {
+      ws.simulateOpen();
       ws.simulateMessage({
         type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
         ts: 15_000,
@@ -813,9 +830,9 @@ describe('GlobalTaskModeView', () => {
     expect(pills).toEqual([
       'task-mode-brain-pill-srv-pin-sess_pin',
       'task-mode-brain-pill-srv-plain-2-sess_pin',
-      'task-mode-brain-pill-srv-pin-sess_plain_on_pin',
-      'task-mode-brain-pill-srv-plain-1-sess_plain',
     ]);
+    expect(screen.queryByTestId('task-mode-brain-pill-srv-pin-sess_plain_on_pin')).toBeNull();
+    expect(screen.queryByTestId('task-mode-brain-pill-srv-plain-1-sess_plain')).toBeNull();
 
     // Server filter menu puts pinned server first, followed by unpinned servers in serverOrder
     fireEvent.click(screen.getByTestId('task-mode-server-filter-btn'));
@@ -828,7 +845,7 @@ describe('GlobalTaskModeView', () => {
       'task-mode-server-toggle-srv-plain-1',
     ]);
 
-    // Add-modal server select also lists pinned server first and selects it by default
+    // Add-modal server select also lists pinned server first and selects it by default, while allowing manual selection of unpinned servers/sessions
     fireEvent.click(screen.getByTestId('task-mode-add-brain-btn'));
     const selectEl = screen.getByTestId('task-mode-add-server-select') as HTMLSelectElement;
     expect(Array.from(selectEl.options).map((o) => o.value)).toEqual([
@@ -837,6 +854,16 @@ describe('GlobalTaskModeView', () => {
       'srv-plain-1',
     ]);
     expect(selectEl.value).toBe('srv-pin');
+    const brainSelectEl = screen.getByTestId('task-mode-add-brain-select') as HTMLSelectElement;
+    expect(Array.from(brainSelectEl.options).map((o) => o.value)).toEqual(['sess_plain_on_pin', 'sess_pin']);
+    await act(async () => {
+      selectEl.value = 'srv-plain-1';
+      selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await waitFor(() => {
+      const updatedBrainSelect = screen.getByTestId('task-mode-add-brain-select') as HTMLSelectElement;
+      expect(Array.from(updatedBrainSelect.options).map((o) => o.value)).toEqual(['sess_plain']);
+    });
   });
 
   it('suppresses TTS for stale tasks, pre-mount backfill, out-of-order frames, unmuted server reveals, and stale brain_text while keeping UI updates, manual speak, clock skew tolerance, and live announcements working', async () => {

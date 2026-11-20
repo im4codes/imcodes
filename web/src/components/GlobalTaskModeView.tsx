@@ -1166,67 +1166,69 @@ export function GlobalTaskModeView({
               +
             </button>
           </div>
-          <div class="global-task-quickbar-list" data-testid="task-mode-quickbar-list">
-            {quickDispatchBrains.map((brain: GlobalTaskQuickDispatchBrain) => {
-              const dispatchSnapshot: TaskModeTargetSnapshot = {
-                serverId: brain.serverId,
-                serverName: brain.serverName,
-                sessionName: brain.sessionName,
-                label: brain.label,
-                projectName: brain.projectName,
-                mode: 'dispatch',
-              };
-              const pillLabel = `${brain.serverName} · ${brain.label}`;
-              const pressProps = bindDualActionButton(
-                `brain:${brain.serverId}:${brain.sessionName}`,
-                () => openQuickComposer(dispatchSnapshot),
-                () => openVoiceInput(dispatchSnapshot),
-              );
-              return (
-                <div
-                  key={`${brain.serverId}:${brain.sessionName}`}
-                  class={`global-task-brain-pill${brain.pinned ? ' is-pinned' : ''}`}
-                  data-testid={`task-mode-brain-pill-${brain.serverId}-${brain.sessionName}`}
-                  role="button"
-                  tabIndex={0}
-                  title={pillLabel}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      openQuickComposer(dispatchSnapshot);
-                    }
-                  }}
-                  {...pressProps}
-                >
-                  <button
-                    type="button"
-                    class={`global-task-brain-pin-btn${brain.pinned ? ' is-pinned' : ''}`}
-                    data-testid={`task-mode-brain-pin-${brain.serverId}-${brain.sessionName}`}
-                    aria-pressed={brain.pinned}
-                    title={brain.pinned ? t('taskMode.unpin_brain', 'Unpin Brain') : t('taskMode.pin_brain', 'Pin Brain')}
-                    aria-label={brain.pinned ? t('taskMode.unpin_brain', 'Unpin Brain') : t('taskMode.pin_brain', 'Pin Brain')}
-                    onPointerDown={(e) => e.stopPropagation()}
-                    onPointerUp={(e) => e.stopPropagation()}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      globalTaskModeStore.togglePinnedBrain({
-                        serverId: brain.serverId,
-                        sessionName: brain.sessionName,
-                        label: brain.label,
-                        projectName: brain.projectName,
-                      });
+          {quickDispatchBrains.length > 0 && (
+            <div class="global-task-quickbar-list" data-testid="task-mode-quickbar-list">
+              {quickDispatchBrains.map((brain: GlobalTaskQuickDispatchBrain) => {
+                const dispatchSnapshot: TaskModeTargetSnapshot = {
+                  serverId: brain.serverId,
+                  serverName: brain.serverName,
+                  sessionName: brain.sessionName,
+                  label: brain.label,
+                  projectName: brain.projectName,
+                  mode: 'dispatch',
+                };
+                const pillLabel = `${brain.serverName} · ${brain.label}`;
+                const pressProps = bindDualActionButton(
+                  `brain:${brain.serverId}:${brain.sessionName}`,
+                  () => openQuickComposer(dispatchSnapshot),
+                  () => openVoiceInput(dispatchSnapshot),
+                );
+                return (
+                  <div
+                    key={`${brain.serverId}:${brain.sessionName}`}
+                    class={`global-task-brain-pill${brain.pinned ? ' is-pinned' : ''}`}
+                    data-testid={`task-mode-brain-pill-${brain.serverId}-${brain.sessionName}`}
+                    role="button"
+                    tabIndex={0}
+                    title={pillLabel}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        openQuickComposer(dispatchSnapshot);
+                      }
                     }}
+                    {...pressProps}
                   >
-                    {brain.pinned ? '★' : '☆'}
-                  </button>
-                  <span class={`global-task-dot${brain.serverOnline ? ' is-online' : ' is-offline'}`} aria-hidden="true" />
-                  <span class="global-task-brain-pill-text" title={pillLabel}>
-                    {pillLabel}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
+                    <button
+                      type="button"
+                      class={`global-task-brain-pin-btn${brain.pinned ? ' is-pinned' : ''}`}
+                      data-testid={`task-mode-brain-pin-${brain.serverId}-${brain.sessionName}`}
+                      aria-pressed={brain.pinned}
+                      title={brain.pinned ? t('taskMode.unpin_brain', 'Unpin Brain') : t('taskMode.pin_brain', 'Pin Brain')}
+                      aria-label={brain.pinned ? t('taskMode.unpin_brain', 'Unpin Brain') : t('taskMode.pin_brain', 'Pin Brain')}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onPointerUp={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        globalTaskModeStore.togglePinnedBrain({
+                          serverId: brain.serverId,
+                          sessionName: brain.sessionName,
+                          label: brain.label,
+                          projectName: brain.projectName,
+                        });
+                      }}
+                    >
+                      {brain.pinned ? '★' : '☆'}
+                    </button>
+                    <span class={`global-task-dot${brain.serverOnline ? ' is-online' : ' is-offline'}`} aria-hidden="true" />
+                    <span class="global-task-brain-pill-text" title={pillLabel}>
+                      {pillLabel}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </section>
 
         {/* Active Tasks Section */}
