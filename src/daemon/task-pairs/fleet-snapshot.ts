@@ -7,14 +7,19 @@ import {
   type GlobalTaskFleetSnapshotPair,
 } from '../../../shared/global-task-mode.js';
 import { TASK_PAIR_NO_AUDITOR } from '../../../shared/task-pair.js';
+import { isInternalSessionDisplayValue } from '../../../shared/session-display.js';
 import { taskPairChecklistCounts } from '../../../shared/task-pair-checklist.js';
 import { getSession } from '../../store/session-store.js';
 import { getTaskPairStore, type StoredTaskPair } from './store.js';
 
 function sessionLabel(sessionName: string | undefined): string | undefined {
   if (!sessionName || sessionName === TASK_PAIR_NO_AUDITOR) return undefined;
-  const label = getSession(sessionName)?.label?.trim();
-  return label || undefined;
+  const sess = getSession(sessionName);
+  const label = sess?.label?.trim();
+  if (label && !isInternalSessionDisplayValue(label, sessionName)) return label;
+  const roleMatch = /^w(\d+)$/i.exec(sess?.role?.trim() ?? '') ?? /_w(\d+)$/i.exec(sessionName);
+  if (roleMatch) return `W${roleMatch[1]}`;
+  return undefined;
 }
 
 export function toGlobalTaskFleetSnapshotPair(stored: StoredTaskPair): GlobalTaskFleetSnapshotPair {

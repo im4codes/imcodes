@@ -12,6 +12,8 @@ import {
   type GlobalTaskSnapshotResponse,
   type GlobalTaskSummaryRow,
 } from '@shared/global-task-mode.js';
+import { pickReadableSessionDisplay } from '@shared/session-display.js';
+import { formatLabel } from './format-label.js';
 import { ApiError, apiFetch, getApiBaseUrl, sendSessionViaHttp } from './api.js';
 
 export const GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY = 'imcodes.global-task-mode.muted-servers';
@@ -283,6 +285,28 @@ export function sortGlobalTaskServers(
   });
 }
 
+export function resolveReadableSessionName(
+  candidates: ReadonlyArray<string | null | undefined>,
+  sessionName?: string | null,
+): string {
+  const readable = pickReadableSessionDisplay([...candidates], sessionName);
+  if (readable) return formatLabel(readable);
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim();
+    if (trimmed) return formatLabel(trimmed);
+  }
+  return sessionName?.trim() ? formatLabel(sessionName.trim()) : '';
+}
+
+function normalizeStoredSessionLabel(
+  label: string | undefined,
+  projectName: string | undefined,
+  sessionName: string,
+): string | undefined {
+  const readable = pickReadableSessionDisplay([label, projectName], sessionName);
+  return readable ? formatLabel(readable) : undefined;
+}
+
 export function resolveQuickDispatchBrains(
   pinned: readonly GlobalTaskPinnedBrain[],
   recent: readonly GlobalTaskRecentBrain[],
@@ -321,13 +345,17 @@ export function resolveQuickDispatchBrains(
     seen.add(key);
     const live = liveByKey.get(key);
     const recentEntry = recentByKey.get(key);
+    const projectName = live?.projectName ?? entry.projectName ?? recentEntry?.projectName ?? '';
     candidates.push({
       serverId: entry.serverId,
       serverName: live?.serverName ?? entry.serverId,
       serverOnline: live?.serverOnline ?? false,
       sessionName: entry.sessionName,
-      projectName: live?.projectName ?? entry.projectName ?? recentEntry?.projectName ?? '',
-      label: live?.label ?? entry.label ?? recentEntry?.label ?? entry.sessionName,
+      projectName,
+      label: resolveReadableSessionName(
+        [live?.label, entry.label, recentEntry?.label, projectName],
+        entry.sessionName,
+      ),
       state: live?.state ?? 'unknown',
       agentType: live?.agentType ?? '',
       pinned: pinnedFlag,
@@ -609,6 +637,7 @@ export class GlobalTaskModeStore {
     if (!serverId || !sessionName) return;
     const key = brainKey(serverId, sessionName);
     const exists = this.state.pinnedBrains.some((p) => brainKey(p.serverId, p.sessionName) === key);
+    const normalizedLabel = normalizeStoredSessionLabel(entry.label, entry.projectName, sessionName);
     const next = exists
       ? this.state.pinnedBrains.filter((p) => brainKey(p.serverId, p.sessionName) !== key)
       : [
@@ -616,7 +645,7 @@ export class GlobalTaskModeStore {
         {
           serverId,
           sessionName,
-          ...(entry.label ? { label: entry.label } : {}),
+          ...(normalizedLabel ? { label: normalizedLabel } : {}),
           ...(entry.projectName ? { projectName: entry.projectName } : {}),
         },
       ];
@@ -629,11 +658,12 @@ export class GlobalTaskModeStore {
     const sessionName = entry.sessionName.trim();
     if (!serverId || !sessionName) return;
     const key = brainKey(serverId, sessionName);
+    const normalizedLabel = normalizeStoredSessionLabel(entry.label, entry.projectName, sessionName);
     const nextEntry: GlobalTaskRecentBrain = {
       serverId,
       sessionName,
       lastUsedAt: entry.lastUsedAt ?? Date.now(),
-      ...(entry.label ? { label: entry.label } : {}),
+      ...(normalizedLabel ? { label: normalizedLabel } : {}),
       ...(entry.projectName ? { projectName: entry.projectName } : {}),
     };
     const next = [

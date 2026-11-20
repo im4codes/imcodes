@@ -735,4 +735,38 @@ describe('global-task-mode-store', () => {
     expect(ws.readyState).toBe(MockWebSocket.CLOSED);
     unsub();
   });
+
+  it('resolves readable display labels and ignores stale internal session IDs in pinned/recent storage', () => {
+    const store = new GlobalTaskModeStore();
+    // Stale internal ID stored as label falls back cleanly to projectName / live formatted label
+    const resolved = resolveQuickDispatchBrains(
+      [
+        { serverId: 'srv-1', sessionName: 'deck_cd_brain', label: 'deck_cd_brain', projectName: 'cd' },
+        { serverId: 'srv-1', sessionName: 'deck_discord_brain', label: 'discord:1476187408042033309#general', projectName: 'discord-proj' },
+      ],
+      [],
+      [
+        makeBrain({ serverId: 'srv-1', sessionName: 'deck_cd_brain', label: 'deck_cd_brain', projectName: 'cd' }),
+        makeBrain({ serverId: 'srv-1', sessionName: 'deck_discord_brain', label: 'discord:1476187408042033309#general', projectName: 'discord-proj' }),
+      ],
+      [],
+    );
+    expect(resolved.find((b) => b.sessionName === 'deck_cd_brain')?.label).toBe('cd');
+    expect(resolved.find((b) => b.sessionName === 'deck_discord_brain')?.label).toBe('discord#general');
+
+    store.togglePinnedBrain({
+      serverId: 'srv-1',
+      sessionName: 'deck_cd_brain',
+      label: 'deck_cd_brain',
+      projectName: 'cd',
+    });
+    expect(store.getState().pinnedBrains[0]?.label).toBe('cd');
+
+    store.recordRecentBrain({
+      serverId: 'srv-1',
+      sessionName: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
+      label: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
+    });
+    expect(store.getState().recentBrains[0]?.label).toBeUndefined();
+  });
 });

@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import type { GlobalTaskSummaryRow } from '@shared/global-task-mode.js';
+import type { GlobalTaskBrainSummary, GlobalTaskSummaryRow } from '@shared/global-task-mode.js';
+import { isInternalSessionDisplayValue, pickReadableSessionDisplay } from '@shared/session-display.js';
+import { taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
+import { formatLabel } from '../format-label.js';
 import {
   brainKey,
   computeDefaultMutedServerIds,
   globalTaskModeStore,
   resolveQuickDispatchBrains,
+  resolveReadableSessionName,
   sortGlobalTaskServers,
   taskKey,
   type GlobalTaskModeState,
@@ -670,6 +674,25 @@ export function GlobalTaskModeView({
     () => new Set(state.pinnedBrains.map((p) => brainKey(p.serverId, p.sessionName))),
     [state.pinnedBrains],
   );
+  const brainsByKey = useMemo(() => {
+    const map = new Map<string, GlobalTaskBrainSummary>();
+    for (const b of state.brains) {
+      map.set(brainKey(b.serverId, b.sessionName), b);
+    }
+    return map;
+  }, [state.brains]);
+
+  const resolveBrainLabel = useCallback((b: Pick<GlobalTaskBrainSummary, 'label' | 'projectName' | 'sessionName'>): string => (
+    resolveReadableSessionName([b.label, b.projectName], b.sessionName)
+  ), []);
+
+  const resolveTaskBrainLabel = useCallback((task: GlobalTaskSummaryRow): string => {
+    const liveBrain = brainsByKey.get(brainKey(task.serverId, task.brainSession));
+    return resolveReadableSessionName(
+      [liveBrain?.label, task.brainLabel, liveBrain?.projectName, task.projectName],
+      task.brainSession,
+    );
+  }, [brainsByKey]);
 
   const quickDispatchBrains = useMemo(
     () => resolveQuickDispatchBrains(
@@ -932,7 +955,7 @@ export function GlobalTaskModeView({
         text,
         locale,
         projectName: brainMeta?.projectName,
-        label: brainMeta?.label ?? addSessionName,
+        label: resolveReadableSessionName([brainMeta?.label, brainMeta?.projectName], addSessionName),
       });
       setAddModalOpen(false);
       setAddMessage('');
@@ -1018,11 +1041,30 @@ export function GlobalTaskModeView({
       </span>
     ) : null;
 
+    const taskBrainLabel = resolveTaskBrainLabel(task);
+    const executorDisplay = (() => {
+      const normalized = taskPairDisplaySessionLabel('', task.executorLabel) ?? task.executorLabel?.trim();
+      const readable = pickReadableSessionDisplay([normalized]);
+      return readable ? formatLabel(readable) : t('taskPair.card_unassigned');
+    })();
+    const auditorDisplay = (() => {
+      if (task.auditor === 'none') return t('taskMode.auditor_none', 'None');
+      const normalized = task.auditorLabel
+        ? (taskPairDisplaySessionLabel(task.auditor ?? '', task.auditorLabel) ?? task.auditorLabel.trim())
+        : undefined;
+      const readable = pickReadableSessionDisplay([normalized], task.auditor);
+      if (readable) return formatLabel(readable);
+      if (task.auditor && !isInternalSessionDisplayValue(task.auditor)) {
+        return formatLabel(task.auditor);
+      }
+      return task.auditor ? t('taskPair.panel_auditor') : t('taskPair.card_unassigned');
+    })();
+
     const replySnapshot: TaskModeTargetSnapshot = {
       serverId: task.serverId,
       serverName: task.serverName,
       sessionName: task.brainSession,
-      label: task.brainLabel || task.brainSession,
+      label: taskBrainLabel,
       projectName: task.projectName,
       taskTitle: task.title,
       mode: 'reply',
@@ -1048,7 +1090,7 @@ export function GlobalTaskModeView({
                 <span class="global-task-dot" aria-hidden="true" />
                 <span class="global-task-tag-text">{task.serverName}</span>
               </span>
-              <span class="global-task-brain-tag" title={task.brainLabel || task.brainSession}>{task.brainLabel || task.brainSession}</span>
+              <span class="global-task-brain-tag" title={taskBrainLabel}>{taskBrainLabel}</span>
               <span class={`global-task-status-badge is-${tone}`}>{renderTaskStatusLabel(task)}</span>
               {task.round > 0 && (
                 <span class="global-task-round-badge">R{task.round}</span>
@@ -1122,11 +1164,9 @@ export function GlobalTaskModeView({
         {expanded && (
           <div class="global-task-card-details" data-testid={`task-mode-details-${task.taskId}`} onClick={(e) => e.stopPropagation()}>
             <div class="global-task-detail-row">
-              <span>{t('taskPair.card_executor')}: {task.executorLabel || t('taskPair.card_unassigned')}</span>
+              <span>{t('taskPair.card_executor')}: {executorDisplay}</span>
               <span>
-                {t('taskPair.card_auditor')}: {task.auditor === 'none'
-                  ? t('taskMode.auditor_none', 'None')
-                  : (task.auditorLabel || task.auditor || t('taskPair.card_unassigned'))}
+                {t('taskPair.card_auditor')}: {auditorDisplay}
               </span>
               {task.projectName && <span>{t('taskMode.project_label', 'Project')}: {task.projectName}</span>}
               {task.updatedAt > 0 && <span>{formatUpdatedRelative(task.updatedAt, locale)}</span>}
@@ -1370,15 +1410,16 @@ export function GlobalTaskModeView({
           {quickDispatchBrains.length > 0 && (
             <div class="global-task-quickbar-list" data-testid="task-mode-quickbar-list">
               {quickDispatchBrains.map((brain: GlobalTaskQuickDispatchBrain) => {
+                const displayLabel = resolveBrainLabel(brain);
                 const dispatchSnapshot: TaskModeTargetSnapshot = {
                   serverId: brain.serverId,
                   serverName: brain.serverName,
                   sessionName: brain.sessionName,
-                  label: brain.label,
+                  label: displayLabel,
                   projectName: brain.projectName,
                   mode: 'dispatch',
                 };
-                const pillLabel = `${brain.serverName} · ${brain.label}`;
+                const pillLabel = `${brain.serverName} · ${displayLabel}`;
                 const pressProps = bindDualActionButton(
                   `brain:${brain.serverId}:${brain.sessionName}`,
                   () => openQuickComposer(dispatchSnapshot),
@@ -1414,7 +1455,7 @@ export function GlobalTaskModeView({
                         globalTaskModeStore.togglePinnedBrain({
                           serverId: brain.serverId,
                           sessionName: brain.sessionName,
-                          label: brain.label,
+                          label: displayLabel,
                           projectName: brain.projectName,
                         });
                       }}
@@ -1623,11 +1664,14 @@ export function GlobalTaskModeView({
                   value={addSessionName}
                   onChange={(e) => setAddSessionName((e.currentTarget as HTMLSelectElement).value)}
                 >
-                  {brainsForSelectedAddServer.map((b) => (
-                    <option key={b.sessionName} value={b.sessionName}>
-                      {b.label}{b.projectName ? ` (${b.projectName})` : ''}
-                    </option>
-                  ))}
+                  {brainsForSelectedAddServer.map((b) => {
+                    const displayLabel = resolveBrainLabel(b);
+                    return (
+                      <option key={b.sessionName} value={b.sessionName}>
+                        {displayLabel}{b.projectName && b.projectName !== displayLabel ? ` (${b.projectName})` : ''}
+                      </option>
+                    );
+                  })}
                 </select>
               </label>
             </div>
@@ -1643,7 +1687,7 @@ export function GlobalTaskModeView({
                     globalTaskModeStore.togglePinnedBrain({
                       serverId: addServerId,
                       sessionName: addSessionName,
-                      label: brain?.label ?? addSessionName,
+                      label: resolveReadableSessionName([brain?.label, brain?.projectName], addSessionName),
                       projectName: brain?.projectName,
                     });
                   }}
@@ -1684,7 +1728,7 @@ export function GlobalTaskModeView({
                     serverId: addServerId,
                     serverName: server?.name ?? addServerId,
                     sessionName: addSessionName,
-                    label: brain?.label ?? addSessionName,
+                    label: resolveReadableSessionName([brain?.label, brain?.projectName], addSessionName),
                     projectName: brain?.projectName ?? '',
                     mode: 'dispatch',
                     initialText: addMessage,

@@ -141,4 +141,49 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
     const cancelledNoWorkspace = frame.pairs[4]!;
     expect(cancelledNoWorkspace.endedAt).toBe(now - GLOBAL_TASK_TERMINAL_WINDOW_MS);
   });
+
+  it('filters internal session IDs from labels and falls back to W<n> for unlabeled named workers', () => {
+    upsertSession({
+      name: 'deck_proj_w1',
+      projectName: 'proj',
+      role: 'w1',
+      agentType: 'claude-code',
+      projectDir: '/tmp/proj',
+      state: 'idle',
+      label: 'deck_proj_w1',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as SessionRecord);
+    upsertSession({
+      name: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
+      projectName: 'proj',
+      role: 'sub',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/proj',
+      state: 'idle',
+      label: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as SessionRecord);
+
+    try {
+      store.savePair('proj', makePairState({
+        taskId: 'tsk_labels',
+        executor: 'deck_proj_w1',
+        auditor: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
+        updatedAt: 5_000,
+      }));
+      const frame = buildGlobalTaskFleetSnapshotPayload(10_000);
+      const row = frame.pairs.find((p) => p.taskId === 'tsk_labels');
+      expect(row?.executorLabel).toBe('W1');
+      expect(row?.auditorLabel).toBeUndefined();
+    } finally {
+      removeSession('deck_proj_w1');
+      removeSession('deck_sub_pair_auto_6ac6fe82aa0aecfc');
+    }
+  });
 });

@@ -8,7 +8,7 @@ export function isInternalSessionDisplayValue(value: string | null | undefined, 
   if (!normalized) return true;
   const normalizedSession = normalizeDisplayValue(sessionName);
   if (normalizedSession && normalized === normalizedSession) return true;
-  if (/^deck_sub_[a-z0-9-]+$/i.test(normalized)) return true;
+  if (/^deck_sub_[a-z0-9_-]+$/i.test(normalized)) return true;
   if (/^deck_.+_(brain|w\d+)$/i.test(normalized)) return true;
   if (/^bootmain[a-z0-9-]+$/i.test(normalized)) return true;
   return false;

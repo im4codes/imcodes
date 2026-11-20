@@ -183,9 +183,10 @@ class InMemoryGlobalTaskDb {
           return (this.servers.get(String(params[0])) ?? null) as unknown as T | null;
         }
 
-        if (norm.startsWith('select label from sessions where server_id = $1 and name = $2')) {
+        if (norm.startsWith('select label, project_name from sessions where server_id = $1 and name = $2')
+          || norm.startsWith('select label from sessions where server_id = $1 and name = $2')) {
           const found = this.sessions.find((s) => s.server_id === String(params[0]) && s.name === String(params[1]));
-          return (found ? { label: found.label } : null) as unknown as T | null;
+          return (found ? { label: found.label, project_name: found.project_name } : null) as unknown as T | null;
         }
 
         return null;
@@ -1437,5 +1438,96 @@ describe('global-task-mode server engine', () => {
     const afterReopen = await getGlobalTaskSummaryForServerTask(db, 'srv-time', 'tsk_done_timed');
     expect(afterReopen?.startedAt).toBe(now - 90_000);
     expect(afterReopen?.endedAt).toBeUndefined();
+  });
+
+  it('resolves readable Brain, Executor, and Auditor display labels across snapshots and single-task queries', async () => {
+    const now = Date.now();
+    memDb.sessions.push(
+      {
+        id: 'sess-cd-unlabeled',
+        server_id: 'srv-a',
+        name: 'deck_cd_brain',
+        project_name: 'cd',
+        role: 'brain',
+        agent_type: 'claude-code-sdk',
+        agent_version: null,
+        project_dir: '/repo/cd',
+        state: 'idle',
+        label: null,
+        runtime_type: 'transport',
+        provider_id: null,
+        provider_session_id: null,
+        description: null,
+        created_at: now - 5000,
+      },
+      {
+        id: 'sess-alpha-renamed',
+        server_id: 'srv-a',
+        name: 'deck_alpha_brain',
+        project_name: 'alpha',
+        role: 'brain',
+        agent_type: 'codex-sdk',
+        agent_version: null,
+        project_dir: '/repo/alpha',
+        state: 'idle',
+        label: 'Alpha Renamed',
+        runtime_type: 'transport',
+        provider_id: null,
+        provider_session_id: null,
+        description: null,
+        created_at: now - 4000,
+      },
+    );
+
+    await upsertGlobalTaskSummariesBatch(db, 'srv-a', [
+      {
+        serverId: 'srv-a',
+        taskId: 'tsk_cd_1',
+        projectName: 'cd',
+        brainSession: 'deck_cd_brain',
+        brainLabel: 'deck_cd_brain',
+        title: 'Task without explicit brain label',
+        status: 'working',
+        executorLabel: 'deck_sub_exec_1',
+        auditorLabel: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
+        auditor: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
+        createdAt: now - 2000,
+        updatedAt: now - 1000,
+      },
+      {
+        serverId: 'srv-a',
+        taskId: 'tsk_alpha_1',
+        projectName: 'alpha',
+        brainSession: 'deck_alpha_brain',
+        brainLabel: 'Old Stale Name',
+        title: 'Task with renamed live brain',
+        status: 'working',
+        executorLabel: 'Worker W1',
+        auditorLabel: 'Reviewer Two',
+        auditor: 'deck_sub_aud_2',
+        createdAt: now - 2000,
+        updatedAt: now - 500,
+      },
+    ]);
+
+    const snapshot = await listGlobalTaskSnapshotForUser(db, 'user-a');
+    expect(snapshot.brains.find((b) => b.sessionName === 'deck_cd_brain')?.label).toBe('cd');
+    expect(snapshot.brains.find((b) => b.sessionName === 'deck_alpha_brain')?.label).toBe('Alpha Renamed');
+
+    const cdTask = snapshot.tasks.find((t) => t.taskId === 'tsk_cd_1');
+    expect(cdTask?.brainLabel).toBe('cd');
+    expect(cdTask?.executorLabel).toBeUndefined();
+    expect(cdTask?.auditorLabel).toBeUndefined();
+    expect(cdTask?.auditor).toBe('deck_sub_pair_auto_6ac6fe82aa0aecfc');
+
+    const alphaTask = snapshot.tasks.find((t) => t.taskId === 'tsk_alpha_1');
+    expect(alphaTask?.brainLabel).toBe('Alpha Renamed');
+    expect(alphaTask?.executorLabel).toBe('Worker W1');
+    expect(alphaTask?.auditorLabel).toBe('Reviewer Two');
+
+    const singleCd = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_cd_1');
+    expect(singleCd?.brainLabel).toBe('cd');
+    const singleAlpha = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_alpha_1');
+    expect(singleAlpha?.brainLabel).toBe('Alpha Renamed');
   });
 });

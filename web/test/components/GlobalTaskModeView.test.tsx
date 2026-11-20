@@ -1926,4 +1926,114 @@ describe('GlobalTaskModeView', () => {
     });
     expect(spokenUtterances).toHaveLength(2);
   });
+
+  it('displays readable session names everywhere instead of internal session IDs and keeps routing by internal sessionName', async () => {
+    const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+    const onExit = vi.fn();
+    const onJumpToSession = vi.fn();
+    render(
+      <GlobalTaskModeView
+        onExit={onExit}
+        onJumpToSession={onJumpToSession}
+        pinnedSessionNames={new Set(['deck_cd_brain', 'deck_chan_brain'])}
+      />,
+    );
+    await waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
+    const ws = MockWebSocket.instances[0]!;
+    const now = Date.now();
+
+    await act(async () => {
+      ws.simulateOpen();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: now,
+        servers: [{ id: 'srv-1', name: 'M3-Mac', online: true }],
+        brains: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            sessionName: 'deck_cd_brain',
+            projectName: 'cd',
+            label: 'deck_cd_brain',
+            state: 'idle',
+            agentType: 'claude-code-sdk',
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            sessionName: 'deck_chan_brain',
+            projectName: 'chat-proj',
+            label: 'discord:1476187408042033309#general',
+            state: 'idle',
+            agentType: 'codex-sdk',
+          },
+        ],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'cd',
+            brainSession: 'deck_cd_brain',
+            brainLabel: 'deck_cd_brain',
+            taskId: 'tsk_display_1',
+            title: 'Check Display Names',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            executorLabel: 'deck_sub_pair_auto_exec1',
+            auditor: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
+            auditorLabel: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
+            createdAt: now - 10_000,
+            updatedAt: now - 1_000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+
+    // Quick Dispatch pills show readable project/formatted channel labels, never internal session IDs
+    const cdPill = screen.getByTestId('task-mode-brain-pill-srv-1-deck_cd_brain');
+    expect(cdPill.textContent).toContain('M3-Mac · cd');
+    expect(cdPill.textContent).not.toContain('deck_cd_brain');
+    const chanPill = screen.getByTestId('task-mode-brain-pill-srv-1-deck_chan_brain');
+    expect(chanPill.textContent).toContain('M3-Mac · discord#general');
+
+    // Card header Brain tag shows readable name 'cd'
+    const card = screen.getByTestId('task-mode-card-tsk_display_1');
+    const brainTag = card.querySelector('.global-task-brain-tag');
+    expect(brainTag?.textContent).toBe('cd');
+    expect(brainTag?.getAttribute('title')).toBe('cd');
+
+    // Expanded details never leak internal deck_sub_* IDs, and jump still uses internal sessionName
+    fireEvent.click(card);
+    const details = screen.getByTestId('task-mode-details-tsk_display_1');
+    expect(details.textContent).not.toContain('deck_sub_');
+    expect(details.textContent).toContain('Executor: Unassigned');
+    expect(details.textContent).toContain('Auditor: Auditor');
+    fireEvent.click(screen.getByTestId('task-mode-jump-tsk_display_1'));
+    expect(onJumpToSession).toHaveBeenCalledWith('srv-1', 'deck_cd_brain');
+
+    // Reply composer header and VoiceOverlay show readable Brain label
+    fireEvent.click(screen.getByTestId('task-mode-reply-tsk_display_1'));
+    expect(screen.getByTestId('task-mode-composer').textContent).toContain('M3-Mac · cd');
+    expect(screen.getByTestId('task-mode-composer').textContent).not.toContain('deck_cd_brain');
+    fireEvent.click(screen.getByTestId('task-mode-composer-voice-btn'));
+    expect(screen.getByTestId('mock-voice-overlay').getAttribute('data-session-label')).toContain('M3-Mac · cd');
+    await act(async () => {
+      voiceOverlayMock.lastOnClose?.();
+    });
+
+    // + Add / Dispatch dropdown avoids 'cd (cd)' duplication and formats custom label with project
+    fireEvent.click(screen.getByTestId('task-mode-add-brain-btn'));
+    const select = screen.getByTestId('task-mode-add-brain-select') as HTMLSelectElement;
+    const optionTexts = Array.from(select.options).map((o) => o.textContent);
+    expect(optionTexts).toContain('cd');
+    expect(optionTexts).not.toContain('cd (cd)');
+    expect(optionTexts).toContain('discord#general (chat-proj)');
+  });
 });
