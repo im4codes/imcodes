@@ -1877,4 +1877,32 @@ describe('styles.css regression contracts', () => {
     const reducedMotion = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(prefers-reduced-motion:\s*reduce\)/).join('\n');
     expect(reducedMotion).toContain('.voice-hold-starting-spinner');
   });
+
+  it('floats .global-task-mode-badge as an out-of-flow top-right superscript without widening the entry button', () => {
+    const entryBtnRule = cssWithoutComments.match(
+      /\.global-task-mode-entry-btn,\s*html\.native-ios-mac\s+\.global-task-mode-entry-btn\s*\{[^}]*\}/,
+    )?.[0];
+    expect(entryBtnRule, '.global-task-mode-entry-btn rule missing').toBeTruthy();
+    expect(entryBtnRule).toMatch(/position:\s*relative/);
+    expect(entryBtnRule).toMatch(/overflow:\s*visible/);
+
+    const badgeRule = cssWithoutComments.match(/\.global-task-mode-badge\s*\{[^}]*\}/)?.[0];
+    expect(badgeRule, '.global-task-mode-badge rule missing').toBeTruthy();
+    expect(badgeRule).toMatch(/position:\s*absolute/);
+    expect(badgeRule).toMatch(/top:\s*-4px/);
+    expect(badgeRule).toMatch(/right:\s*-4px/);
+    expect(badgeRule).toMatch(/pointer-events:\s*none/);
+    expect(badgeRule).toMatch(/min-width:\s*14px/);
+    expect(badgeRule).toMatch(/height:\s*14px/);
+    expect(badgeRule).toMatch(/font-size:\s*9px/);
+    expect(badgeRule).toMatch(/background:\s*#14b8a6/);
+    expect(badgeRule).toMatch(/color:\s*#042f2e/);
+
+    const attentionBadgeRule = cssWithoutComments.match(
+      /\.global-task-mode-entry-btn\.is-attention\s+\.global-task-mode-badge\s*\{[^}]*\}/,
+    )?.[0];
+    expect(attentionBadgeRule, 'attention badge rule missing').toBeTruthy();
+    expect(attentionBadgeRule).toMatch(/background:\s*#f59e0b/);
+    expect(attentionBadgeRule).toMatch(/color:\s*#451a03/);
+  });
 });

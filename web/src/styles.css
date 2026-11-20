@@ -23121,7 +23121,7 @@ html.native-ios-mac .global-task-mode-entry-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  overflow: visible;
   padding: 5px 8px;
   border-radius: 7px;
   border: 1.5px solid rgba(20, 184, 166, 0.72);
@@ -23157,16 +23157,22 @@ html.native-ios-mac .global-task-mode-entry-btn {
 }
 
 .global-task-mode-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  z-index: 1;
+  pointer-events: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 15px;
-  height: 15px;
-  padding: 0 4px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
   border-radius: 999px;
   background: #14b8a6;
   color: #042f2e;
-  font-size: 10px;
+  box-shadow: 0 0 0 1.5px rgba(15, 23, 42, 0.92);
+  font-size: 9px;
   font-weight: 700;
   line-height: 1;
   font-variant-numeric: tabular-nums;
