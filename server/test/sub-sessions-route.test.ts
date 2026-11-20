@@ -16,6 +16,7 @@ vi.mock('../src/security/authorization.js', () => ({
     return next();
   },
   resolveServerRole: vi.fn().mockResolvedValue('owner'),
+  resolveServerMembershipRole: vi.fn().mockResolvedValue('owner'),
 }));
 
 vi.mock('../src/routes/share-http-auth.js', () => ({

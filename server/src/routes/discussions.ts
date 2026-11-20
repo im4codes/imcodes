@@ -17,7 +17,7 @@ import {
   type DbOrchestrationRun,
 } from '../db/queries.js';
 import { sanitizeLegacyP2pProgressSnapshot } from '../p2p-workflow-sanitize.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth, resolveServerMembershipRole, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import {
   deriveShareTransitionKey,
@@ -133,11 +133,11 @@ async function resolveDiscussionActor(
   target: ShareTarget,
   now: number,
 ): Promise<EffectiveDiscussionActor | null> {
-  const serverRole = await resolveServerRole(db, serverId, userId);
-  if (serverRole === 'owner' || serverRole === 'admin') {
+  const membership = await resolveServerMembershipRole(db, serverId, userId);
+  if (membership === 'owner' || membership === 'admin') {
     return { kind: 'member', effectiveActorRole: 'server-manager', snapshot: memberSnapshot(target, now) };
   }
-  if (serverRole === 'member') {
+  if (membership === 'member') {
     return { kind: 'member', effectiveActorRole: 'server-member', snapshot: memberSnapshot(target, now) };
   }
 

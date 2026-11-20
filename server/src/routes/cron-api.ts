@@ -476,7 +476,7 @@ async function cronScopeCoversPayload(
     if (!scope.sharedSessionName || payload.targetSessionName !== scope.sharedSessionName) {
       return false;
     }
-    if (payload.action.type === 'send' && payload.action.target !== scope.sharedSessionName) {
+    if (payload.action.type === 'send' && (payload.action.broadcast || payload.action.target !== scope.sharedSessionName)) {
       return false;
     }
     if (payload.action.type === 'p2p') {
@@ -488,6 +488,10 @@ async function cronScopeCoversPayload(
       }
     }
     return true;
+  }
+
+  if (payload.action.type === 'send' && payload.action.broadcast) {
+    return false;
   }
 
   if (payload.targetSessionName) {
@@ -532,6 +536,7 @@ function pinnedSessionCoversPayload(
 
   const action = payload.action;
   if (action?.type === 'send') {
+    if (action.broadcast) return false;
     const allowedSendTarget = action.target === pinnedSessionName
       || (!isSubPinned && expectedMainRole !== null && action.target === expectedMainRole);
     if (!allowedSendTarget) return false;
@@ -554,6 +559,14 @@ function pinnedSessionCoversPayload(
   return true;
 }
 
+async function runCronWriteTx<T>(db: Database, fn: (tx: Database) => Promise<T>): Promise<T> {
+  const txFn = (db as Database & { transaction?: (cb: (tx: Database) => Promise<unknown>) => Promise<unknown> }).transaction;
+  if (typeof txFn === 'function') {
+    return await txFn.call(db, fn) as T;
+  }
+  return await fn(db);
+}
+
 async function isSharedCronMutationAllowed(
   db: Database,
   params: {
@@ -570,7 +583,7 @@ async function isSharedCronMutationAllowed(
   const prov = await db.queryOne<{ shared?: boolean }>(
     'SELECT shared FROM cron_job_provenance WHERE job_id = $1',
     [params.job.id],
-  ).catch(() => null);
+  );
   return Boolean(prov?.shared);
 }
 
@@ -770,19 +783,22 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
     validation.intervalMs,
   );
 
-  await c.env.DB.execute(
-    `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)`,
-    [id, serverId, access.scope.ownerUserId, name, cronExpr, access.scope.projectName ?? projectName, targetRole, targetSessionName ?? null, JSON.stringify(persistedAction), timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, completionPolicy, now],
-  );
-  if (access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId) {
-    await c.env.DB.execute(
-      `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (job_id) DO NOTHING`,
-      [id, authority.actorUserId, serverId, access.scope.projectName ?? projectName ?? null, Boolean(access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId), now],
-    ).catch(() => {});
-  }
+  const requiresProvenance = access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId;
+  await runCronWriteTx(c.env.DB, async (tx) => {
+    await tx.execute(
+      `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)`,
+      [id, serverId, access.scope.ownerUserId, name, cronExpr, access.scope.projectName ?? projectName, targetRole, targetSessionName ?? null, JSON.stringify(persistedAction), timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, completionPolicy, now],
+    );
+    if (requiresProvenance) {
+      await tx.execute(
+        `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (job_id) DO NOTHING`,
+        [id, authority.actorUserId, serverId, access.scope.projectName ?? projectName ?? null, true, now],
+      );
+    }
+  });
 
   await logAudit({ userId: authority.actorUserId, action: 'cron.create', details: { id, name, cronExpr, projectName: access.scope.projectName ?? projectName } }, c.env.DB);
   // Notify open browser views (incl. crons created externally via MCP) to refetch.
@@ -935,21 +951,35 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   }
 
   vals.push(jobId);
-  await c.env.DB.execute(
-    `UPDATE cron_jobs SET ${sets.join(', ')} WHERE id = $${idx}`,
-    vals,
-  );
-  if (access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== job.user_id) {
-    await c.env.DB.execute(
-      `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
-       VALUES ($1, $2, $3, $4, TRUE, $5)
-       ON CONFLICT (job_id) DO UPDATE
-         SET creator_user_id = EXCLUDED.creator_user_id,
-             server_id = EXCLUDED.server_id,
-             project_name = EXCLUDED.project_name,
-             shared = TRUE`,
-      [jobId, authority.actorUserId, job.server_id, updates.projectName ?? job.project_name ?? null, now],
-    ).catch(() => {});
+  const isSharedOrNonOwner = access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== job.user_id;
+  const txAllowed = await runCronWriteTx(c.env.DB, async (tx) => {
+    if (isSharedOrNonOwner) {
+      const prov = await tx.queryOne<{ shared?: boolean }>(
+        'SELECT shared FROM cron_job_provenance WHERE job_id = $1',
+        [jobId],
+      );
+      if (!prov?.shared) return false;
+    }
+    await tx.execute(
+      `UPDATE cron_jobs SET ${sets.join(', ')} WHERE id = $${idx}`,
+      vals,
+    );
+    if (isSharedOrNonOwner) {
+      await tx.execute(
+        `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+         VALUES ($1, $2, $3, $4, TRUE, $5)
+         ON CONFLICT (job_id) DO UPDATE
+           SET creator_user_id = EXCLUDED.creator_user_id,
+               server_id = EXCLUDED.server_id,
+               project_name = EXCLUDED.project_name,
+               shared = TRUE`,
+        [jobId, authority.actorUserId, job.server_id, updates.projectName ?? job.project_name ?? null, now],
+      );
+    }
+    return true;
+  });
+  if (!txAllowed) {
+    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
   }
 
   await logAudit({

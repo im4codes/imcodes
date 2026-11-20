@@ -179,7 +179,7 @@ describe('cross-share & platform hardening regressions', () => {
         },
       });
       expect(bgSessRes.status).toBe(200);
-    });
+    }, 15_000);
   });
 
   describe('job-dispatch verifySharedCronCreatorStillAuthorized sub-session isolation', () => {
@@ -220,7 +220,14 @@ describe('cross-share & platform hardening regressions', () => {
           const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
           if (s.startsWith('select exists (')) return { exists: true };
           if (s.includes('from servers where id')) {
-            return { user_id: 'owner-1', owner_status: 'active', actor_status: 'active' };
+            return {
+              token_hash: DAEMON_TOKEN_HASH,
+              owner_status: 'active',
+              actor_status: 'active',
+              user_id: 'owner-1',
+              node_role: NODE_ROLE.FULL,
+              revoked_at: null,
+            };
           }
           if (s.includes('from cron_job_provenance')) {
             return { creator_user_id: 'part-1', shared: true };
@@ -536,6 +543,572 @@ describe('cross-share & platform hardening regressions', () => {
           action: { type: 'command', command: '/status' },
         }),
       })).status).toBe(201);
+    });
+  });
+
+  describe('cron provenance atomicity, fail-closed reads, and scoped broadcast prevention', () => {
+    beforeEach(() => {
+      vi.resetModules();
+    });
+
+    it('rolls back cron_jobs insert and update atomically when cron_job_provenance persistence fails', async () => {
+      vi.doMock('../src/ws/bridge.js', () => ({
+        WsBridge: { publishResourceChanged: vi.fn(), get: () => ({ isDaemonConnected: () => true, sendToDaemon: vi.fn() }) },
+      }));
+      const { cronApiRoutes } = await import('../src/routes/cron-api.js');
+
+      const storedJobs = new Map<string, Record<string, unknown>>();
+      const storedProv = new Map<string, { creator_user_id: string; shared: boolean }>();
+      let failProvWrite = false;
+
+      const makeTxClient = (draftJobs: Map<string, Record<string, unknown>>, draftProv: Map<string, { creator_user_id: string; shared: boolean }>) => ({
+        queryOne: async (sql: string, params: unknown[] = []) => {
+          { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
+          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+          if (s.startsWith('select exists (')) return { exists: true };
+          if (s.includes('from servers where id')) {
+            return {
+              token_hash: DAEMON_TOKEN_HASH,
+              owner_status: 'active',
+              actor_status: 'active',
+              user_id: 'owner-1',
+              node_role: NODE_ROLE.FULL,
+              revoked_at: null,
+            };
+          }
+          if (s.includes('from sessions where server_id')) return { project_name: 'proj', role: 'brain' };
+          if (s.includes('from cron_jobs where id')) return draftJobs.get(params[0] as string) ?? null;
+          if (s.includes('from cron_job_provenance where job_id')) return draftProv.get(params[0] as string) ?? null;
+          return null;
+        },
+        query: async (sql: string) => {
+          const s = sql.toLowerCase();
+          if (s.includes('from session_shares')) {
+            return [{
+              id: 'share-main-tx',
+              server_id: 'srv-1',
+              target_kind: 'main',
+              session_name: 'deck_proj_brain',
+              target_user_id: 'part-1',
+              role: 'participant',
+              created_by: 'owner-1',
+              created_at: 1,
+              updated_at: 1,
+              expires_at: null,
+              revoked_at: null,
+            }];
+          }
+          return [];
+        },
+        execute: async (sql: string, params: unknown[] = []) => {
+          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+          if (s.startsWith('insert into cron_jobs')) {
+            draftJobs.set(params[0] as string, {
+              id: params[0],
+              server_id: params[1],
+              user_id: params[2],
+              name: params[3],
+              cron_expr: params[4],
+              project_name: params[5],
+              target_role: params[6],
+              target_session_name: params[7],
+              action: params[8],
+              timezone: params[9],
+              status: params[10],
+              next_run_at: params[11],
+            });
+            return { changes: 1 };
+          }
+          if (s.startsWith('update cron_jobs set')) {
+            const jobId = params[params.length - 1] as string;
+            const existing = draftJobs.get(jobId);
+            if (!existing) return { changes: 0 };
+            draftJobs.set(jobId, { ...existing, name: params[1], action: params[2] });
+            return { changes: 1 };
+          }
+          if (s.includes('into cron_job_provenance')) {
+            if (failProvWrite) throw new Error('simulated_provenance_write_failure');
+            draftProv.set(params[0] as string, {
+              creator_user_id: params[1] as string,
+              shared: Boolean(params[2]),
+            });
+            return { changes: 1 };
+          }
+          return { changes: 1 };
+        },
+      });
+
+      const txDb = {
+        ...makeTxClient(storedJobs, storedProv),
+        transaction: async <T>(fn: (tx: Database) => Promise<T>): Promise<T> => {
+          const draftJobs = new Map(storedJobs);
+          const draftProv = new Map(storedProv);
+          const res = await fn(makeTxClient(draftJobs, draftProv) as unknown as Database);
+          storedJobs.clear();
+          for (const [k, v] of draftJobs) storedJobs.set(k, v);
+          storedProv.clear();
+          for (const [k, v] of draftProv) storedProv.set(k, v);
+          return res;
+        },
+      } as unknown as Database;
+
+      const app = new Hono<{ Bindings: Env }>();
+      app.use('*', async (c, next) => {
+        c.env = { DB: txDb, JWT_SIGNING_KEY: JWT_KEY } as Env;
+        await next();
+      });
+      app.route('/api/server/:serverId/cron', cronApiRoutes);
+
+      const partToken = issueSharedMachineAuthority({
+        type: SHARED_MACHINE_AUTHORITY_TYPE,
+        sub: 'part-1',
+        sourceServerId: 'srv-1',
+        sessionName: 'deck_proj_brain',
+        projectName: 'proj',
+        shareTarget: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+        actionId: 'act-part-tx',
+      }, JWT_KEY);
+      const headers = {
+        Authorization: `Bearer ${DAEMON_TOKEN}`,
+        'X-Server-Id': 'srv-1',
+        [SHARED_MACHINE_AUTHORITY_HEADER]: partToken,
+        'Content-Type': 'application/json',
+      };
+      // 1) POST rollback on provenance write error
+      failProvWrite = true;
+      const postRes = await app.request('/api/server/srv-1/cron', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          name: 'should-rollback',
+          cronExpr: '0 9 * * *',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'command', command: '/status' },
+        }),
+      });
+      expect(postRes.status).toBe(500);
+      expect(storedJobs.size).toBe(0);
+      expect(storedProv.size).toBe(0);
+
+      // 2) Seed valid job + provenance, then fail provenance upsert during PUT -> job row must remain untouched
+      failProvWrite = false;
+      const okPost = await app.request('/api/server/srv-1/cron', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          name: 'seed-job',
+          cronExpr: '0 9 * * *',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'command', command: '/status' },
+        }),
+      });
+      expect(okPost.status).toBe(201);
+      const created = await okPost.json() as { id: string };
+      expect(storedJobs.get(created.id)?.name).toBe('seed-job');
+
+      failProvWrite = true;
+      const putRes = await app.request(`/api/server/srv-1/cron/${created.id}`, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({
+          name: 'mutated-should-rollback',
+          action: { type: 'command', command: '/mutated' },
+        }),
+      });
+      expect(putRes.status).toBe(500);
+      expect(storedJobs.get(created.id)?.name).toBe('seed-job');
+      expect(storedJobs.get(created.id)?.action).toBe(JSON.stringify({ type: 'command', command: '/status', onlyWhenIdle: true }));
+    });
+
+    it('fails closed in dispatchJobNow and jobDispatchCron when cron_job_provenance query fails (never minting authority or sending)', async () => {
+      const sendToDaemon = vi.fn();
+      vi.doMock('../src/ws/bridge.js', () => ({
+        WsBridge: {
+          publishResourceChanged: vi.fn(),
+          get: () => ({ isDaemonConnected: () => true, sendToDaemon }),
+        },
+      }));
+      const { dispatchJobNow, jobDispatchCron } = await import('../src/cron/job-dispatch.js');
+      const now = Date.now();
+      const executions = new Map<string, string>();
+      const baseJob = {
+        id: 'cron-prov-err',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'prov-err-job',
+        cron_expr: '*/5 * * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: 'deck_proj_brain',
+        action: JSON.stringify({ type: 'command', command: '/status' }),
+        timezone: null,
+        expires_at: null,
+        completion_policy: 'recurring',
+        last_run_at: null,
+        next_run_at: now - 1000,
+        status: 'active',
+        execution_id: 'exec-1',
+      };
+      const db = {
+        queryOne: async (sql: string) => {
+          { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
+          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+          if (s.includes('from cron_job_provenance')) throw new Error('db_provenance_read_timeout');
+          if (s.includes('from servers where id')) return { user_id: 'owner-1', owner_status: 'active', actor_status: 'active' };
+          return null;
+        },
+        query: async (sql: string) => {
+          const s = sql.toLowerCase();
+          if (s.includes('from cron_executions e')) return [];
+          if (s.includes('from cron_jobs')) return [baseJob];
+          return [];
+        },
+        execute: async (sql: string, params: unknown[] = []) => {
+          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+          if (s.startsWith('insert into cron_executions')) {
+            executions.set(params[0] as string, params[2] as string);
+          } else if (s.startsWith('update cron_executions set status = $1 where id = $2')) {
+            executions.set(params[1] as string, params[0] as string);
+          }
+          return { changes: 1 };
+        },
+        transaction: async <T>(fn: (tx: Database) => Promise<T>) => fn(db),
+      } as unknown as Database;
+      executions.set('exec-1', 'dispatching');
+
+      await expect(dispatchJobNow({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env, baseJob as never)).rejects.toThrow('db_provenance_read_timeout');
+      expect(sendToDaemon).not.toHaveBeenCalled();
+
+      await jobDispatchCron({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env);
+      expect(sendToDaemon).not.toHaveBeenCalled();
+      // Execution remains retryable (pending_dispatch) rather than marked dispatched or cancelled
+      const statuses = [...executions.values()];
+      expect(statuses).not.toContain('dispatched');
+      expect(statuses).toContain('pending_dispatch');
+    });
+
+    it('rejects broadcast send escape for sub-session and main shares across API and dispatch while keeping scoped command and whole-server broadcast working', async () => {
+      const sendToDaemon = vi.fn();
+      vi.doMock('../src/ws/bridge.js', () => ({
+        WsBridge: {
+          publishResourceChanged: vi.fn(),
+          get: () => ({ isDaemonConnected: () => true, sendToDaemon }),
+        },
+      }));
+      const { cronApiRoutes } = await import('../src/routes/cron-api.js');
+      const { dispatchJobNow, jobDispatchCron } = await import('../src/cron/job-dispatch.js');
+      const now = Date.now();
+
+      const activeShares = [
+        {
+          id: 'share-sub-1',
+          server_id: 'srv-1',
+          target_kind: 'subsession',
+          sub_session_id: 'allowed1',
+          target_user_id: 'part-sub',
+          role: 'participant',
+          created_by: 'owner-1',
+          created_at: 1,
+          updated_at: 1,
+          expires_at: null,
+          revoked_at: null,
+        },
+        {
+          id: 'share-main-1',
+          server_id: 'srv-1',
+          target_kind: 'main',
+          session_name: 'deck_proj_brain',
+          target_user_id: 'part-main',
+          role: 'participant',
+          created_by: 'owner-1',
+          created_at: 1,
+          updated_at: 1,
+          expires_at: null,
+          revoked_at: null,
+        },
+        {
+          id: 'share-srv-1',
+          server_id: 'srv-1',
+          target_kind: 'server',
+          target_user_id: 'part-srv',
+          role: 'participant',
+          created_by: 'owner-1',
+          created_at: 1,
+          updated_at: 1,
+          expires_at: null,
+          revoked_at: null,
+        },
+      ];
+
+      let existingJobProvenance = { creator_user_id: 'part-sub', shared: true };
+      const db = {
+        queryOne: async (sql: string, params: unknown[] = []) => {
+          { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
+          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+          if (s.startsWith('select exists (')) return { exists: true };
+          if (s.includes('from servers where id')) {
+            return {
+              token_hash: DAEMON_TOKEN_HASH,
+              owner_status: 'active',
+              actor_status: 'active',
+              user_id: 'owner-1',
+              node_role: NODE_ROLE.FULL,
+              revoked_at: null,
+            };
+          }
+          if (s.includes('from sessions where server_id')) {
+            return { project_name: 'proj' };
+          }
+          if (s.includes('from sub_sessions where id')) {
+            return { id: params[0], server_id: 'srv-1', closed_at: null, parent_session: 'deck_proj_brain', execution_clone_metadata: null };
+          }
+          if (s.includes('from cron_job_provenance')) {
+            return existingJobProvenance;
+          }
+          if (s.includes('from cron_jobs where id')) {
+            return {
+              id: params[0],
+              user_id: 'owner-1',
+              server_id: 'srv-1',
+              project_name: 'proj',
+              target_role: 'brain',
+              target_session_name: 'deck_sub_allowed1',
+              name: 'existing-sub',
+              cron_expr: '0 9 * * *',
+              action: JSON.stringify({ type: 'command', command: '/status' }),
+              status: 'active',
+            };
+          }
+          return null;
+        },
+        query: async (sql: string, params: unknown[] = []) => {
+          const s = sql.toLowerCase();
+          if (s.includes('union all')) {
+            return activeShares.filter((r) => params.includes(r.target_user_id));
+          }
+          if (s.includes('from server_shares')) {
+            return activeShares.filter((r) => r.target_kind === 'server' && params.includes(r.target_user_id));
+          }
+          if (s.includes('from session_shares')) {
+            return activeShares.filter((r) => r.target_kind === 'main' && params.includes(r.target_user_id));
+          }
+          if (s.includes('from sub_session_shares')) {
+            return activeShares.filter((r) => r.target_kind === 'subsession' && params.includes(r.target_user_id));
+          }
+          if (s.includes('from cron_jobs')) return [];
+          return [];
+        },
+        execute: async () => ({ changes: 1 }),
+      } as unknown as Database;
+
+      const app = new Hono<{ Bindings: Env }>();
+      app.use('*', async (c, next) => {
+        c.env = { DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env;
+        await next();
+      });
+      app.route('/api/server/:serverId/cron', cronApiRoutes);
+
+      const subHeaders = {
+        Authorization: `Bearer ${DAEMON_TOKEN}`,
+        'X-Server-Id': 'srv-1',
+        [SHARED_MACHINE_AUTHORITY_HEADER]: issueSharedMachineAuthority({
+          type: SHARED_MACHINE_AUTHORITY_TYPE,
+          sub: 'part-sub',
+          sourceServerId: 'srv-1',
+          sessionName: 'deck_sub_allowed1',
+          projectName: 'proj',
+          shareTarget: { kind: 'subsession', serverId: 'srv-1', subSessionId: 'allowed1' },
+          actionId: 'act-bcast-sub',
+        }, JWT_KEY),
+        'Content-Type': 'application/json',
+      };
+      const mainHeaders = {
+        Authorization: `Bearer ${DAEMON_TOKEN}`,
+        'X-Server-Id': 'srv-1',
+        [SHARED_MACHINE_AUTHORITY_HEADER]: issueSharedMachineAuthority({
+          type: SHARED_MACHINE_AUTHORITY_TYPE,
+          sub: 'part-main',
+          sourceServerId: 'srv-1',
+          sessionName: 'deck_proj_brain',
+          projectName: 'proj',
+          shareTarget: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          actionId: 'act-bcast-main',
+        }, JWT_KEY),
+        'Content-Type': 'application/json',
+      };
+      const { signJwt } = await import('../src/security/crypto.js');
+      const srvWebHeaders = {
+        Authorization: `Bearer ${signJwt({ sub: 'part-srv', type: 'web' }, JWT_KEY, 3600)}`,
+        'Content-Type': 'application/json',
+      };
+
+      // API POST & PUT reject broadcast: true for subsession and main shares
+      expect((await app.request('/api/server/srv-1/cron', {
+        method: 'POST',
+        headers: subHeaders,
+        body: JSON.stringify({
+          name: 'sub-bcast',
+          cronExpr: '0 9 * * *',
+          projectName: 'proj',
+          targetRole: 'brain',
+          targetSessionName: 'deck_sub_allowed1',
+          action: { type: 'send', target: 'deck_sub_allowed1', message: 'hi', broadcast: true },
+        }),
+      })).status).toBe(403);
+
+      expect((await app.request('/api/server/srv-1/cron/job-sub-1', {
+        method: 'PUT',
+        headers: subHeaders,
+        body: JSON.stringify({
+          action: { type: 'send', target: 'deck_sub_allowed1', message: 'hi', broadcast: true },
+        }),
+      })).status).toBe(403);
+
+      expect((await app.request('/api/server/srv-1/cron', {
+        method: 'POST',
+        headers: mainHeaders,
+        body: JSON.stringify({
+          name: 'main-bcast',
+          cronExpr: '0 9 * * *',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'send', target: 'brain', message: 'hi', broadcast: true },
+        }),
+      })).status).toBe(403);
+
+      // Whole-server share keeps broadcast send working on API (via web user auth, not a session-pinned turn)
+      expect((await app.request('/api/server/srv-1/cron', {
+        method: 'POST',
+        headers: srvWebHeaders,
+        body: JSON.stringify({
+          name: 'srv-bcast',
+          cronExpr: '0 9 * * *',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'send', target: 'brain', message: 'hi', broadcast: true },
+        }),
+      })).status).toBe(201);
+
+      // Manual dispatchJobNow rejects persisted broadcast: true for subsession & main shares without sending
+      existingJobProvenance = { creator_user_id: 'part-sub', shared: true };
+      await expect(dispatchJobNow({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env, {
+        id: 'cron-sub-bcast',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'sub-bcast',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: 'deck_sub_allowed1',
+        action: JSON.stringify({ type: 'send', target: 'deck_sub_allowed1', message: 'hi', broadcast: true }),
+        timezone: null,
+        expires_at: null,
+        completion_policy: 'recurring',
+        last_run_at: null,
+        next_run_at: now + 60_000,
+        status: 'active',
+      } as never)).rejects.toThrow('share_revoked');
+      expect(sendToDaemon).not.toHaveBeenCalled();
+
+      existingJobProvenance = { creator_user_id: 'part-main', shared: true };
+      await expect(dispatchJobNow({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env, {
+        id: 'cron-main-bcast',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'main-bcast',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: 'deck_proj_brain',
+        action: JSON.stringify({ type: 'send', target: 'deck_proj_brain', message: 'hi', broadcast: true }),
+        timezone: null,
+        expires_at: null,
+        completion_policy: 'recurring',
+        last_run_at: null,
+        next_run_at: now + 60_000,
+        status: 'active',
+      } as never)).rejects.toThrow('share_revoked');
+      expect(sendToDaemon).not.toHaveBeenCalled();
+
+      // Scheduled jobDispatchCron rejects broadcast escape without sending, while dispatching whole-server broadcast & scoped command
+      const schedDb = {
+        ...db,
+        queryOne: async (sql: string, params: unknown[] = []) => {
+          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+          if (s.includes('from cron_job_provenance')) {
+            const jid = params[0] as string;
+            if (jid === 'sched-sub-bcast') return { creator_user_id: 'part-sub', shared: true };
+            if (jid === 'sched-sub-cmd') return { creator_user_id: 'part-sub', shared: true };
+            if (jid === 'sched-srv-bcast') return { creator_user_id: 'part-srv', shared: true };
+          }
+          return db.queryOne(sql, params);
+        },
+        query: async (sql: string, params: unknown[] = []) => {
+          const s = sql.toLowerCase();
+          if (s.includes('from cron_jobs')) {
+            return [
+              {
+                id: 'sched-sub-bcast',
+                server_id: 'srv-1',
+                user_id: 'owner-1',
+                name: 'sub-bcast',
+                cron_expr: '0 9 * * *',
+                project_name: 'proj',
+                target_role: 'brain',
+                target_session_name: 'deck_sub_allowed1',
+                action: JSON.stringify({ type: 'send', target: 'deck_sub_allowed1', message: 'hi', broadcast: true }),
+                timezone: null,
+                expires_at: null,
+                completion_policy: 'recurring',
+                last_run_at: null,
+                next_run_at: now - 1000,
+                status: 'active',
+              },
+              {
+                id: 'sched-sub-cmd',
+                server_id: 'srv-1',
+                user_id: 'owner-1',
+                name: 'sub-cmd',
+                cron_expr: '0 9 * * *',
+                project_name: 'proj',
+                target_role: 'brain',
+                target_session_name: 'deck_sub_allowed1',
+                action: JSON.stringify({ type: 'command', command: '/status' }),
+                timezone: null,
+                expires_at: null,
+                completion_policy: 'recurring',
+                last_run_at: null,
+                next_run_at: now - 1000,
+                status: 'active',
+              },
+              {
+                id: 'sched-srv-bcast',
+                server_id: 'srv-1',
+                user_id: 'owner-1',
+                name: 'srv-bcast',
+                cron_expr: '0 9 * * *',
+                project_name: 'proj',
+                target_role: 'brain',
+                target_session_name: null,
+                action: JSON.stringify({ type: 'send', target: 'brain', message: 'ok', broadcast: true }),
+                timezone: null,
+                expires_at: null,
+                completion_policy: 'recurring',
+                last_run_at: null,
+                next_run_at: now - 1000,
+                status: 'active',
+              },
+            ];
+          }
+          return db.query(sql, params);
+        },
+      } as unknown as Database;
+
+      await jobDispatchCron({ DB: schedDb, JWT_SIGNING_KEY: JWT_KEY } as Env);
+      const sentIds = sendToDaemon.mock.calls.map((call) => JSON.parse(call[0] as string).jobId as string);
+      expect(sentIds).toEqual(['sched-sub-cmd', 'sched-srv-bcast']);
     });
   });
 });

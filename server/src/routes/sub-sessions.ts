@@ -8,7 +8,7 @@ import {
   deleteSubSession,
   reorderSubSessions,
 } from '../db/queries.js';
-import { requireAuth } from '../security/authorization.js';
+import { requireAuth, resolveServerMembershipRole } from '../security/authorization.js';
 import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import {
   resolveHttpShareAccess,
@@ -117,7 +117,6 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   const member = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   const memberMayCreate = member.ok && (member.role === 'owner' || member.role === 'admin');
   let mayCreate = memberMayCreate;
-  let wholeServerShare = false;
   let shareReason: string | undefined;
   let effectiveParentSession = parentSession;
 
@@ -165,7 +164,6 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
       if (serverAccess.actor.kind === 'share') {
         if (serverAccess.actor.effectiveActorRole === 'participant') {
           mayCreate = true;
-          wholeServerShare = true;
         } else if (!shareReason) {
           shareReason = 'share-role-denied';
         }
@@ -178,9 +176,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
       const participantShare = shares.find((s) => s.serverId === serverId && s.role === 'participant');
       if (participantShare) {
         mayCreate = true;
-        if (participantShare.target.kind === 'server') {
-          wholeServerShare = true;
-        } else if (participantShare.target.kind === 'main' && participantShare.target.sessionName) {
+        if (participantShare.target.kind === 'main' && participantShare.target.sessionName) {
           effectiveParentSession = participantShare.target.sessionName;
         } else if (participantShare.target.kind === 'subsession' && participantShare.target.subSessionId) {
           effectiveParentSession = `deck_sub_${participantShare.target.subSessionId}`;
@@ -196,8 +192,11 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     const reason = shareReason ?? (member.ok ? 'share-role-denied' : member.reason);
     return c.json({ error: 'forbidden', reason }, 403);
   }
-  if (!member.ok && !wholeServerShare && Object.prototype.hasOwnProperty.call(body, 'transport_config')) {
-    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  if (body.transport_config !== undefined && body.transport_config !== null) {
+    const realMembership = await resolveServerMembershipRole(c.env.DB, serverId, userId);
+    if (realMembership !== 'owner' && realMembership !== 'admin') {
+      return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+    }
   }
   // Generate 8-char id
   const id = Array.from(crypto.getRandomValues(new Uint8Array(6)))

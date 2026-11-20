@@ -61,16 +61,32 @@ async function prepareCronAction(env: Env, job: DbCronJob): Promise<PreparedCron
   return { ok: true, action: registered.action };
 }
 
+type CronProvenanceRow = { creator_user_id: string; shared: boolean };
+type CronProvenanceLookup =
+  | { ok: true; row: CronProvenanceRow | null }
+  | { ok: false; error: unknown };
+
+async function readCronJobProvenance(db: Database, jobId: string): Promise<CronProvenanceLookup> {
+  if (typeof (db as { queryOne?: unknown })?.queryOne !== 'function') {
+    return { ok: true, row: null };
+  }
+  try {
+    const row = await db.queryOne<CronProvenanceRow>(
+      'SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1',
+      [jobId],
+    );
+    return { ok: true, row: row ?? null };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
 async function verifySharedCronCreatorStillAuthorized(
   db: Database,
   job: DbCronJob,
   now: number,
+  prov: CronProvenanceRow | null,
 ): Promise<boolean> {
-  if (typeof (db as { queryOne?: unknown })?.queryOne !== 'function') return true;
-  const prov = await db.queryOne<{ creator_user_id: string; shared: boolean }>(
-    'SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1',
-    [job.id],
-  ).catch(() => null);
   if (!prov || !prov.shared || prov.creator_user_id === job.user_id) return true;
 
   const member = await resolveServerMemberAccessOrShareDeny(db, {
@@ -79,7 +95,7 @@ async function verifySharedCronCreatorStillAuthorized(
   });
   if (member.ok) return true;
 
-  const shares = await listActiveSharesForUser(db, prov.creator_user_id, now).catch(() => []);
+  const shares = await listActiveSharesForUser(db, prov.creator_user_id, now);
   const participantShares = shares.filter((s) => s.serverId === job.server_id && s.role === 'participant');
   if (participantShares.length === 0) return false;
 
@@ -89,7 +105,7 @@ async function verifySharedCronCreatorStillAuthorized(
       const sess = await db.queryOne<{ project_name: string }>(
         'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
         [job.server_id, s.target.sessionName],
-      ).catch(() => null);
+      );
       if (sess?.project_name === job.project_name) {
         hasMatchingMainShare = true;
         break;
@@ -104,6 +120,12 @@ async function verifySharedCronCreatorStillAuthorized(
       parsedAction = parsed as Record<string, unknown>;
     }
   } catch {
+    return false;
+  }
+
+  // Non-whole-server shared crons must never use broadcast send semantics,
+  // which fan out across all project candidates regardless of target.
+  if (parsedAction?.type === 'send' && parsedAction.broadcast === true) {
     return false;
   }
 
@@ -139,6 +161,38 @@ async function verifySharedCronCreatorStillAuthorized(
     return true;
   }
 
+  if (parsedAction?.type === 'send' && typeof parsedAction.target === 'string' && parsedAction.target.startsWith('deck_')) {
+    const sendTarget = shareTargetFromSessionName(job.server_id, parsedAction.target);
+    if (!sendTarget) return false;
+    const access = await resolveHttpShareAccessForCoveredSession(db, {
+      serverId: job.server_id,
+      userId: prov.creator_user_id,
+      target: sendTarget,
+    });
+    if (access.actor.kind !== 'share' || access.actor.effectiveActorRole !== 'participant') {
+      return false;
+    }
+  }
+  if (parsedAction?.type === 'p2p') {
+    const entries = Array.isArray(parsedAction.participantEntries) ? parsedAction.participantEntries : [];
+    for (const entry of entries) {
+      if (entry && typeof entry === 'object' && (entry as Record<string, unknown>).type === 'session') {
+        const value = (entry as Record<string, unknown>).value;
+        if (typeof value !== 'string') return false;
+        const entryTarget = shareTargetFromSessionName(job.server_id, value);
+        if (!entryTarget) return false;
+        const access = await resolveHttpShareAccessForCoveredSession(db, {
+          serverId: job.server_id,
+          userId: prov.creator_user_id,
+          target: entryTarget,
+        });
+        if (access.actor.kind !== 'share' || access.actor.effectiveActorRole !== 'participant') {
+          return false;
+        }
+      }
+    }
+  }
+
   return hasMatchingMainShare;
 }
 
@@ -146,14 +200,11 @@ async function issueCronOwnerAuthority(
   env: Env,
   job: DbCronJob,
   executionId: string,
+  prov: CronProvenanceRow | null,
 ): Promise<string | undefined> {
   if (!env.JWT_SIGNING_KEY || typeof (env.DB as { queryOne?: unknown })?.queryOne !== 'function') {
     return undefined;
   }
-  const prov = await env.DB.queryOne<{ shared: boolean }>(
-    'SELECT shared FROM cron_job_provenance WHERE job_id = $1',
-    [job.id],
-  ).catch(() => null);
   if (prov?.shared) return undefined;
   const targetSessionName = job.target_session_name?.trim()
     || (job.project_name ? `deck_${job.project_name}_${job.target_role ?? 'brain'}` : '');
@@ -170,7 +221,11 @@ async function issueCronOwnerAuthority(
 
 /** Immediately dispatch a single cron job (for manual "Run Now" trigger). */
 export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
-  if (!await verifySharedCronCreatorStillAuthorized(env.DB, job, Date.now())) {
+  const provenance = await readCronJobProvenance(env.DB, job.id);
+  if (!provenance.ok) {
+    throw provenance.error instanceof Error ? provenance.error : new Error('cron_provenance_read_failed');
+  }
+  if (!await verifySharedCronCreatorStillAuthorized(env.DB, job, Date.now(), provenance.row)) {
     await env.DB.execute('UPDATE cron_jobs SET status = $1, updated_at = $2 WHERE id = $3', [CRON_STATUS.PAUSED, Date.now(), job.id]).catch(() => {});
     await logExecution(env, randomHex(12), job.id, 'error', 'share_revoked');
     throw new Error('share_revoked');
@@ -192,7 +247,7 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     logger.warn({ jobId: job.id }, 'Cron manual trigger: target_role is NULL, defaulting to brain');
   }
   const executionId = randomHex(12);
-  const ownerMachineAuthority = await issueCronOwnerAuthority(env, job, executionId);
+  const ownerMachineAuthority = await issueCronOwnerAuthority(env, job, executionId, provenance.row);
   const msg: CronDispatchMessage = {
     type: CRON_MSG.DISPATCH,
     jobId: job.id,
@@ -354,7 +409,19 @@ export async function jobDispatchCron(env: Env): Promise<void> {
 
   for (const job of dueJobs) {
     try {
-      if (!await verifySharedCronCreatorStillAuthorized(env.DB, job, now)) {
+      const provenance = await readCronJobProvenance(env.DB, job.id);
+      if (!provenance.ok) {
+        logger.error({ jobId: job.id, err: provenance.error }, 'Cron provenance read failed; refusing dispatch and keeping pending for retry');
+        if (job.execution_id) {
+          await env.DB.execute('UPDATE cron_executions SET status = $1 WHERE id = $2 AND status = $3', [
+            'pending_dispatch', job.execution_id, 'dispatching',
+          ]).catch(() => {});
+        } else {
+          await logExecution(env, randomHex(12), job.id, 'error', 'provenance_read_failed');
+        }
+        continue;
+      }
+      if (!await verifySharedCronCreatorStillAuthorized(env.DB, job, now, provenance.row)) {
         logger.info({ jobId: job.id }, 'Pausing shared cron job because creator access was revoked');
         await env.DB.execute('UPDATE cron_jobs SET status = $1, updated_at = $2 WHERE id = $3', [CRON_STATUS.PAUSED, now, job.id]).catch(() => {});
         if (job.execution_id) {
@@ -425,7 +492,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       // the claim, so the payload always describes the durable occurrence.
       const nextRun = job.next_run_at ?? calculateNextRun(job.cron_expr, now, job.timezone);
       const executionId = job.execution_id ?? randomHex(12);
-      const ownerMachineAuthority = await issueCronOwnerAuthority(env, job, executionId);
+      const ownerMachineAuthority = await issueCronOwnerAuthority(env, job, executionId, provenance.row);
       const msg: CronDispatchMessage = {
         type: CRON_MSG.DISPATCH,
         jobId: job.id,

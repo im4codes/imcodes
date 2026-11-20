@@ -1243,6 +1243,10 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
         v.content_md
       FROM shared_context_document_bindings b
       JOIN shared_context_document_versions v ON v.id = b.version_id
+      JOIN shared_context_documents d
+        ON d.id = v.document_id
+       AND d.id = b.document_id
+       AND d.enterprise_id = b.enterprise_id
       WHERE b.enterprise_id = $1
         AND b.status = 'active'
         AND v.status = 'active'
@@ -1253,6 +1257,7 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
             SELECT 1
             FROM shared_project_enrollments e
             WHERE e.id = b.enrollment_id
+              AND e.enterprise_id = b.enterprise_id
               AND e.canonical_repo_id = $3
               AND e.status = 'active'
           )

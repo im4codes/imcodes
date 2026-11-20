@@ -16,6 +16,7 @@
  *    - Viewers are denied access (403 share-role-denied)
  *    - Outsiders are forbidden (403)
  */
+import { createHash } from 'node:crypto';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/index.js';
 import { createDatabase, type Database } from '../src/db/client.js';
@@ -644,5 +645,76 @@ describe('Real-machine test: Shared session participant 3-level session identity
       },
     );
     expect(putRes.status).toBe(403);
+  });
+});
+
+describe('Real-machine test: daemon authored-bindings cross-tenant isolation', () => {
+  it('excludes cross-tenant document, version, and enrollment bindings for a team-bound daemon', async () => {
+    const now = Date.now();
+    const daemonToken = 'authored-bindings-daemon-tok';
+    const tokenHash = createHash('sha256').update(daemonToken).digest('hex');
+    const authoredServerId = 'srv-authored-tenant-a';
+    const teamA = 'team-authored-a';
+    const teamB = 'team-authored-b';
+
+    await db.execute(
+      `INSERT INTO teams (id, name, owner_id, plan, created_at) VALUES ($1, 'Team A', $2, 'free', $3), ($4, 'Team B', $5, 'free', $3)`,
+      [teamA, OWNER_ID, now, teamB, PARTICIPANT_ID],
+    );
+    await createServer(db, authoredServerId, OWNER_ID, 'Authored Daemon Node', tokenHash);
+    await db.execute('UPDATE servers SET team_id = $1 WHERE id = $2', [teamA, authoredServerId]);
+
+    await db.execute(
+      `INSERT INTO shared_project_enrollments (id, enterprise_id, workspace_id, canonical_repo_id, display_name, scope, status, created_by, created_at, updated_at)
+       VALUES ($1, $2, NULL, 'github.com/acme/repo', 'Repo A', 'project_shared', 'active', $3, $4, $4),
+              ($5, $6, NULL, 'github.com/acme/repo', 'Repo B', 'project_shared', 'active', $7, $4, $4)`,
+      ['enr-a', teamA, OWNER_ID, now, 'enr-b', teamB, PARTICIPANT_ID],
+    );
+
+    await db.execute(
+      `INSERT INTO shared_context_documents (id, enterprise_id, kind, title, created_by, created_at, updated_at)
+       VALUES ('doc-a', $1, 'standard', 'Doc A', $2, $3, $3),
+              ('doc-b', $4, 'standard', 'Doc B', $5, $3, $3)`,
+      [teamA, OWNER_ID, now, teamB, PARTICIPANT_ID],
+    );
+
+    await db.execute(
+      `INSERT INTO shared_context_document_versions (id, document_id, version_number, label, content_md, status, created_by, created_at, activated_at)
+       VALUES ('ver-a', 'doc-a', 1, 'v1', 'Allowed Tenant A rule', 'active', $1, $2, $2),
+              ('ver-b', 'doc-b', 1, 'v1', 'SECRET Tenant B rule', 'active', $3, $2, $2)`,
+      [OWNER_ID, now, PARTICIPANT_ID],
+    );
+
+    await db.execute(
+      `INSERT INTO shared_context_document_bindings (id, enterprise_id, workspace_id, enrollment_id, document_id, version_id, binding_mode, status, created_by, created_at)
+       VALUES ('bind-valid-a', $1, NULL, 'enr-a', 'doc-a', 'ver-a', 'required', 'active', $2, $3),
+              ('bind-xtenant-doc', $1, NULL, 'enr-a', 'doc-b', 'ver-b', 'required', 'active', $2, $3),
+              ('bind-xtenant-enr', $1, NULL, 'enr-b', 'doc-a', 'ver-a', 'required', 'active', $2, $3)`,
+      [teamA, OWNER_ID, now],
+    );
+
+    const res = await app.request(`/api/server/${authoredServerId}/shared-context/authored-bindings`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${daemonToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        namespace: {
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          enterpriseId: teamA,
+        },
+        language: 'typescript',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { bindings: Array<{ bindingId: string; content: string }> };
+    expect(body.bindings).toHaveLength(1);
+    expect(body.bindings[0]).toMatchObject({
+      bindingId: 'bind-valid-a',
+      content: 'Allowed Tenant A rule',
+    });
   });
 });

@@ -1507,6 +1507,116 @@ describe('session-mgmt persistence routes', () => {
     expect(body.scopeKey).toBe('tsk_pair_456');
   });
 
+  it('discards client-supplied pair scopeKey on concrete session share GET/PUT/DELETE while keeping owner explicit pair scopeKey', async () => {
+    const app = await buildApp();
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+      shareProvenance: 'session',
+    });
+
+    // 1) Linked pair GET with spoofed scopeKey -> ignores client scopeKey, sends '', gets authoritative linked pair
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({
+      status: 'ok', scopeKey: 'tsk_pair_linked', content: 'Linked prompt', contentHash: 'lh', revision: 3, updatedAt: 90,
+    });
+    const linkedGet = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=pair&scopeKey=tsk_victim_999');
+    expect(linkedGet.status).toBe(200);
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      { op: 'get', scope: 'pair', scopeKey: '', sessionName: 'deck_proj_brain' },
+      expect.any(Number),
+    );
+    await expect(linkedGet.json()).resolves.toMatchObject({
+      profile: { scope: 'pair', scopeKey: 'tsk_pair_linked', content: 'Linked prompt' },
+    });
+
+    // 2) Unlinked / offline pair GET -> does NOT fall back to DB metadata lookup using spoofed scopeKey
+    mockDbQueryOne.mockClear();
+    sendSessionIdentityLocalRequestMock.mockRejectedValueOnce(new Error('daemon_offline'));
+    const offlineGet = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=pair&scopeKey=tsk_victim_999');
+    expect(offlineGet.status).toBe(409);
+    await expect(offlineGet.json()).resolves.toEqual({ error: 'daemon_offline' });
+    expect(mockDbQueryOne).not.toHaveBeenCalledWith(
+      expect.stringContaining('FROM session_identity_metadata'),
+      expect.anything(),
+    );
+
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({ status: 'ok' });
+    const unlinkedOnlineGet = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=pair&scopeKey=tsk_victim_999');
+    expect(unlinkedOnlineGet.status).toBe(200);
+    await expect(unlinkedOnlineGet.json()).resolves.toEqual({ profile: null });
+
+    // 3) PUT with spoofed scopeKey -> relays '', writes metadata only for authoritative returned scopeKey
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({
+      status: 'ok', scopeKey: 'tsk_pair_linked', contentHash: 'new-lh', revision: 4, updatedAt: 100,
+    });
+    mockDbQueryOne.mockResolvedValueOnce({
+      scope: 'pair', scope_key: 'tsk_pair_linked', content_hash: 'new-lh', content_length: 12,
+      revision: 4, updated_at: 100, source: 'web', source_file: null,
+    });
+    const putRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'pair', scopeKey: 'tsk_victim_999', content: 'Updated pair' }),
+    });
+    expect(putRes.status).toBe(200);
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      expect.objectContaining({ op: 'set', scope: 'pair', scopeKey: '', sessionName: 'deck_proj_brain', content: 'Updated pair' }),
+      expect.any(Number),
+    );
+    expect(mockDbQueryOne).toHaveBeenLastCalledWith(
+      expect.stringContaining('INSERT INTO session_identity_metadata'),
+      expect.arrayContaining(['owner-user', 'pair', 'tsk_pair_linked']),
+    );
+
+    // Unlinked PUT -> daemon rejects invalid local pair request -> 502 and no metadata written
+    mockDbQueryOne.mockClear();
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({ status: 'error', error: 'identity_local_request_invalid' });
+    const unlinkedPut = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'pair', scopeKey: 'tsk_victim_999', content: 'Blocked tamper' }),
+    });
+    expect(unlinkedPut.status).toBe(502);
+    expect(mockDbQueryOne).not.toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO session_identity_metadata'),
+      expect.anything(),
+    );
+
+    // 4) DELETE with spoofed scopeKey -> relays '', deletes only daemon-returned scopeKey, never spoofed key
+    mockDbExecute.mockClear();
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({ status: 'ok', scopeKey: 'tsk_pair_linked' });
+    const delRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=pair&scopeKey=tsk_victim_999', {
+      method: 'DELETE',
+    });
+    expect(delRes.status).toBe(200);
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      { op: 'delete', scope: 'pair', scopeKey: '', sessionName: 'deck_proj_brain' },
+      expect.any(Number),
+    );
+    expect(mockDbExecute).toHaveBeenLastCalledWith(
+      expect.stringContaining('DELETE FROM session_identity_metadata'),
+      ['owner-user', 'pair', 'tsk_pair_linked'],
+    );
+
+    // 5) Direct owner explicit-keyed PAIR continues to use caller scopeKey
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'owner',
+      actor: { kind: 'server-member', effectiveActorRole: 'server-manager' },
+    });
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({
+      status: 'ok', scopeKey: 'tsk_owner_123', content: 'Owner pair', contentHash: 'oh', revision: 1, updatedAt: 10,
+    });
+    const ownerGet = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=pair&scopeKey=tsk_owner_123');
+    expect(ownerGet.status).toBe(200);
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      { op: 'get', scope: 'pair', scopeKey: 'tsk_owner_123', sessionName: 'deck_proj_brain' },
+      expect.any(Number),
+    );
+  });
+
   it('serves the machine owner\'s identity to a whole-server participant before any session exists', async () => {
     mockResolveHttpShareAccess.mockResolvedValue({
       membership: 'none',

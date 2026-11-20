@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
+const mockResolveServerMembershipRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockResolveServerMemberAccessOrShareDeny = vi.fn();
 const mockResolveHttpShareAccess = vi.fn();
 const mockResolveHttpShareAccessForCoveredSession = vi.fn();
@@ -14,6 +15,7 @@ vi.mock('../src/security/authorization.js', () => ({
     await next();
   },
   resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args as []),
+  resolveServerMembershipRole: (...args: unknown[]) => mockResolveServerMembershipRole(...args as []),
 }));
 
 vi.mock('../src/routes/share-http-auth.js', () => ({
@@ -35,6 +37,7 @@ describe('sub-session routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    mockResolveServerMembershipRole.mockResolvedValue('owner');
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
     mockResolveHttpShareAccess.mockResolvedValue({
       membership: 'owner',
@@ -200,15 +203,46 @@ describe('sub-session routes', () => {
     expect(mockCreateSubSession).not.toHaveBeenCalled();
   });
 
-  it('rejects transport_config on POST /sub-sessions for share participants', async () => {
+  it('allows browser-shaped transport_config: null for main and sub-session share participants while rejecting non-null transport_config for all share participants (including whole-server) and allowing direct owner', async () => {
+    const app = await buildApp();
+
+    // 1) Main share participant with browser default transport_config: null -> 201
+    mockResolveServerMembershipRole.mockResolvedValue('none');
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
     mockResolveHttpShareAccess.mockResolvedValue({
       membership: 'none',
       actor: { kind: 'share', effectiveActorRole: 'participant' },
+      shareProvenance: 'session',
     });
-    const app = await buildApp();
+    const mainNullRes = await app.request('/api/server/srv-1/sub-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'codex-sdk',
+        parent_session: 'deck_project_brain',
+        transport_config: null,
+      }),
+    });
+    expect(mainNullRes.status).toBe(201);
+    expect(mockCreateSubSession).toHaveBeenCalledTimes(1);
 
-    const res = await app.request('/api/server/srv-1/sub-sessions', {
+    // 2) Sub-session share participant with browser default transport_config: null -> 201
+    mockCreateSubSession.mockClear();
+    const subNullRes = await app.request('/api/server/srv-1/sub-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'codex-sdk',
+        parent_session: 'deck_sub_allowed1',
+        transport_config: null,
+      }),
+    });
+    expect(subNullRes.status).toBe(201);
+    expect(mockCreateSubSession).toHaveBeenCalledTimes(1);
+
+    // 3) Main share participant with non-null transport_config -> 403
+    mockCreateSubSession.mockClear();
+    const mainNonNullRes = await app.request('/api/server/srv-1/sub-sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -217,10 +251,57 @@ describe('sub-session routes', () => {
         transport_config: { supervision: { mode: 'supervised' } },
       }),
     });
-
-    expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    expect(mainNonNullRes.status).toBe(403);
+    expect(await mainNonNullRes.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
     expect(mockCreateSubSession).not.toHaveBeenCalled();
+
+    // 4) Whole-server share participant (member.ok === true via resolveServerRole, but resolveServerMembershipRole === 'none'):
+    //    transport_config: null -> 201; non-null transport_config -> 403
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+      shareProvenance: 'server',
+    });
+    const wholeNullRes = await app.request('/api/server/srv-1/sub-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'codex-sdk',
+        parent_session: 'deck_project_brain',
+        transport_config: null,
+      }),
+    });
+    expect(wholeNullRes.status).toBe(201);
+
+    mockCreateSubSession.mockClear();
+    const wholeNonNullRes = await app.request('/api/server/srv-1/sub-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'codex-sdk',
+        parent_session: 'deck_project_brain',
+        transport_config: { supervision: { mode: 'supervised' } },
+      }),
+    });
+    expect(wholeNonNullRes.status).toBe(403);
+    expect(await wholeNonNullRes.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    expect(mockCreateSubSession).not.toHaveBeenCalled();
+
+    // 5) Direct server owner positive control with non-null transport_config -> 201
+    mockResolveServerMembershipRole.mockResolvedValue('owner');
+    const ownerRes = await app.request('/api/server/srv-1/sub-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'codex-sdk',
+        parent_session: 'deck_project_brain',
+        transport_config: { supervision: { mode: 'supervised' } },
+      }),
+    });
+    expect(ownerRes.status).toBe(201);
+    expect(mockCreateSubSession).toHaveBeenCalledTimes(1);
+    expect(mockCreateSubSession.mock.calls[0]?.[18]).toEqual({ supervision: { mode: 'supervised' } });
   });
 
   it('rejects cwd changes and shell/script type switches on PATCH /sub-sessions/:subId for single-session shares', async () => {

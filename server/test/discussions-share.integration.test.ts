@@ -290,6 +290,68 @@ describe('share-scoped discussion comments', () => {
     ]));
   });
 
+  it('pins threadId and records share actor metadata for whole-server share participants while direct owners keep custom threads', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(2_200);
+    const app = makeApp();
+    const { ownerId, recipientId, serverId } = await seedServer();
+    const wholeServerTarget = { kind: 'server', serverId } as const;
+    const share = await createOrUpdateShare(db, {
+      id: id('share'),
+      target: wholeServerTarget,
+      targetUserId: recipientId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: 1_000,
+    });
+
+    const spoofedThreadId = id('spoofed-whole-thread');
+    const partRes = await app.request(`/api/server/${serverId}/discussions/comments`, {
+      method: 'POST',
+      headers: authHeaders(recipientId),
+      body: JSON.stringify({
+        type: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT,
+        requestId: 'whole-server-comment-1',
+        threadId: spoofedThreadId,
+        body: 'Whole-server participant comment.',
+      }),
+    });
+
+    expect(partRes.status).toBe(201);
+    const partPayload = await partRes.json() as { comment: { id: string; thread_id: string; actorEnvelope: Record<string, unknown> } };
+    expect(partPayload.comment.thread_id).toBe(shareTargetKey(wholeServerTarget));
+    expect(partPayload.comment.thread_id).not.toBe(spoofedThreadId);
+    expect(partPayload.comment.actorEnvelope).toMatchObject({
+      actorUserId: recipientId,
+      effectiveActorRole: 'participant',
+      primaryShareId: share.id,
+    });
+
+    const dbRow = await db.queryOne<{ thread_id: string; created_by_user_id: string }>(
+      'SELECT thread_id, created_by_user_id FROM discussion_comments WHERE id = $1',
+      [partPayload.comment.id],
+    );
+    expect(dbRow).toEqual({
+      thread_id: shareTargetKey(wholeServerTarget),
+      created_by_user_id: recipientId,
+    });
+
+    // Direct owner keeps their chosen threadId unpinned
+    const ownerThreadId = id('owner-custom-thread');
+    const ownerRes = await app.request(`/api/server/${serverId}/discussions/comments`, {
+      method: 'POST',
+      headers: authHeaders(ownerId),
+      body: JSON.stringify({
+        requestId: 'owner-comment-1',
+        threadId: ownerThreadId,
+        body: 'Owner discussion note.',
+      }),
+    });
+    expect(ownerRes.status).toBe(201);
+    const ownerPayload = await ownerRes.json() as { comment: { thread_id: string } };
+    expect(ownerPayload.comment.thread_id).toBe(ownerThreadId);
+  });
+
   it('audits invalid share comments before persistence', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(2_500);
