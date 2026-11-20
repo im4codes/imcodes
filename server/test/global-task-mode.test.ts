@@ -25,7 +25,9 @@ import type { Env } from '../src/env.js';
 import { buildApp, setupWebSocketUpgrade } from '../src/index.js';
 import { signJwt } from '../src/security/crypto.js';
 import { globalTaskHub, GlobalTaskHub } from '../src/services/global-task-hub.js';
+import { closeConnectionsOfInactiveUsers } from '../src/ws/account-watch.js';
 import { WsBridge } from '../src/ws/bridge.js';
+import { applyMachineGroupInvalidation } from '../src/ws/machine-group-revalidation.js';
 
 interface MemServerRow {
   id: string;
@@ -84,9 +86,10 @@ interface MemSummaryRow {
 }
 
 class InMemoryGlobalTaskDb {
-  users = new Map<string, { id: string; status: string; sessions_invalid_before: number | null }>([
-    ['user-a', { id: 'user-a', status: 'active', sessions_invalid_before: null }],
-    ['user-b', { id: 'user-b', status: 'active', sessions_invalid_before: null }],
+  users = new Map<string, { id: string; status: string; sessions_valid_after: number }>([
+    ['user-a', { id: 'user-a', status: 'active', sessions_valid_after: 0 }],
+    ['user-b', { id: 'user-b', status: 'active', sessions_valid_after: 0 }],
+    ['user-c', { id: 'user-c', status: 'active', sessions_valid_after: 0 }],
   ]);
   servers = new Map<string, MemServerRow>();
   machineGroups: Array<{ server_id: string; team_id: string }> = [];
@@ -127,6 +130,14 @@ class InMemoryGlobalTaskDb {
           return this.sessions
             .filter((s) => serverIds.has(s.server_id))
             .sort((a, b) => a.created_at - b.created_at) as unknown as T[];
+        }
+
+        if (norm.startsWith('select u.id from users u where u.id = any')) {
+          const ids = Array.isArray(params[0]) ? params[0].map(String) : [];
+          return ids
+            .map((id) => this.users.get(id))
+            .filter((u): u is NonNullable<typeof u> => Boolean(u && u.status === 'active'))
+            .map((u) => ({ id: u.id })) as unknown as T[];
         }
 
         if (norm.includes('from global_task_pair_summaries') && norm.includes('is_terminal = false')) {
@@ -822,5 +833,134 @@ describe('global-task-mode server engine', () => {
     const standalone = new GlobalTaskHub();
     expect(standalone.isPgListening()).toBe(false);
     await standalone.stop();
+  });
+
+  it('closes real-time permission boundary when team_members or server is revoked mid-connection and via invalidation hooks', async () => {
+    memDb.machineGroups.push({ server_id: 'srv-a', team_id: 'team-1' });
+    memDb.teamMembers.push({ team_id: 'team-1', user_id: 'user-c', role: 'member' });
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_team',
+      projectName: 'imcodes',
+      brainSession: 'deck_proj_brain',
+      title: 'Team Task',
+      status: 'working',
+      updatedAt: 1000,
+    });
+
+    const ownerFrames: GlobalTaskServerFrame[] = [];
+    const ownerWs = {
+      readyState: WebSocket.OPEN,
+      send: vi.fn((data: string) => { ownerFrames.push(JSON.parse(data)); }),
+      on: vi.fn(),
+      once: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    const memberFrames: GlobalTaskServerFrame[] = [];
+    const memberWs = {
+      readyState: WebSocket.OPEN,
+      send: vi.fn((data: string) => { memberFrames.push(JSON.parse(data)); }),
+      on: vi.fn(),
+      once: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    await globalTaskHub.handleConnection(ownerWs, 'user-a', db);
+    await globalTaskHub.handleConnection(memberWs, 'user-c', db);
+    expect(memberFrames[0]?.type).toBe(GLOBAL_TASK_MODE_MSG.SNAPSHOT);
+    expect((memberFrames[0] as Extract<GlobalTaskServerFrame, { type: 'global_tasks.snapshot' }>).tasks).toHaveLength(1);
+
+    // 1. Revoke team_members directly (without calling HTTP route), then emit task upsert & brain_text
+    memberFrames.length = 0;
+    ownerFrames.length = 0;
+    memDb.teamMembers = [];
+
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_team',
+      status: 'in_audit',
+      updatedAt: 2000,
+    });
+    await globalTaskHub.notifyTaskUpdated(db, 'srv-a', 'tsk_team');
+    await globalTaskHub.notifyBrainText(db, {
+      serverId: 'srv-a',
+      sessionName: 'deck_proj_brain',
+      eventId: 'evt-after-tm-revoke',
+      text: 'Private reply after member removal',
+      ts: 3000,
+    });
+    await globalTaskHub.notifyServerState(db, 'srv-a', false);
+
+    // Revoked member MUST NOT receive upsert, brain_text, or server_state — only cleaned snapshot
+    expect(memberFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.UPSERT)).toBe(false);
+    expect(memberFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.BRAIN_TEXT)).toBe(false);
+    expect(memberFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.SERVER_STATE)).toBe(false);
+    expect(memberFrames).toContainEqual(expect.objectContaining({
+      type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+      tasks: [],
+      brains: [],
+      servers: [],
+    }));
+    // Owner still receives the live pushes
+    expect(ownerFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.UPSERT && f.task.taskId === 'tsk_team')).toBe(true);
+    expect(ownerFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.BRAIN_TEXT && f.event.eventId === 'evt-after-tm-revoke')).toBe(true);
+
+    // 2. Unified machine-group invalidation hook proactively purges snapshot even before next event
+    memDb.teamMembers.push({ team_id: 'team-1', user_id: 'user-c', role: 'member' });
+    await globalTaskHub.refreshUserAuthorization('user-c');
+    memberFrames.length = 0;
+    memDb.teamMembers = [];
+    await applyMachineGroupInvalidation(db, { teamId: 'team-1', actorId: 'user-c', serverId: 'srv-a' });
+    expect(memberFrames).toHaveLength(1);
+    expect(memberFrames[0]).toMatchObject({
+      type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+      tasks: [],
+      brains: [],
+      servers: [],
+    });
+
+    // 3. Server revocation mid-connection blocks owner's future upsert & brain_text and purges snapshot
+    ownerFrames.length = 0;
+    memDb.servers.get('srv-a')!.revoked_at = Date.now();
+    await globalTaskHub.notifyTaskUpdated(db, 'srv-a', 'tsk_team', {
+      serverId: 'srv-a',
+      serverName: 'Alpha Box',
+      serverOnline: true,
+      projectName: 'imcodes',
+      brainSession: 'deck_proj_brain',
+      brainLabel: 'Alpha Brain',
+      taskId: 'tsk_team',
+      title: 'Team Task',
+      status: 'done',
+      flags: [],
+      round: 1,
+      checklist: { total: 0, implemented: 0, audited: 0 },
+      createdAt: 1000,
+      updatedAt: 4000,
+      isTerminal: true,
+      needsAttention: false,
+    });
+    await globalTaskHub.notifyBrainText(db, {
+      serverId: 'srv-a',
+      serverName: 'Alpha Box',
+      sessionName: 'deck_proj_brain',
+      eventId: 'evt-after-srv-revoke',
+      text: 'Secret after server revoke',
+      ts: 4000,
+    });
+    expect(ownerFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.UPSERT)).toBe(false);
+    expect(ownerFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.BRAIN_TEXT)).toBe(false);
+    expect(ownerFrames).toContainEqual(expect.objectContaining({
+      type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+      tasks: [],
+      servers: [],
+    }));
+
+    // 4. Disabled user account closed by account-watch
+    memDb.users.get('user-a')!.status = 'disabled';
+    const watchRes = await closeConnectionsOfInactiveUsers(db, []);
+    expect(watchRes.browserSockets).toBeGreaterThanOrEqual(1);
+    expect((ownerWs.close as ReturnType<typeof vi.fn>)).toHaveBeenCalled();
   });
 });

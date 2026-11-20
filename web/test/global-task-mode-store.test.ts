@@ -317,6 +317,16 @@ describe('global-task-mode-store', () => {
     });
     expect(receivedBrainTexts).toHaveLength(1);
 
+    // Revocation snapshot (server removed from snapshot.servers) purges cached latestBrainTexts/tasks/brains
+    ws.simulateMessage({
+      type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+      servers: [{ id: 'srv-2', name: 'Node 2', online: true }],
+      brains: [],
+      tasks: [],
+      ts: 2000,
+    });
+    expect(store.getLatestBrainText('srv-1', 'brain_1')).toBeUndefined();
+
     unsubText();
     store.stop();
   });

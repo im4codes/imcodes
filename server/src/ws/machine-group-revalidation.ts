@@ -1,5 +1,6 @@
 import type { Database } from '../db/client.js';
 import { WsBridge } from './bridge.js';
+import { globalTaskHub } from '../services/global-task-hub.js';
 import { mutateMachineGroupAccess } from '../services/machine-group-invalidation.js';
 import type { MachineGroupInvalidationScope } from '../../../shared/machine-group-invalidation.js';
 
@@ -9,9 +10,12 @@ export async function applyMachineGroupInvalidation(db: Database, scope: Machine
   const targets = scope.serverId ? [scope.serverId] : !local.length ? [] : (await db.query<{ server_id: string }>(
     'SELECT server_id FROM machine_groups WHERE team_id = $1 AND server_id = ANY($2::text[])', [scope.teamId, local],
   )).map((row) => row.server_id);
-  await Promise.all(targets.map((serverId) => scope.actorId
-    ? WsBridge.find(serverId)?.revalidateShareSocketsForUser(scope.actorId)
-    : WsBridge.find(serverId)?.revalidateMachineGroupAccess()));
+  await Promise.all([
+    ...targets.map((serverId) => scope.actorId
+      ? WsBridge.find(serverId)?.revalidateShareSocketsForUser(scope.actorId)
+      : WsBridge.find(serverId)?.revalidateMachineGroupAccess()),
+    globalTaskHub.handleMachineGroupInvalidation(db, scope),
+  ]);
 }
 
 export function failClosedMachineGroupConnections(): void {

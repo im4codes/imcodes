@@ -699,14 +699,32 @@ export class GlobalTaskModeStore {
 
   private applySnapshot(snapshot: GlobalTaskSnapshotResponse): void {
     const mutedSet = new Set(this.state.mutedServerIds);
+    const allowedServerIds = new Set((snapshot.servers ?? []).map((s) => s.id));
     const tasks = sortGlobalTaskCards((snapshot.tasks ?? []).filter((t) => !mutedSet.has(t.serverId)));
     const brains = (snapshot.brains ?? []).filter((b) => !mutedSet.has(b.serverId));
     const servers = snapshot.servers ?? [];
+    const nextLatestBrainTexts: Record<string, GlobalTaskBrainTextEvent> = {};
+    const nextBrainTextOrder: string[] = [];
+    for (const key of this.brainTextOrder) {
+      const event = this.state.latestBrainTexts[key];
+      if (!event) continue;
+      if (!allowedServerIds.has(event.serverId) || mutedSet.has(event.serverId)) continue;
+      nextLatestBrainTexts[key] = event;
+      nextBrainTextOrder.push(key);
+    }
+    for (const [key, event] of Object.entries(this.state.latestBrainTexts)) {
+      if (nextLatestBrainTexts[key]) continue;
+      if (!allowedServerIds.has(event.serverId) || mutedSet.has(event.serverId)) continue;
+      nextLatestBrainTexts[key] = event;
+      nextBrainTextOrder.push(key);
+    }
+    this.brainTextOrder = nextBrainTextOrder;
     this.setState({
       loading: false,
       tasks,
       brains,
       servers,
+      latestBrainTexts: nextLatestBrainTexts,
       lastSyncedAt: snapshot.ts ?? Date.now(),
     });
   }

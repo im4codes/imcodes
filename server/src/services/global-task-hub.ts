@@ -18,6 +18,7 @@ import {
   listGlobalTaskSnapshotForUser,
   resolveAuthorizedFullServersForUser,
 } from '../db/global-task-summaries.js';
+import { evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
 import logger from '../util/logger.js';
 
 interface ClientSubscription {
@@ -40,7 +41,8 @@ type GlobalTaskNotifyEnvelope =
     text: string;
     ts: number;
   }
-  | { kind: 'server_state'; serverId: string; online: boolean; ts: number };
+  | { kind: 'server_state'; serverId: string; online: boolean; ts: number }
+  | { kind: 'access_changed'; userId?: string; serverId?: string; ts: number };
 
 const RECONNECT_INITIAL_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
@@ -244,13 +246,109 @@ export class GlobalTaskHub {
   }
 
   /**
-   * Recompute authorized servers for connected clients of a user (e.g. after team/server change).
+   * Collect distinct active user IDs holding live Global Task Mode connections.
    */
-  async refreshUserAuthorization(userId: string): Promise<void> {
+  collectLiveUserIds(out: Set<string>): void {
     for (const sub of this.clients.values()) {
-      if (sub.userId !== userId) continue;
-      const servers = await resolveAuthorizedFullServersForUser(sub.db, userId);
-      sub.serverIds = new Set(servers.map((s) => s.id));
+      if (sub.ws.readyState === WebSocket.OPEN) out.add(sub.userId);
+    }
+  }
+
+  /**
+   * Immediately close live Global Task Mode sockets belonging to disabled/inactive accounts.
+   */
+  closeInactiveUserSockets(inactiveUserIds: ReadonlySet<string>): number {
+    if (inactiveUserIds.size === 0) return 0;
+    let closed = 0;
+    for (const [ws, sub] of [...this.clients]) {
+      if (!inactiveUserIds.has(sub.userId)) continue;
+      this.clients.delete(ws);
+      closed += 1;
+      try { ws.close(1008, 'account_inactive'); } catch { /* ignore */ }
+    }
+    return closed;
+  }
+
+  /**
+   * Re-sync a specific user's authorized servers and push a fresh filtered snapshot if access changed.
+   */
+  async refreshUserAuthorization(userId: string, pushSnapshotIfChanged = true): Promise<void> {
+    const subs = [...this.clients.values()].filter((sub) => sub.userId === userId);
+    if (subs.length === 0) return;
+    await this.syncSubscriptionsBatch(subs, pushSnapshotIfChanged, pushSnapshotIfChanged);
+  }
+
+  /**
+   * Re-sync clients when membership or server access for `serverId` / `userId` changes.
+   */
+  async notifyAccessChanged(
+    db: Database | null,
+    scope: { userId?: string; serverId?: string },
+  ): Promise<void> {
+    const activeDb = db ?? this.db ?? null;
+    const envelope: GlobalTaskNotifyEnvelope = {
+      kind: 'access_changed',
+      ...(scope.userId ? { userId: scope.userId } : {}),
+      ...(scope.serverId ? { serverId: scope.serverId } : {}),
+      ts: Date.now(),
+    };
+    await emitGlobalTaskPgNotify(activeDb, JSON.stringify(envelope));
+    if (!this.pgListening) {
+      await this.applyAccessChanged(scope);
+    }
+  }
+
+  async handleMachineGroupInvalidation(
+    db: Database,
+    scope: { actorId?: string; serverId?: string },
+  ): Promise<void> {
+    if (!this.db) this.db = db;
+    await this.applyAccessChanged({ userId: scope.actorId, serverId: scope.serverId });
+  }
+
+  private async applyAccessChanged(scope: { userId?: string; serverId?: string }): Promise<void> {
+    if (this.clients.size === 0) return;
+    const targets = [...this.clients.values()].filter((sub) => {
+      if (scope.userId && sub.userId !== scope.userId) return false;
+      return true;
+    });
+    if (targets.length === 0) return;
+    await this.syncSubscriptionsBatch(targets, true, true);
+  }
+
+  private async syncSubscriptionsBatch(
+    subs: ClientSubscription[],
+    pushSnapshotOnLoss: boolean,
+    pushSnapshotOnGain: boolean,
+  ): Promise<void> {
+    const authCache = new Map<string, { allowed: boolean; serverIds: Set<string> }>();
+    for (const sub of subs) {
+      if (sub.ws.readyState !== WebSocket.OPEN || !this.clients.has(sub.ws)) continue;
+      let resolved = authCache.get(sub.userId);
+      if (!resolved) {
+        const userAccess = await loadUserAccess(sub.db, sub.userId);
+        const decision = evaluateUserAccess(userAccess, undefined);
+        if (!decision.ok) {
+          resolved = { allowed: false, serverIds: new Set<string>() };
+        } else {
+          const servers = await resolveAuthorizedFullServersForUser(sub.db, sub.userId);
+          resolved = { allowed: true, serverIds: new Set(servers.map((s) => s.id)) };
+        }
+        authCache.set(sub.userId, resolved);
+      }
+
+      if (!resolved.allowed) {
+        this.clients.delete(sub.ws);
+        try { sub.ws.close(1008, 'account_inactive'); } catch { /* ignore */ }
+        continue;
+      }
+
+      const lostAccess = [...sub.serverIds].some((id) => !resolved.serverIds.has(id));
+      const gainedAccess = [...resolved.serverIds].some((id) => !sub.serverIds.has(id));
+      sub.serverIds = new Set(resolved.serverIds);
+      if ((lostAccess && pushSnapshotOnLoss) || (gainedAccess && pushSnapshotOnGain)) {
+        await this.sendSnapshotToClient(sub);
+      }
     }
   }
 
@@ -273,7 +371,7 @@ export class GlobalTaskHub {
       const row = activeDb
         ? (await getGlobalTaskSummaryForServerTask(activeDb, serverId, taskId)) ?? fallbackRow ?? null
         : (fallbackRow ?? null);
-      if (row) this.broadcastTaskUpsert(row);
+      if (row) await this.broadcastTaskUpsert(row);
     }
   }
 
@@ -308,7 +406,7 @@ export class GlobalTaskHub {
 
     if (!this.pgListening) {
       const parsed = JSON.parse(boundedJson) as Extract<GlobalTaskNotifyEnvelope, { kind: 'brain_text' }>;
-      this.broadcastBrainText({
+      await this.broadcastBrainText({
         serverId: parsed.serverId,
         serverName: parsed.serverName,
         sessionName: parsed.sessionName,
@@ -331,7 +429,7 @@ export class GlobalTaskHub {
     await emitGlobalTaskPgNotify(activeDb, JSON.stringify(envelope));
 
     if (!this.pgListening) {
-      this.broadcastServerState(serverId, online);
+      await this.broadcastServerState(serverId, online);
     }
   }
 
@@ -348,14 +446,14 @@ export class GlobalTaskHub {
       const activeDb = dbOverride ?? this.db ?? this.clients.values().next().value?.db;
       if (!activeDb || !parsed.serverId || !parsed.taskId) return;
       const row = await getGlobalTaskSummaryForServerTask(activeDb, parsed.serverId, parsed.taskId);
-      if (row) this.broadcastTaskUpsert(row);
+      if (row) await this.broadcastTaskUpsert(row);
       return;
     }
 
     if (parsed.kind === 'brain_text') {
       const text = truncateGlobalBrainText(parsed.text, GLOBAL_TASK_BRAIN_TEXT_MAX_CHARS);
       if (!text || !parsed.serverId || !parsed.sessionName || !parsed.eventId) return;
-      this.broadcastBrainText({
+      await this.broadcastBrainText({
         serverId: parsed.serverId,
         serverName: parsed.serverName || parsed.serverId,
         sessionName: parsed.sessionName,
@@ -368,32 +466,62 @@ export class GlobalTaskHub {
     }
 
     if (parsed.kind === 'server_state' && parsed.serverId) {
-      this.broadcastServerState(parsed.serverId, Boolean(parsed.online));
+      await this.broadcastServerState(parsed.serverId, Boolean(parsed.online));
+      return;
+    }
+
+    if (parsed.kind === 'access_changed') {
+      await this.applyAccessChanged({ userId: parsed.userId, serverId: parsed.serverId });
     }
   }
 
-  private broadcastTaskUpsert(task: GlobalTaskSummaryRow): void {
+  private async collectAuthorizedRecipients(
+    serverId: string,
+    respectMuted: boolean,
+  ): Promise<ClientSubscription[]> {
+    const candidates = [...this.clients.values()].filter((sub) => {
+      if (sub.ws.readyState !== WebSocket.OPEN) return false;
+      if (!sub.serverIds.has(serverId)) return false;
+      return true;
+    });
+    if (candidates.length === 0) return [];
+
+    // Re-verify live DB access for every candidate user before delivering any event
+    // so team_members removal, server revocation, or account disablement stops pushes
+    // immediately even across pods or direct DB updates, and purges stale client caches.
+    await this.syncSubscriptionsBatch(candidates, true, false);
+
+    return candidates.filter((sub) => (
+      this.clients.has(sub.ws)
+      && sub.ws.readyState === WebSocket.OPEN
+      && sub.serverIds.has(serverId)
+      && (!respectMuted || !sub.mutedServerIds.has(serverId))
+    ));
+  }
+
+  private async broadcastTaskUpsert(task: GlobalTaskSummaryRow): Promise<void> {
+    const recipients = await this.collectAuthorizedRecipients(task.serverId, true);
+    if (recipients.length === 0) return;
     const frame: GlobalTaskServerFrame = { type: GLOBAL_TASK_MODE_MSG.UPSERT, task };
-    for (const sub of this.clients.values()) {
-      if (!sub.serverIds.has(task.serverId)) continue;
-      if (sub.mutedServerIds.has(task.serverId)) continue;
+    for (const sub of recipients) {
       safeSendWs(sub.ws, frame);
     }
   }
 
-  private broadcastBrainText(event: GlobalTaskBrainTextEvent): void {
+  private async broadcastBrainText(event: GlobalTaskBrainTextEvent): Promise<void> {
+    const recipients = await this.collectAuthorizedRecipients(event.serverId, true);
+    if (recipients.length === 0) return;
     const frame: GlobalTaskServerFrame = { type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT, event };
-    for (const sub of this.clients.values()) {
-      if (!sub.serverIds.has(event.serverId)) continue;
-      if (sub.mutedServerIds.has(event.serverId)) continue;
+    for (const sub of recipients) {
       safeSendWs(sub.ws, frame);
     }
   }
 
-  private broadcastServerState(serverId: string, online: boolean): void {
+  private async broadcastServerState(serverId: string, online: boolean): Promise<void> {
+    const recipients = await this.collectAuthorizedRecipients(serverId, false);
+    if (recipients.length === 0) return;
     const frame: GlobalTaskServerFrame = { type: GLOBAL_TASK_MODE_MSG.SERVER_STATE, serverId, online };
-    for (const sub of this.clients.values()) {
-      if (!sub.serverIds.has(serverId)) continue;
+    for (const sub of recipients) {
       safeSendWs(sub.ws, frame);
     }
   }

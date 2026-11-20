@@ -12,6 +12,7 @@ import { ACCOUNT_CONNECTION_WATCH_INTERVAL_MS, USER_STATUS, userStatusDenialCode
 import { findInactiveUsers } from '../security/user-status.js';
 import logger from '../util/logger.js';
 import { WsBridge } from './bridge.js';
+import { globalTaskHub } from '../services/global-task-hub.js';
 
 export interface AccountWatchResult {
   inactiveUsers: number;
@@ -27,10 +28,12 @@ export async function closeConnectionsOfInactiveUsers(
   const all = [...bridges];
   const live = new Set<string>();
   for (const bridge of all) bridge.collectLiveUserIds(live);
+  globalTaskHub.collectLiveUserIds(live);
   if (live.size === 0) return { inactiveUsers: 0, browserSockets: 0, daemons: 0 };
   const inactive = await findInactiveUsers(db, [...live]);
   if (inactive.size === 0) return { inactiveUsers: 0, browserSockets: 0, daemons: 0 };
   const result: AccountWatchResult = { inactiveUsers: inactive.size, browserSockets: 0, daemons: 0 };
+  result.browserSockets += globalTaskHub.closeInactiveUserSockets(inactive);
   for (const bridge of all) {
     const closed = bridge.closeConnectionsOfUsers(inactive, userStatusDenialCode(USER_STATUS.DISABLED));
     result.browserSockets += closed.browserSockets;

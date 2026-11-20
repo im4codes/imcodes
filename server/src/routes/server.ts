@@ -20,6 +20,7 @@ import { isSharedOrContributedServer } from '../security/daemon-scope.js';
 import { resolveSharedMachineAuthority } from '../share/shared-machine-authority.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { WsBridge } from '../ws/bridge.js';
+import { globalTaskHub } from '../services/global-task-hub.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
 import { checkControlledNodeUpgradeArtifactAvailability } from '../services/controlled-node-artifact-catalog.js';
 import { sha256Hex, randomHex } from '../security/crypto.js';
@@ -423,6 +424,7 @@ serverRoutes.delete('/:id', requireAuth(), async (c) => {
   try {
     WsBridge.get(serverId).sendToDaemon(JSON.stringify({ type: DAEMON_COMMAND_TYPES.SERVER_DELETE }));
   } catch { /* daemon may be offline, continue with DB deletion */ }
+  void globalTaskHub.notifyAccessChanged(c.env.DB, { serverId }).catch(() => {});
   return c.json({ ok: true });
 });
 
