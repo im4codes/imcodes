@@ -46,6 +46,13 @@ export interface EnvConfig {
   ONLYOFFICE_INTERNAL_URL?: string;
   IMCODES_CLOUD_DOCS_DIR?: string;
 
+  // Optional server-side OpenAI-compatible TTS defaults
+  TTS_BASE_URL?: string;
+  TTS_API_KEY?: string;
+  TTS_MODEL?: string;
+  TTS_VOICE?: string;
+  TTS_RESPONSE_FORMAT?: string;
+
   // Server URL (used to build webhook URLs)
   SERVER_URL: string;
 
@@ -185,6 +192,11 @@ export function loadEnv(): EnvConfig {
     ONLYOFFICE_PUBLIC_URL: process.env.ONLYOFFICE_PUBLIC_URL,
     ONLYOFFICE_INTERNAL_URL: process.env.ONLYOFFICE_INTERNAL_URL ?? 'http://onlyoffice:80',
     IMCODES_CLOUD_DOCS_DIR: process.env.IMCODES_CLOUD_DOCS_DIR,
+    TTS_BASE_URL: process.env.TTS_BASE_URL,
+    TTS_API_KEY: process.env.TTS_API_KEY,
+    TTS_MODEL: process.env.TTS_MODEL,
+    TTS_VOICE: process.env.TTS_VOICE,
+    TTS_RESPONSE_FORMAT: process.env.TTS_RESPONSE_FORMAT,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES,

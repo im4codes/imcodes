@@ -16,9 +16,10 @@ describe('app Content-Security-Policy', () => {
     expect(policy.get('connect-src')).toContain('blob:');
   });
 
-  it('allows blob: nowhere else, and adds nothing broader', () => {
+  it('allows blob: only on connect-src, img-src, media-src, and worker-src, and adds nothing broader', () => {
     const withBlob = [...policy].filter(([, sources]) => sources.includes('blob:')).map(([name]) => name).sort();
-    expect(withBlob).toEqual(['connect-src', 'img-src', 'worker-src']);
+    expect(withBlob).toEqual(['connect-src', 'img-src', 'media-src', 'worker-src']);
+    expect(policy.get('media-src')).toEqual(["'self'", 'blob:']);
     for (const [, sources] of policy) {
       expect(sources).not.toContain('*');
       expect(sources).not.toContain("'unsafe-eval'");
@@ -33,6 +34,6 @@ describe('app Content-Security-Policy', () => {
 
   it('is the one definition the header is built from, in a stable order', () => {
     expect(buildAppContentSecurityPolicy()).toBe(buildAppContentSecurityPolicy(APP_CSP_DIRECTIVES));
-    expect(Object.keys(APP_CSP_DIRECTIVES)).toEqual(['default-src', 'script-src', 'style-src', 'connect-src', 'worker-src', 'img-src', 'font-src', 'frame-ancestors']);
+    expect(Object.keys(APP_CSP_DIRECTIVES)).toEqual(['default-src', 'script-src', 'style-src', 'connect-src', 'worker-src', 'img-src', 'media-src', 'font-src', 'frame-ancestors']);
   });
 });

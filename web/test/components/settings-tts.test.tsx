@@ -6,8 +6,11 @@ import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { SettingsPage } from '../../src/pages/SettingsPage.js';
+import { TtsQuickSettingsPopover } from '../../src/components/TtsQuickSettingsPopover.js';
 import {
+  applyServerTtsConfig,
   getTtsAutoReadEnabled,
+  getTtsMode,
   getTtsSpeechRate,
   TTS_DEFAULT_RATE,
   TTS_RATE_OPTIONS,
@@ -33,8 +36,15 @@ vi.mock('@capacitor/core', () => ({
   }),
 }));
 
+const mockApi = vi.hoisted(() => ({
+  getServerTtsConfig: vi.fn(),
+  updateServerTtsConfig: vi.fn(),
+}));
+
 vi.mock('../../src/api.js', () => ({
   apiFetch: vi.fn().mockResolvedValue({ servers: [], machines: [] }),
+  getServerTtsConfig: (...args: unknown[]) => mockApi.getServerTtsConfig(...args),
+  updateServerTtsConfig: (...args: unknown[]) => mockApi.updateServerTtsConfig(...args),
   passwordChange: vi.fn(),
   passkeyVerifyBegin: vi.fn(),
   passwordSetupWithPasskey: vi.fn(),
@@ -61,6 +71,34 @@ vi.mock('../../src/tts.js', async (importOriginal) => {
       mockState.voiceQuality ?? actual.getNativeTtsVoiceQuality(lang)
     )),
   };
+});
+
+beforeEach(() => {
+  mockApi.getServerTtsConfig.mockClear();
+  mockApi.updateServerTtsConfig.mockClear();
+  mockApi.getServerTtsConfig.mockResolvedValue({
+    mode: 'system',
+    baseUrl: '',
+    hasApiKey: false,
+    apiKeyMasked: null,
+    model: 'gpt-4o-mini-tts',
+    voice: 'alloy',
+    responseFormat: 'mp3',
+    serverDefaultConfigured: false,
+  });
+  mockApi.updateServerTtsConfig.mockImplementation(async (body: Record<string, unknown>) => ({
+    ok: true,
+    config: {
+      mode: body.mode ?? 'server',
+      baseUrl: body.baseUrl ?? 'http://127.0.0.1:8880/v1',
+      hasApiKey: body.apiKey === '' ? false : (body.apiKey !== undefined ? Boolean(body.apiKey) : true),
+      apiKeyMasked: body.apiKey === '' ? null : 'sk-1...7890',
+      model: body.model ?? 'gpt-4o-mini-tts',
+      voice: body.voice ?? 'alloy',
+      responseFormat: body.responseFormat ?? 'mp3',
+      serverDefaultConfigured: false,
+    },
+  }));
 });
 
 vi.mock('react-i18next', () => ({
@@ -242,6 +280,32 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
       expect(json.settings?.tts_quality_default, `${locale} settings.tts_quality_default`).toBeTruthy();
       expect(json.settings?.tts_open_android_settings, `${locale} settings.tts_open_android_settings`).toBeTruthy();
       expect(json.settings?.tts_open_ios_settings, `${locale} settings.tts_open_ios_settings`).toBeTruthy();
+      for (const k of [
+        'tts_engine',
+        'tts_engine_desc',
+        'tts_engine_system',
+        'tts_engine_server',
+        'tts_server_base_url',
+        'tts_server_base_url_placeholder',
+        'tts_server_default_configured',
+        'tts_server_api_key',
+        'tts_server_api_key_placeholder',
+        'tts_server_api_key_keep',
+        'tts_server_api_key_clear',
+        'tts_server_model',
+        'tts_server_voice',
+        'tts_server_format',
+        'tts_server_save',
+        'tts_server_saving',
+        'tts_server_saved',
+        'tts_server_save_error',
+        'tts_server_test',
+        'tts_server_test_text',
+        'tts_server_test_failed',
+        'tts_server_unconfigured_hint',
+      ]) {
+        expect(json.settings?.[k], `${locale} settings.${k}`).toBeTruthy();
+      }
     }
   });
 
@@ -344,5 +408,85 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
     expect(screen.queryByTestId('settings-tts-current-voice')).toBeNull();
     expect(screen.getByTestId('settings-tts-voice-hint').textContent).not.toContain('undefined');
     expect(screen.getByTestId('settings-tts-voice-hint').textContent).not.toContain('()');
+  });
+
+  it('configures server TTS settings, persists via API, and clears stored API key', async () => {
+    mockApi.getServerTtsConfig.mockResolvedValueOnce({
+      mode: 'system',
+      baseUrl: 'http://127.0.0.1:8880/v1',
+      hasApiKey: true,
+      apiKeyMasked: 'sk-o...9999',
+      model: 'kokoro',
+      voice: 'af_sky',
+      responseFormat: 'wav',
+      serverDefaultConfigured: false,
+    });
+
+    render(
+      <SettingsPage
+        displayName="Tester"
+        username="tester"
+        hasPassword={true}
+        onBack={() => {}}
+        onDisplayNameChanged={() => {}}
+        onUserAuthUpdated={() => {}}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(mockApi.getServerTtsConfig).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.click(screen.getByTestId('settings-tts-engine-server'));
+    await waitFor(() => {
+      expect(screen.getByTestId('settings-tts-server-panel')).toBeTruthy();
+    });
+
+    expect((screen.getByTestId('settings-tts-server-baseurl') as HTMLInputElement).value).toBe('http://127.0.0.1:8880/v1');
+    expect(screen.getByTestId('settings-tts-server-apikey-hint')).toBeTruthy();
+
+    fireEvent.input(screen.getByTestId('settings-tts-server-voice'), { target: { value: 'af_bella' } });
+    fireEvent.click(screen.getByTestId('settings-tts-server-save'));
+
+    await waitFor(() => {
+      expect(mockApi.updateServerTtsConfig).toHaveBeenCalledWith({
+        mode: 'server',
+        baseUrl: 'http://127.0.0.1:8880/v1',
+        model: 'kokoro',
+        voice: 'af_bella',
+        responseFormat: 'wav',
+      });
+    });
+
+    fireEvent.click(screen.getByTestId('settings-tts-server-clear-key'));
+    await waitFor(() => {
+      expect(mockApi.updateServerTtsConfig).toHaveBeenCalledWith({ apiKey: '' });
+    });
+  });
+
+  it('shows compact engine toggle in TtsQuickSettingsPopover when server TTS is configured', async () => {
+    applyServerTtsConfig({
+      mode: 'system',
+      baseUrl: 'http://127.0.0.1:8880/v1',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'kokoro',
+      voice: 'af_sky',
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+
+    const anchorRef = { current: document.createElement('div') };
+    render(<TtsQuickSettingsPopover anchorRef={anchorRef} onClose={() => {}} />);
+
+    expect(screen.getByTestId('chat-tts-settings-engine-section')).toBeTruthy();
+    expect(screen.getByTestId('chat-tts-settings-engine-system').getAttribute('aria-pressed')).toBe('true');
+
+    fireEvent.click(screen.getByTestId('chat-tts-settings-engine-server'));
+    expect(getTtsMode()).toBe('server');
+    expect(screen.getByTestId('chat-tts-settings-engine-server').getAttribute('aria-pressed')).toBe('true');
+    await waitFor(() => {
+      expect(mockApi.updateServerTtsConfig).toHaveBeenCalledWith({ mode: 'server' });
+    });
   });
 });

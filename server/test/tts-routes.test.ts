@@ -1,0 +1,383 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { buildApp } from '../src/index.js';
+import type { Env } from '../src/env.js';
+import type { Database } from '../src/db/client.js';
+import { signJwt } from '../src/security/crypto.js';
+import { activeUserAnswer } from './helpers/user-status.js';
+import { COOKIE_CSRF, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
+import {
+  TTS_CONFIG_PATH,
+  TTS_DEFAULT_MODEL,
+  TTS_DEFAULT_RESPONSE_FORMAT,
+  TTS_DEFAULT_VOICE,
+  TTS_MAX_RESPONSE_BYTES,
+  TTS_SPEECH_PATH,
+  TTS_USER_CONFIG_PREF_KEY,
+} from '../../shared/tts-config.js';
+
+const JWT_KEY = 'test-signing-key-32chars-padding!!';
+const BOT_KEY = 'test-bot-encryption-key-32chars!!';
+
+function makeMemDb(): { db: Database; prefs: Map<string, string> } {
+  const prefs = new Map<string, string>();
+  const keyFor = (userId: string, key: string) => `${userId}:${key}`;
+
+  const db = {
+    query: async <T = unknown>(sql: string): Promise<T[]> => {
+      const activeUser = activeUserAnswer(sql);
+      if (activeUser) return [activeUser as T];
+      return [];
+    },
+    queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      const activeUser = activeUserAnswer(sql);
+      if (activeUser) return activeUser as T;
+      const s = sql.toLowerCase();
+      if (s.includes('from user_preferences')) {
+        const val = prefs.get(keyFor(String(params[0]), String(params[1])));
+        return (val !== undefined ? { value: val } : null) as T | null;
+      }
+      return null;
+    },
+    execute: async (sql: string, params: unknown[] = []): Promise<void> => {
+      const s = sql.toLowerCase();
+      if (s.includes('insert into user_preferences')) {
+        prefs.set(keyFor(String(params[0]), String(params[1])), String(params[2]));
+      } else if (s.includes('delete from user_preferences')) {
+        prefs.delete(keyFor(String(params[0]), String(params[1])));
+      }
+    },
+    transaction: async <T>(fn: (tx: Database) => Promise<T>): Promise<T> => fn(db),
+  } as unknown as Database;
+
+  return { db, prefs };
+}
+
+function makeEnv(db: Database, overrides: Partial<Env> = {}): Env {
+  return {
+    DB: db,
+    JWT_SIGNING_KEY: JWT_KEY,
+    BOT_ENCRYPTION_KEY: BOT_KEY,
+    SERVER_URL: 'https://test.im.codes',
+    ALLOWED_ORIGINS: 'https://test.im.codes',
+    DATABASE_URL: 'postgres://localhost/test',
+    ...overrides,
+  };
+}
+
+function authCookies(userId = 'user-1'): string {
+  const token = signJwt({ sub: userId, role: 'owner', type: 'web' }, JWT_KEY, 3600);
+  return `${COOKIE_SESSION}=${token}; ${COOKIE_CSRF}=csrf-tok-1`;
+}
+
+function cookieWriteHeaders(cookie: string, json = true): Record<string, string> {
+  return {
+    Cookie: cookie,
+    Origin: 'https://test.im.codes',
+    [HEADER_CSRF]: 'csrf-tok-1',
+    ...(json ? { 'Content-Type': 'application/json' } : {}),
+  };
+}
+
+describe('TTS routes & preferences isolation', () => {
+  const realFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it('requires authentication on /api/tts/config and /api/tts/speech', async () => {
+    const { db } = makeMemDb();
+    const env = makeEnv(db);
+    const app = buildApp(env);
+
+    const r1 = await app.request(TTS_CONFIG_PATH, { method: 'GET' }, env);
+    expect(r1.status).toBe(401);
+
+    const r2 = await app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: 'hello' }),
+    }, env);
+    expect(r2.status).toBe(401);
+  });
+
+  it('blocks direct access to reserved TTS preference key via /api/preferences/*', async () => {
+    const { db } = makeMemDb();
+    const env = makeEnv(db);
+    const app = buildApp(env);
+    const cookie = authCookies();
+
+    const g = await app.request(`/api/preferences/${encodeURIComponent(TTS_USER_CONFIG_PREF_KEY)}`, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    }, env);
+    expect(g.status).toBe(403);
+
+    const p = await app.request(`/api/preferences/${encodeURIComponent(TTS_USER_CONFIG_PREF_KEY)}`, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ value: { mode: 'server' } }),
+    }, env);
+    expect(p.status).toBe(403);
+
+    const d = await app.request(`/api/preferences/${encodeURIComponent(TTS_USER_CONFIG_PREF_KEY)}`, {
+      method: 'DELETE',
+      headers: cookieWriteHeaders(cookie, false),
+    }, env);
+    expect(d.status).toBe(403);
+  });
+
+  it('encrypts API key at rest, masks on read, keeps on omit, and clears on empty string', async () => {
+    const { db, prefs } = makeMemDb();
+    const env = makeEnv(db);
+    const app = buildApp(env);
+    const cookie = authCookies();
+    const secret = 'sk-secret-key-9876543210';
+
+    const put1 = await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({
+        mode: 'server',
+        baseUrl: 'http://127.0.0.1:8880/v1',
+        apiKey: secret,
+        model: 'kokoro',
+        voice: 'af_sky',
+        responseFormat: 'wav',
+      }),
+    }, env);
+    expect(put1.status).toBe(200);
+    const body1 = await put1.json() as { config: Record<string, unknown> };
+    expect(body1.config.mode).toBe('server');
+    expect(body1.config.baseUrl).toBe('http://127.0.0.1:8880/v1');
+    expect(body1.config.hasApiKey).toBe(true);
+    expect(body1.config.apiKeyMasked).toBe('sk-s...3210');
+    expect(JSON.stringify(body1)).not.toContain(secret);
+
+    const rawStored = prefs.get(`user-1:${TTS_USER_CONFIG_PREF_KEY}`)!;
+    expect(rawStored).toBeDefined();
+    expect(rawStored).not.toContain(secret);
+
+    // Omitting apiKey preserves previously saved encrypted key
+    const put2 = await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ voice: 'af_bella' }),
+    }, env);
+    expect(put2.status).toBe(200);
+    const get2 = await app.request(TTS_CONFIG_PATH, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    }, env);
+    expect(get2.status).toBe(200);
+    const cfg2 = await get2.json() as Record<string, unknown>;
+    expect(cfg2.hasApiKey).toBe(true);
+    expect(cfg2.apiKeyMasked).toBe('sk-s...3210');
+    expect(cfg2.voice).toBe('af_bella');
+    expect(JSON.stringify(cfg2)).not.toContain(secret);
+
+    // Empty string clears stored key
+    const put3 = await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ apiKey: '' }),
+    }, env);
+    expect(put3.status).toBe(200);
+    const body3 = await put3.json() as { config: Record<string, unknown> };
+    expect(body3.config.hasApiKey).toBe(false);
+    expect(body3.config.apiKeyMasked).toBeNull();
+  });
+
+  it('rejects unsafe baseUrl targets and missing BOT_ENCRYPTION_KEY when saving apiKey', async () => {
+    const { db } = makeMemDb();
+    const env = makeEnv(db, { BOT_ENCRYPTION_KEY: '' });
+    const app = buildApp(env);
+    const cookie = authCookies();
+
+    const badMeta = await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ baseUrl: 'http://169.254.169.254/latest' }),
+    }, env);
+    expect(badMeta.status).toBe(400);
+
+    const noKeySecret = await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ baseUrl: 'http://127.0.0.1:8880/v1', apiKey: 'sk-1234567890' }),
+    }, env);
+    expect(noKeySecret.status).toBe(500);
+  });
+
+  it('proxies OpenAI speech requests with env defaults and streams audio without leaking apiKey', async () => {
+    const { db } = makeMemDb();
+    const env = makeEnv(db, {
+      TTS_BASE_URL: 'https://tts.example.com/v1',
+      TTS_API_KEY: 'env-secret-api-key-9999',
+      TTS_MODEL: 'tts-1',
+      TTS_VOICE: 'nova',
+      TTS_RESPONSE_FORMAT: 'mp3',
+    });
+    const app = buildApp(env);
+    const cookie = authCookies();
+
+    const cfgRes = await app.request(TTS_CONFIG_PATH, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    }, env);
+    expect(cfgRes.status).toBe(200);
+    const cfg = await cfgRes.json() as Record<string, unknown>;
+    expect(cfg.serverDefaultConfigured).toBe(true);
+    expect(cfg.model).toBe('tts-1');
+    expect(cfg.voice).toBe('nova');
+    expect(JSON.stringify(cfg)).not.toContain('env-secret-api-key-9999');
+
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => {
+      return new Response(Uint8Array.from([1, 2, 3, 4]), {
+        status: 200,
+        headers: { 'Content-Type': 'audio/mpeg' },
+      });
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const speechRes = await app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ input: 'Hello world', speed: 1.5 }),
+    }, env);
+    expect(speechRes.status).toBe(200);
+    expect(speechRes.headers.get('content-type')).toBe('audio/mpeg');
+    expect(speechRes.headers.get('cache-control')).toBe('no-store');
+    expect(new Uint8Array(await speechRes.arrayBuffer())).toEqual(Uint8Array.from([1, 2, 3, 4]));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [targetUrl, init] = fetchMock.mock.calls[0]!;
+    expect(targetUrl).toBe('https://tts.example.com/v1/audio/speech');
+    expect(init?.redirect).toBe('manual');
+    const hdrs = init?.headers as Record<string, string>;
+    expect(hdrs.Authorization).toBe('Bearer env-secret-api-key-9999');
+    expect(JSON.parse(String(init?.body))).toEqual({
+      model: 'tts-1',
+      input: 'Hello world',
+      voice: 'nova',
+      response_format: 'mp3',
+      speed: 1.5,
+    });
+  });
+
+  it('never sends env TTS_API_KEY to a user-supplied baseUrl and blocks 3xx redirects or oversized responses', async () => {
+    const { db } = makeMemDb();
+    const env = makeEnv(db, {
+      TTS_BASE_URL: 'https://admin-tts.example.com/v1',
+      TTS_API_KEY: 'admin-only-secret-key',
+    });
+    const app = buildApp(env);
+    const cookie = authCookies();
+
+    // User sets their own local URL without an apiKey
+    await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ mode: 'server', baseUrl: 'http://192.168.1.50:8880' }),
+    }, env);
+
+    const fetchMock = vi.fn(async () => new Response(Uint8Array.from([9, 8]), {
+      status: 200,
+      headers: { 'Content-Type': 'audio/mpeg' },
+    }));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const okRes = await app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ input: 'Test local' }),
+    }, env);
+    expect(okRes.status).toBe(200);
+    const hdrs = fetchMock.mock.calls[0]?.[1]?.headers as Record<string, string>;
+    expect(hdrs.Authorization).toBeUndefined();
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      model: TTS_DEFAULT_MODEL,
+      input: 'Test local',
+      voice: TTS_DEFAULT_VOICE,
+      response_format: TTS_DEFAULT_RESPONSE_FORMAT,
+    });
+
+    // 3xx redirect blocked
+    globalThis.fetch = vi.fn(async () => new Response(null, {
+      status: 302,
+      headers: { Location: 'http://169.254.169.254/latest' },
+    })) as typeof fetch;
+    const redirRes = await app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ input: 'Test redirect' }),
+    }, env);
+    expect(redirRes.status).toBe(502);
+
+    // Oversized Content-Length blocked
+    globalThis.fetch = vi.fn(async () => new Response(Uint8Array.from([1]), {
+      status: 200,
+      headers: {
+        'Content-Type': 'audio/mpeg',
+        'Content-Length': String(TTS_MAX_RESPONSE_BYTES + 1),
+      },
+    })) as typeof fetch;
+    const bigRes = await app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ input: 'Test large' }),
+    }, env);
+    expect(bigRes.status).toBe(502);
+  });
+
+  it('propagates client aborts to the upstream fetch signal and sanitizes upstream errors', async () => {
+    const { db } = makeMemDb();
+    const env = makeEnv(db);
+    const app = buildApp(env);
+    const cookie = authCookies();
+    const secret = 'sk-do-not-leak-in-errors';
+
+    await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ mode: 'server', baseUrl: 'https://api.openai.com/v1', apiKey: secret }),
+    }, env);
+
+    // Upstream 401/500 does not leak API key
+    globalThis.fetch = vi.fn(async () => new Response(`bad key ${secret}`, { status: 401 })) as typeof fetch;
+    const errRes = await app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ input: 'Hello' }),
+    }, env);
+    expect(errRes.status).toBe(502);
+    const errText = await errRes.text();
+    expect(errText).not.toContain(secret);
+
+    // Client abort cancels upstream fetch signal
+    let capturedSignal: AbortSignal | undefined;
+    const clientAbort = new AbortController();
+    globalThis.fetch = vi.fn((_url, init) => {
+      capturedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        capturedSignal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    }) as typeof fetch;
+
+    const reqPromise = app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ input: 'Abort me' }),
+      signal: clientAbort.signal,
+    }, env);
+    await new Promise((r) => setTimeout(r, 10));
+    clientAbort.abort();
+    const abortRes = await reqPromise;
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(abortRes.status).toBe(499);
+  });
+});

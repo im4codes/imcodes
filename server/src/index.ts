@@ -75,9 +75,11 @@ import {
 } from './storage/cloud-doc-storage.js';
 import { documentSharingRoutes } from './routes/document-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
+import { ttsRoutes } from './routes/tts.js';
 import { aliasRoutes } from './routes/aliases.js';
 import { buildAppContentSecurityPolicy } from '../../shared/app-content-security-policy.js';
 import { ALIAS_API_PATH } from '../../shared/alias-types.js';
+import { TTS_API_BASE } from '../../shared/tts-config.js';
 import { sessionIdentityRoutes } from './routes/session-identities.js';
 import { SESSION_IDENTITY_API_PATH } from '../../shared/session-identity.js';
 import { verificationMachineRoutes } from './routes/verification-machines.js';
@@ -780,6 +782,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.route('/api/server', discussionRoutes);
   app.route('/api/server', taskPairsRoutes);
   app.route('/api/preferences', preferencesRoutes);
+  app.route(TTS_API_BASE, ttsRoutes);
   // User-level alias store: flat, pod-independent (no serverId). Mounted under
   // /api/* so it inherits the global CORS + CSRF middleware.
   app.route(ALIAS_API_PATH, aliasRoutes);

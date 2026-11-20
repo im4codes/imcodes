@@ -61,6 +61,13 @@ import {
   type SessionIdentityProfile,
   type SessionIdentityScope,
 } from '@shared/session-identity.js';
+import {
+  TTS_CONFIG_PATH,
+  TTS_SPEECH_PATH,
+  type TtsConfigUpdateBody,
+  type TtsPublicConfig,
+  type TtsSpeechRequestBody,
+} from '@shared/tts-config.js';
 import type {
   CloudDocBlankType,
   CloudDocFolder,
@@ -3955,4 +3962,121 @@ export async function deleteRecentDocumentApi(recentId: string): Promise<{ ok: b
     `/api/recent-documents/${encodeURIComponent(recentId)}`,
     { method: 'DELETE' },
   );
+}
+
+// ── Server TTS ───────────────────────────────────────────────────────────────
+
+export async function getServerTtsConfig(): Promise<TtsPublicConfig> {
+  return apiFetch<TtsPublicConfig>(TTS_CONFIG_PATH, { cache: 'no-store' });
+}
+
+export async function updateServerTtsConfig(
+  body: TtsConfigUpdateBody,
+): Promise<{ ok: true; config: TtsPublicConfig }> {
+  return apiFetch<{ ok: true; config: TtsPublicConfig }>(TTS_CONFIG_PATH, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
+async function readResponseBlobWithSignal(res: Response, signal?: AbortSignal | null): Promise<Blob> {
+  throwIfAborted(signal);
+  return waitForPromiseWithSignal(res.blob(), signal);
+}
+
+/**
+ * Synthesize speech audio via the authenticated `/api/tts/speech` proxy,
+ * sharing cookie/Bearer auth, CSRF retry, and AbortSignal handling with `apiFetch`.
+ */
+export async function synthesizeServerTtsSpeech(
+  body: TtsSpeechRequestBody,
+  options: { signal?: AbortSignal } = {},
+): Promise<Blob> {
+  const signal = options.signal;
+  const reqOpts: RequestInit = {
+    method: 'POST',
+    body: JSON.stringify(body),
+    signal,
+  };
+  throwIfAborted(signal);
+  let res = await rawFetch(TTS_SPEECH_PATH, reqOpts);
+  throwIfAborted(signal);
+
+  if (res.status === 409) {
+    const errBody = await readResponseTextWithSignal(res, signal);
+    throwIfAborted(signal);
+    if (errBody.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
+      _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+    }
+    throw new ApiError(res.status, errBody);
+  }
+
+  if (res.status === 401) {
+    if (_apiKey) {
+      let verifyRes: Response;
+      try {
+        verifyRes = await rawFetch('/api/auth/user/me', { signal });
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        throw new ApiError(503, 'server_unavailable');
+      }
+      throwIfAborted(signal);
+      if (verifyRes.ok) {
+        res = await rawFetch(TTS_SPEECH_PATH, reqOpts);
+      } else if (verifyRes.status >= 500) {
+        const errBody = await readResponseTextWithSignal(verifyRes, signal).catch(() => 'server_unavailable');
+        throw new ApiError(verifyRes.status, errBody || 'server_unavailable');
+      } else {
+        _onAuthExpired?.(`401 on ${TTS_SPEECH_PATH} — bearer account verification failed`);
+        throw new ApiError(401, 'session_expired');
+      }
+    } else {
+      let refreshed = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        throwIfAborted(signal);
+        if (!refreshPromise) {
+          refreshPromise = doRefresh().finally(() => { refreshPromise = null; });
+        }
+        try {
+          refreshed = await waitForPromiseWithSignal(refreshPromise, signal);
+        } catch (err) {
+          if (signal?.aborted) throw err;
+          throw new ApiError(503, 'server_unavailable');
+        }
+        if (refreshed) break;
+        if (attempt === 0) await sleepWithSignal(1000, signal);
+      }
+      if (refreshed) {
+        res = await rawFetch(TTS_SPEECH_PATH, reqOpts);
+      } else {
+        throw new ApiError(401, 'session_expired');
+      }
+    }
+  } else if (res.status === 403) {
+    const errBody = await readResponseTextWithSignal(res, signal);
+    throwIfAborted(signal);
+    if (errBody.includes('csrf_rejected')) {
+      if (!refreshPromise) {
+        refreshPromise = doRefresh().finally(() => { refreshPromise = null; });
+      }
+      const ok = await waitForPromiseWithSignal(refreshPromise, signal).catch(() => false);
+      if (ok) {
+        res = await rawFetch(TTS_SPEECH_PATH, reqOpts);
+      } else {
+        throw new ApiError(403, errBody);
+      }
+    } else {
+      if (errBody.includes(AUTH_ERROR_CODES.ACCOUNT_DISABLED) || errBody.includes(AUTH_ERROR_CODES.ACCOUNT_PENDING)) {
+        _onAuthExpired?.(errBody.includes(AUTH_ERROR_CODES.ACCOUNT_PENDING) ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED);
+      }
+      throw new ApiError(403, errBody);
+    }
+  }
+
+  throwIfAborted(signal);
+  if (!res.ok) {
+    const errBody = await readResponseTextWithSignal(res, signal);
+    throw new ApiError(res.status, errBody);
+  }
+  return readResponseBlobWithSignal(res, signal);
 }

@@ -482,3 +482,130 @@ describe('tts service', () => {
     await vi.waitFor(() => expect(nativeTts.getTtsState().status).toBe('idle'));
   });
 });
+
+describe('server TTS playback', () => {
+  const realFetch = globalThis.fetch;
+  const realCreateObjectURL = URL.createObjectURL;
+  const realRevokeObjectURL = URL.revokeObjectURL;
+
+  beforeEach(async () => {
+    localStorage.clear();
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    const tts = await import('../src/tts.js');
+    await tts.__resetTtsForTests();
+    globalThis.fetch = realFetch;
+    URL.createObjectURL = realCreateObjectURL;
+    URL.revokeObjectURL = realRevokeObjectURL;
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it('plays segments sequentially with prefetch and revokes every blob URL on completion', async () => {
+    const createdUrls: string[] = [];
+    const revokedUrls: string[] = [];
+    let urlCounter = 0;
+    URL.createObjectURL = vi.fn(() => {
+      const url = `blob:mock/${++urlCounter}`;
+      createdUrls.push(url);
+      return url;
+    });
+    URL.revokeObjectURL = vi.fn((url: string) => {
+      revokedUrls.push(url);
+    });
+
+    interface MockAudioInstance {
+      src: string;
+      onended: (() => void) | null;
+      onerror: (() => void) | null;
+      play: ReturnType<typeof vi.fn>;
+      pause: ReturnType<typeof vi.fn>;
+    }
+    const audioInstances: MockAudioInstance[] = [];
+    class MockAudio {
+      src: string;
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      play = vi.fn(async () => {});
+      pause = vi.fn();
+      constructor(src = '') {
+        this.src = src;
+        audioInstances.push(this);
+      }
+    }
+    vi.stubGlobal('Audio', MockAudio);
+
+    const fetchMock = vi.fn(async () => new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 }));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.setTtsMode('server');
+    const res = await tts.speakText('第一句中文。 Second sentence in English.', { messageId: 'srv-1', rate: 1.25 });
+    expect(res).toEqual({ started: true });
+    expect(tts.getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'srv-1', error: null });
+
+    // Segment 1 is played and segment 2 is prefetched
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(audioInstances).toHaveLength(1);
+    expect(audioInstances[0]!.src).toBe('blob:mock/1');
+
+    // Finish segment 1 -> revokes blob 1 and starts segment 2
+    audioInstances[0]!.onended?.();
+    await vi.waitFor(() => expect(audioInstances).toHaveLength(2));
+    expect(revokedUrls).toContain('blob:mock/1');
+    expect(audioInstances[1]!.src).toBe('blob:mock/2');
+
+    // Finish segment 2 -> revokes blob 2 and returns to idle
+    audioInstances[1]!.onended?.();
+    await vi.waitFor(() => expect(tts.getTtsState().status).toBe('idle'));
+    expect(revokedUrls).toEqual(['blob:mock/1', 'blob:mock/2']);
+    expect(createdUrls).toEqual(['blob:mock/1', 'blob:mock/2']);
+  });
+
+  it('aborts active HTTP request on stopSpeaking() mid-fetch and cleans up playback', async () => {
+    URL.createObjectURL = vi.fn(() => 'blob:mock/unused');
+    URL.revokeObjectURL = vi.fn();
+    vi.stubGlobal('Audio', class { play = vi.fn(async () => {}); pause = vi.fn(); });
+
+    let capturedSignal: AbortSignal | undefined;
+    globalThis.fetch = vi.fn((_url, init) => {
+      capturedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        capturedSignal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.setTtsMode('server');
+    const speakPromise = tts.speakText('Cancel while fetching.', { messageId: 'srv-abort' });
+    await vi.waitFor(() => expect(capturedSignal).toBeDefined());
+    await tts.stopSpeaking();
+
+    const result = await speakPromise;
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(result).toEqual({ started: false, reason: 'superseded' });
+    expect(tts.getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it('syncs server config without breaking when offline or unauthenticated', async () => {
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      mode: 'server',
+      baseUrl: 'http://127.0.0.1:8880/v1',
+      hasApiKey: true,
+      apiKeyMasked: 'sk-a...wxyz',
+      model: 'kokoro',
+      voice: 'af_sky',
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    const cfg = await tts.syncTtsConfigFromServer();
+    expect(cfg?.mode).toBe('server');
+    expect(tts.getTtsMode()).toBe('server');
+    expect(tts.isServerTtsConfigured()).toBe(true);
+  });
+});

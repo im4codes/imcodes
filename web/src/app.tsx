@@ -348,6 +348,7 @@ import {
   DESKTOP_NOTIFICATION_PREFS_CHANGED_EVENT,
   showDesktopNotification,
 } from './desktop-notifications.js';
+import { syncTtsConfigFromServer } from './tts.js';
 import {
   resolveEffectivePushEnabledServerIds,
   sanitizePushEnabledServerIds,
@@ -1831,6 +1832,14 @@ function InternalMainApp() {
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
     };
+  }, [auth]);
+
+  // Sync server-side TTS config (non-blocking) when authenticated session initializes
+  useEffect(() => {
+    if (!auth) return;
+    if (typeof syncTtsConfigFromServer === 'function') {
+      void syncTtsConfigFromServer();
+    }
   }, [auth]);
 
   // Keep per-server push preferences synchronized with Settings -> Notifications and remote devices.

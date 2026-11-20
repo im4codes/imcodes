@@ -2,6 +2,14 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startAuthentication } from '@simplewebauthn/browser';
 import { ApiError, apiFetch, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
+import {
+  TTS_DEFAULT_MODEL,
+  TTS_DEFAULT_RESPONSE_FORMAT,
+  TTS_DEFAULT_VOICE,
+  TTS_ENGINES,
+  TTS_RESPONSE_FORMATS,
+  type TtsResponseFormat,
+} from '@shared/tts-config.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
 import { AUTH_ERROR_CODES } from '@shared/auth-error-codes.js';
@@ -55,14 +63,22 @@ import {
 } from '../ui-scale.js';
 import {
   canOpenNativeTtsSettings,
+  fetchServerTtsConfig,
+  getCachedServerTtsConfig,
   getNativeTtsVoiceQuality,
   getTtsAutoReadEnabled,
+  getTtsMode,
   getTtsSpeechRate,
   openNativeTtsSettings,
+  saveServerTtsConfig,
   setTtsAutoReadEnabled,
+  setTtsMode,
   setTtsSpeechRate,
+  speakText,
+  stopSpeaking,
   subscribeTtsPreferences,
   TTS_RATE_OPTIONS,
+  type TtsEngineMode,
 } from '../tts.js';
 import {
   getNativeTtsVoiceQualityLabelKey,
@@ -121,13 +137,45 @@ export function SettingsPage({
   const [uiScale, setUiScale, defaultUiScale] = useUiScale();
   const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => getTtsAutoReadEnabled());
   const [ttsRate, setTtsRate] = useState<number>(() => getTtsSpeechRate());
+  const [ttsMode, setLocalTtsMode] = useState<TtsEngineMode>(() => getTtsMode());
+  const [ttsBaseUrl, setTtsBaseUrl] = useState<string>(() => getCachedServerTtsConfig()?.baseUrl ?? '');
+  const [ttsApiKeyInput, setTtsApiKeyInput] = useState<string>('');
+  const [ttsHasApiKey, setTtsHasApiKey] = useState<boolean>(() => getCachedServerTtsConfig()?.hasApiKey ?? false);
+  const [ttsApiKeyMasked, setTtsApiKeyMasked] = useState<string | null>(() => getCachedServerTtsConfig()?.apiKeyMasked ?? null);
+  const [ttsModel, setTtsModel] = useState<string>(() => getCachedServerTtsConfig()?.model ?? TTS_DEFAULT_MODEL);
+  const [ttsVoice, setTtsVoice] = useState<string>(() => getCachedServerTtsConfig()?.voice ?? TTS_DEFAULT_VOICE);
+  const [ttsFormat, setTtsFormat] = useState<TtsResponseFormat>(() => getCachedServerTtsConfig()?.responseFormat ?? TTS_DEFAULT_RESPONSE_FORMAT);
+  const [ttsServerDefaultConfigured, setTtsServerDefaultConfigured] = useState<boolean>(() => getCachedServerTtsConfig()?.serverDefaultConfigured ?? false);
+  const [ttsSaving, setTtsSaving] = useState(false);
+  const [ttsTesting, setTtsTesting] = useState(false);
+  const [ttsServerMsg, setTtsServerMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [nativeVoiceQuality, setNativeVoiceQuality] = useState<NativeTtsVoiceQualityInfo | null>(null);
 
   useEffect(() => {
     return subscribeTtsPreferences(() => {
       setTtsAutoRead(getTtsAutoReadEnabled());
       setTtsRate(getTtsSpeechRate());
+      setLocalTtsMode(getTtsMode());
     });
+  }, []);
+
+  useEffect(() => {
+    if (typeof fetchServerTtsConfig !== 'function') return;
+    let cancelled = false;
+    void fetchServerTtsConfig().then((cfg) => {
+      if (cancelled || !cfg) return;
+      setLocalTtsMode(cfg.mode);
+      setTtsBaseUrl(cfg.baseUrl);
+      setTtsHasApiKey(cfg.hasApiKey);
+      setTtsApiKeyMasked(cfg.apiKeyMasked);
+      setTtsModel(cfg.model);
+      setTtsVoice(cfg.voice);
+      setTtsFormat(cfg.responseFormat);
+      setTtsServerDefaultConfigured(cfg.serverDefaultConfigured);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -801,8 +849,256 @@ export function SettingsPage({
                       ))}
                     </div>
                   </div>
-                  <div
-                    data-testid="settings-tts-voice-hint"
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                    <div style={{ minWidth: 0, flex: '1 1 180px' }}>
+                      <div style={inlineLabelStyle}>{t('settings.tts_engine')}</div>
+                      <div style={{ color: '#94a3b8', fontSize: '12px', lineHeight: 1.45 }}>
+                        {t('settings.tts_engine_desc')}
+                      </div>
+                    </div>
+                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0, flexWrap: 'wrap' }}>
+                      {TTS_ENGINES.map((engine) => (
+                        <button
+                          key={engine}
+                          type="button"
+                          data-testid={`settings-tts-engine-${engine}`}
+                          aria-pressed={ttsMode === engine}
+                          class={ttsMode === engine ? 'settings-btn-primary' : 'settings-btn-secondary'}
+                          style={{ minWidth: 72, padding: '6px 12px', fontSize: '12px' }}
+                          onClick={() => {
+                            setTtsMode(engine);
+                            setLocalTtsMode(engine);
+                            setTtsServerMsg(null);
+                            void stopSpeaking();
+                            if (typeof saveServerTtsConfig === 'function') {
+                              void saveServerTtsConfig({ mode: engine }).catch(() => {});
+                            }
+                          }}
+                        >
+                          {t(`settings.tts_engine_${engine}`)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {ttsMode === 'server' && (
+                    <div
+                      data-testid="settings-tts-server-panel"
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 10,
+                        borderTop: '1px solid rgba(148, 163, 184, 0.14)',
+                        paddingTop: 12,
+                      }}
+                    >
+                      <div>
+                        <label style={inlineLabelStyle} for="settings-tts-server-baseurl-input">
+                          {t('settings.tts_server_base_url')}
+                        </label>
+                        <input
+                          id="settings-tts-server-baseurl-input"
+                          data-testid="settings-tts-server-baseurl"
+                          type="url"
+                          class="settings-input"
+                          value={ttsBaseUrl}
+                          onInput={(e) => setTtsBaseUrl((e.target as HTMLInputElement).value)}
+                          placeholder={ttsServerDefaultConfigured
+                            ? t('settings.tts_server_default_configured')
+                            : t('settings.tts_server_base_url_placeholder')}
+                        />
+                      </div>
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                          <label style={inlineLabelStyle} for="settings-tts-server-apikey-input">
+                            {t('settings.tts_server_api_key')}
+                          </label>
+                          {ttsHasApiKey && (
+                            <button
+                              type="button"
+                              data-testid="settings-tts-server-clear-key"
+                              class="settings-btn-secondary"
+                              style={{ padding: '2px 8px', fontSize: '11px' }}
+                              disabled={ttsSaving}
+                              onClick={async () => {
+                                if (typeof saveServerTtsConfig !== 'function') return;
+                                setTtsSaving(true);
+                                setTtsServerMsg(null);
+                                try {
+                                  const res = await saveServerTtsConfig({ apiKey: '' });
+                                  if (res?.config) {
+                                    setTtsHasApiKey(res.config.hasApiKey);
+                                    setTtsApiKeyMasked(res.config.apiKeyMasked);
+                                    setTtsApiKeyInput('');
+                                    setTtsServerMsg({ type: 'ok', text: t('settings.tts_server_saved') });
+                                  }
+                                } catch (err) {
+                                  setTtsServerMsg({ type: 'err', text: err instanceof Error ? err.message : t('settings.tts_server_save_error') });
+                                } finally {
+                                  setTtsSaving(false);
+                                }
+                              }}
+                            >
+                              {t('settings.tts_server_api_key_clear')}
+                            </button>
+                          )}
+                        </div>
+                        <input
+                          id="settings-tts-server-apikey-input"
+                          data-testid="settings-tts-server-apikey"
+                          type="password"
+                          autocomplete="off"
+                          class="settings-input"
+                          value={ttsApiKeyInput}
+                          onInput={(e) => setTtsApiKeyInput((e.target as HTMLInputElement).value)}
+                          placeholder={t('settings.tts_server_api_key_placeholder')}
+                        />
+                        {ttsHasApiKey && ttsApiKeyMasked && (
+                          <div data-testid="settings-tts-server-apikey-hint" style={{ color: '#94a3b8', fontSize: '11px', marginTop: 4 }}>
+                            {t('settings.tts_server_api_key_keep', { masked: ttsApiKeyMasked })}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10 }}>
+                        <div>
+                          <label style={inlineLabelStyle} for="settings-tts-server-model-input">
+                            {t('settings.tts_server_model')}
+                          </label>
+                          <input
+                            id="settings-tts-server-model-input"
+                            data-testid="settings-tts-server-model"
+                            type="text"
+                            class="settings-input"
+                            value={ttsModel}
+                            onInput={(e) => setTtsModel((e.target as HTMLInputElement).value)}
+                            placeholder={TTS_DEFAULT_MODEL}
+                          />
+                        </div>
+                        <div>
+                          <label style={inlineLabelStyle} for="settings-tts-server-voice-input">
+                            {t('settings.tts_server_voice')}
+                          </label>
+                          <input
+                            id="settings-tts-server-voice-input"
+                            data-testid="settings-tts-server-voice"
+                            type="text"
+                            class="settings-input"
+                            value={ttsVoice}
+                            onInput={(e) => setTtsVoice((e.target as HTMLInputElement).value)}
+                            placeholder={TTS_DEFAULT_VOICE}
+                          />
+                        </div>
+                        <div>
+                          <label style={inlineLabelStyle} for="settings-tts-server-format-select">
+                            {t('settings.tts_server_format')}
+                          </label>
+                          <select
+                            id="settings-tts-server-format-select"
+                            data-testid="settings-tts-server-format"
+                            class="settings-input"
+                            value={ttsFormat}
+                            onChange={(e) => setTtsFormat((e.target as HTMLSelectElement).value as TtsResponseFormat)}
+                          >
+                            {TTS_RESPONSE_FORMATS.map((fmt) => (
+                              <option key={fmt} value={fmt}>{fmt}</option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                      <div class="settings-action-row" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          data-testid="settings-tts-server-save"
+                          class="settings-btn-primary"
+                          disabled={ttsSaving}
+                          onClick={async () => {
+                            if (typeof saveServerTtsConfig !== 'function') return;
+                            setTtsSaving(true);
+                            setTtsServerMsg(null);
+                            try {
+                              const payload: {
+                                mode: TtsEngineMode;
+                                baseUrl: string;
+                                apiKey?: string;
+                                model: string;
+                                voice: string;
+                                responseFormat: TtsResponseFormat;
+                              } = {
+                                mode: ttsMode,
+                                baseUrl: ttsBaseUrl.trim(),
+                                model: ttsModel.trim(),
+                                voice: ttsVoice.trim(),
+                                responseFormat: ttsFormat,
+                              };
+                              if (ttsApiKeyInput.trim()) {
+                                payload.apiKey = ttsApiKeyInput.trim();
+                              }
+                              const res = await saveServerTtsConfig(payload);
+                              if (res?.config) {
+                                setTtsBaseUrl(res.config.baseUrl);
+                                setTtsHasApiKey(res.config.hasApiKey);
+                                setTtsApiKeyMasked(res.config.apiKeyMasked);
+                                setTtsModel(res.config.model);
+                                setTtsVoice(res.config.voice);
+                                setTtsFormat(res.config.responseFormat);
+                                setTtsServerDefaultConfigured(res.config.serverDefaultConfigured);
+                                setTtsApiKeyInput('');
+                                setTtsServerMsg({ type: 'ok', text: t('settings.tts_server_saved') });
+                              }
+                            } catch (err) {
+                              setTtsServerMsg({ type: 'err', text: err instanceof Error ? err.message : t('settings.tts_server_save_error') });
+                            } finally {
+                              setTtsSaving(false);
+                            }
+                          }}
+                        >
+                          {ttsSaving ? t('settings.tts_server_saving') : t('settings.tts_server_save')}
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="settings-tts-server-test"
+                          class="settings-btn-secondary"
+                          disabled={ttsTesting || ttsSaving}
+                          onClick={async () => {
+                            setTtsTesting(true);
+                            setTtsServerMsg(null);
+                            try {
+                              setTtsMode('server');
+                              const res = await speakText(t('settings.tts_server_test_text'), {
+                                messageId: 'settings-tts-test',
+                                lang: currentLang,
+                              });
+                              if (!res.started) {
+                                setTtsServerMsg({
+                                  type: 'err',
+                                  text: t('settings.tts_server_test_failed', { error: res.error ?? res.reason ?? 'error' }),
+                                });
+                              }
+                            } catch (err) {
+                              setTtsServerMsg({
+                                type: 'err',
+                                text: t('settings.tts_server_test_failed', { error: err instanceof Error ? err.message : 'error' }),
+                              });
+                            } finally {
+                              setTtsTesting(false);
+                            }
+                          }}
+                        >
+                          {t('settings.tts_server_test')}
+                        </button>
+                      </div>
+                      {ttsServerMsg && (
+                        <div
+                          data-testid="settings-tts-server-status"
+                          style={{ fontSize: '12px', color: messageColor(ttsServerMsg.type) }}
+                        >
+                          {ttsServerMsg.text}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {ttsMode === 'system' && (
+                    <div
+                      data-testid="settings-tts-voice-hint"
                     style={{
                       color: '#94a3b8',
                       fontSize: '12px',
@@ -849,6 +1145,7 @@ export function SettingsPage({
                       </div>
                     )}
                   </div>
+                  )}
                 </div>
               </div>
 

@@ -3,15 +3,21 @@ import type { RefObject } from 'preact';
 import { useTranslation } from 'react-i18next';
 import {
   canOpenNativeTtsSettings,
+  getCachedServerTtsConfig,
   getNativeTtsVoiceQuality,
   getTtsAutoReadEnabled,
+  getTtsMode,
   getTtsSpeechRate,
+  isServerTtsConfigured,
   openNativeTtsSettings,
+  saveServerTtsConfig,
   setTtsAutoReadEnabled,
+  setTtsMode,
   setTtsSpeechRate,
   stopSpeaking,
   subscribeTtsPreferences,
   TTS_RATE_OPTIONS,
+  type TtsEngineMode,
 } from '../tts.js';
 import {
   getNativeTtsVoiceQualityLabelKey,
@@ -30,6 +36,8 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
   const { t } = useTranslation();
   const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => getTtsAutoReadEnabled());
   const [ttsRate, setTtsRate] = useState<number>(() => getTtsSpeechRate());
+  const [ttsMode, setLocalTtsMode] = useState<TtsEngineMode>(() => getTtsMode());
+  const [serverConfigured, setServerConfigured] = useState<boolean>(() => isServerTtsConfigured(getCachedServerTtsConfig()));
   const [nativeVoiceQuality, setNativeVoiceQuality] = useState<NativeTtsVoiceQualityInfo | null>(null);
   const [alignLeft, setAlignLeft] = useState(false);
 
@@ -39,6 +47,8 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
   useEffect(() => subscribeTtsPreferences(() => {
     setTtsAutoRead(getTtsAutoReadEnabled());
     setTtsRate(getTtsSpeechRate());
+    setLocalTtsMode(getTtsMode());
+    setServerConfigured(isServerTtsConfigured(getCachedServerTtsConfig()));
   }), []);
 
   useEffect(() => {
@@ -141,6 +151,38 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
           ))}
         </div>
       </div>
+
+      {serverConfigured || ttsMode === 'server' ? (
+        <div class="chat-tts-settings-section" data-testid="chat-tts-settings-engine-section">
+          <div class="chat-tts-settings-label">{t('settings.tts_engine')}</div>
+          <div class="chat-tts-settings-rate-group">
+            {(['system', 'server'] as const).map((engine) => (
+              <button
+                key={engine}
+                type="button"
+                data-testid={`chat-tts-settings-engine-${engine}`}
+                aria-pressed={ttsMode === engine}
+                class={`chat-tts-settings-rate-btn${ttsMode === engine ? ' is-active' : ''}`}
+                onClick={() => {
+                  if (ttsMode === engine) return;
+                  setTtsMode(engine);
+                  setLocalTtsMode(engine);
+                  void stopSpeaking();
+                  if (typeof saveServerTtsConfig === 'function') {
+                    void saveServerTtsConfig({ mode: engine }).catch(() => {});
+                  }
+                }}
+              >
+                {t(`settings.tts_engine_${engine}`)}
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div class="chat-tts-settings-hint" data-testid="chat-tts-settings-server-hint">
+          {t('settings.tts_server_unconfigured_hint')}
+        </div>
+      )}
 
       {showNativeSection && (
         <div class="chat-tts-settings-native" data-testid="chat-tts-settings-native-section">

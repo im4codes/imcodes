@@ -2,6 +2,14 @@ import {
   STREAMING_SPEECH_TTS_STATE_EVENT,
   STREAMING_SPEECH_TTS_STATUS,
 } from '@shared/voice-recognition.js';
+import {
+  clampTtsServerSpeed,
+  isTtsEngineMode,
+  type TtsConfigUpdateBody,
+  type TtsEngineMode,
+  type TtsPublicConfig,
+  type TtsSpeechRequestBody,
+} from '@shared/tts-config.js';
 import { isNative } from './native.js';
 import {
   getNativeSystemTts,
@@ -10,8 +18,12 @@ import {
   type NativeTtsVoiceQualityInfo,
 } from './voice-recognition-backend.js';
 
+export type { TtsEngineMode, TtsPublicConfig };
+
 export const TTS_AUTO_READ_STORAGE_KEY = 'imcodes_tts_auto_read';
 export const TTS_SPEECH_RATE_STORAGE_KEY = 'imcodes_tts_rate';
+export const TTS_MODE_STORAGE_KEY = 'imcodes_tts_mode';
+export const TTS_SERVER_CONFIG_CACHE_KEY = 'imcodes_tts_server_config';
 export const TTS_DEFAULT_RATE = 1.1;
 export const TTS_MIN_RATE = 0.5;
 export const TTS_MAX_RATE = 2.0;
@@ -63,6 +75,11 @@ let activeWebUtterance: SpeechSynthesisUtterance | null = null;
 let nativeTtsBoundPlugin: NativeSystemTts | null = null;
 let nativeTtsListenerHandle: { remove: () => Promise<void> } | null = null;
 let nativeStateWaiter: ((event: NativeTtsStateEvent) => void) | null = null;
+let cachedServerTtsConfig: TtsPublicConfig | null = null;
+let activeServerAbortController: AbortController | null = null;
+let activeAudioElement: HTMLAudioElement | null = null;
+let activeAudioObjectUrl: string | null = null;
+let activeAudioWaiter: ((result: { ok: boolean; error?: string }) => void) | null = null;
 const pendingQueue: QueuedTtsItem[] = [];
 
 export function getTtsQueueLength(): number {
@@ -155,6 +172,110 @@ export function setTtsSpeechRate(rate: number): void {
     globalThis.localStorage?.setItem(TTS_SPEECH_RATE_STORAGE_KEY, String(clamped));
   } catch { /* localStorage may be unavailable */ }
   notifyPreferences();
+}
+
+export function getTtsMode(): TtsEngineMode {
+  try {
+    const raw = globalThis.localStorage?.getItem(TTS_MODE_STORAGE_KEY);
+    return isTtsEngineMode(raw) ? raw : 'system';
+  } catch {
+    return 'system';
+  }
+}
+
+export function setTtsMode(mode: TtsEngineMode): void {
+  const next: TtsEngineMode = isTtsEngineMode(mode) ? mode : 'system';
+  try {
+    globalThis.localStorage?.setItem(TTS_MODE_STORAGE_KEY, next);
+  } catch { /* localStorage may be unavailable */ }
+  if (cachedServerTtsConfig) {
+    cachedServerTtsConfig = { ...cachedServerTtsConfig, mode: next };
+    try {
+      globalThis.localStorage?.setItem(TTS_SERVER_CONFIG_CACHE_KEY, JSON.stringify(cachedServerTtsConfig));
+    } catch { /* ignore */ }
+  }
+  notifyPreferences();
+}
+
+export function getCachedServerTtsConfig(): TtsPublicConfig | null {
+  if (cachedServerTtsConfig) return { ...cachedServerTtsConfig };
+  try {
+    const raw = globalThis.localStorage?.getItem(TTS_SERVER_CONFIG_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<TtsPublicConfig>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    cachedServerTtsConfig = {
+      mode: isTtsEngineMode(parsed.mode) ? parsed.mode : 'system',
+      baseUrl: typeof parsed.baseUrl === 'string' ? parsed.baseUrl : '',
+      hasApiKey: parsed.hasApiKey === true,
+      apiKeyMasked: typeof parsed.apiKeyMasked === 'string' ? parsed.apiKeyMasked : null,
+      model: typeof parsed.model === 'string' ? parsed.model : 'gpt-4o-mini-tts',
+      voice: typeof parsed.voice === 'string' ? parsed.voice : 'alloy',
+      responseFormat: typeof parsed.responseFormat === 'string' ? parsed.responseFormat : 'mp3',
+      serverDefaultConfigured: parsed.serverDefaultConfigured === true,
+    };
+    return { ...cachedServerTtsConfig };
+  } catch {
+    return null;
+  }
+}
+
+export function applyServerTtsConfig(config: TtsPublicConfig): void {
+  cachedServerTtsConfig = { ...config };
+  try {
+    globalThis.localStorage?.setItem(TTS_MODE_STORAGE_KEY, isTtsEngineMode(config.mode) ? config.mode : 'system');
+    globalThis.localStorage?.setItem(TTS_SERVER_CONFIG_CACHE_KEY, JSON.stringify(cachedServerTtsConfig));
+  } catch { /* localStorage may be unavailable */ }
+  notifyPreferences();
+}
+
+export function isServerTtsConfigured(config?: TtsPublicConfig | null): boolean {
+  const effective = config ?? getCachedServerTtsConfig();
+  return Boolean(effective && (effective.baseUrl.trim() || effective.serverDefaultConfigured));
+}
+
+function getOptionalModuleExport<T>(mod: unknown, name: string): T | null {
+  if (!mod || typeof mod !== 'object') return null;
+  if (!Object.prototype.hasOwnProperty.call(mod, name)) return null;
+  const val = (mod as Record<string, unknown>)[name];
+  return typeof val === 'function' ? (val as T) : null;
+}
+
+async function loadTtsApiExport<T>(name: string): Promise<T | null> {
+  try {
+    const mod = await import('./api.js');
+    return getOptionalModuleExport<T>(mod, name);
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchServerTtsConfig(): Promise<TtsPublicConfig | null> {
+  const fn = await loadTtsApiExport<() => Promise<TtsPublicConfig>>('getServerTtsConfig');
+  if (!fn) return null;
+  const config = await fn();
+  applyServerTtsConfig(config);
+  return config;
+}
+
+export async function saveServerTtsConfig(
+  body: TtsConfigUpdateBody,
+): Promise<{ ok: true; config: TtsPublicConfig } | null> {
+  const fn = await loadTtsApiExport<(input: TtsConfigUpdateBody) => Promise<{ ok: true; config: TtsPublicConfig }>>('updateServerTtsConfig');
+  if (!fn) return null;
+  const res = await fn(body);
+  if (res?.config) {
+    applyServerTtsConfig(res.config);
+  }
+  return res;
+}
+
+export async function syncTtsConfigFromServer(): Promise<TtsPublicConfig | null> {
+  try {
+    return await fetchServerTtsConfig();
+  } catch {
+    return null;
+  }
 }
 
 /** Normalize short UI/system locale tags to BCP-47 speech locale tags. */
@@ -443,6 +564,9 @@ function getWebSpeechSynthesis(): SpeechSynthesis | null {
 }
 
 export function isTtsSupported(): boolean {
+  if (getTtsMode() === 'server') {
+    return typeof Audio === 'function' || typeof HTMLAudioElement !== 'undefined';
+  }
   if (isNative() && getNativeSystemTts()) return true;
   return getWebSpeechSynthesis() !== null;
 }
@@ -686,15 +810,247 @@ async function runNativeSegments(
   return { started: true };
 }
 
+function revokeActiveAudioObjectUrl(): void {
+  if (activeAudioObjectUrl) {
+    try {
+      URL.revokeObjectURL(activeAudioObjectUrl);
+    } catch { /* ignore */ }
+    activeAudioObjectUrl = null;
+  }
+}
+
+function cleanupActiveServerPlayback(): void {
+  if (activeServerAbortController) {
+    try {
+      activeServerAbortController.abort();
+    } catch { /* ignore */ }
+    activeServerAbortController = null;
+  }
+  const waiter = activeAudioWaiter;
+  activeAudioWaiter = null;
+  if (activeAudioElement) {
+    activeAudioElement.onended = null;
+    activeAudioElement.onerror = null;
+    try {
+      activeAudioElement.pause?.();
+    } catch { /* ignore */ }
+    try {
+      activeAudioElement.src = '';
+    } catch { /* ignore */ }
+    activeAudioElement = null;
+  }
+  revokeActiveAudioObjectUrl();
+  if (waiter) {
+    waiter({ ok: false });
+  }
+}
+
+function extractServerTtsErrorMessage(err: unknown): string {
+  const raw = extractErrorMessage(err);
+  if (!raw) return 'Server TTS playback failed';
+  try {
+    const parsed = JSON.parse(raw) as { error?: unknown };
+    if (typeof parsed?.error === 'string' && parsed.error) return parsed.error;
+  } catch { /* raw may already be plain text */ }
+  const match = raw.match(/\{\s*"error"\s*:\s*"([^"]+)"/);
+  if (match?.[1]) return match[1];
+  return raw;
+}
+
+async function beginAudioBlobPlayback(
+  blob: Blob,
+  gen: number,
+  abortController: AbortController,
+): Promise<{ completion: Promise<{ ok: boolean; error?: string }> }> {
+  const objectUrl = URL.createObjectURL(blob);
+  let urlRevoked = false;
+  const revokeUrl = () => {
+    if (urlRevoked) return;
+    urlRevoked = true;
+    if (activeAudioObjectUrl === objectUrl) activeAudioObjectUrl = null;
+    try {
+      URL.revokeObjectURL(objectUrl);
+    } catch { /* ignore */ }
+  };
+
+  if (playbackGeneration !== gen || abortController.signal.aborted) {
+    revokeUrl();
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
+  activeAudioObjectUrl = objectUrl;
+  const audio = new Audio(objectUrl);
+  activeAudioElement = audio;
+
+  let settled = false;
+  let resolveCompletion!: (result: { ok: boolean; error?: string }) => void;
+  const completion = new Promise<{ ok: boolean; error?: string }>((resolve) => {
+    resolveCompletion = (result) => {
+      if (settled) return;
+      settled = true;
+      if (activeAudioWaiter === settleFromExternal) activeAudioWaiter = null;
+      audio.onended = null;
+      audio.onerror = null;
+      if (activeAudioElement === audio) activeAudioElement = null;
+      revokeUrl();
+      resolve(result);
+    };
+  });
+  const settleFromExternal = (result: { ok: boolean; error?: string }) => {
+    resolveCompletion(result);
+  };
+  activeAudioWaiter = settleFromExternal;
+
+  audio.onended = () => resolveCompletion({ ok: true });
+  audio.onerror = () => resolveCompletion({ ok: false, error: 'Server TTS audio playback failed' });
+
+  try {
+    await audio.play();
+  } catch (err) {
+    resolveCompletion({ ok: false, error: extractServerTtsErrorMessage(err) });
+    throw err;
+  }
+
+  if (playbackGeneration !== gen || abortController.signal.aborted) {
+    try { audio.pause?.(); } catch { /* ignore */ }
+    resolveCompletion({ ok: false });
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
+  return { completion };
+}
+
+async function speakWithServerTts(
+  segments: TtsSegment[],
+  rate: number,
+  gen: number,
+  messageId: string | null,
+): Promise<SpeakTextResult> {
+  if (typeof Audio !== 'function' && typeof HTMLAudioElement === 'undefined') {
+    setState({ status: 'idle', activeMessageId: null, error: null });
+    return { started: false, reason: 'unsupported' };
+  }
+  const synthesizeFn = await loadTtsApiExport<
+    (body: TtsSpeechRequestBody, opts?: { signal?: AbortSignal }) => Promise<Blob>
+  >('synthesizeServerTtsSpeech');
+  if (!synthesizeFn) {
+    setState({ status: 'idle', activeMessageId: null, error: null });
+    return { started: false, reason: 'unsupported' };
+  }
+
+  const abortController = new AbortController();
+  activeServerAbortController = abortController;
+  const speed = clampTtsServerSpeed(rate);
+
+  const fetchSegmentBlob = (seg: TtsSegment): Promise<Blob> => (
+    synthesizeFn({ input: seg.text, speed }, { signal: abortController.signal })
+  );
+
+  setState({ status: 'speaking', activeMessageId: messageId, error: null });
+
+  let firstBlob: Blob;
+  try {
+    firstBlob = await fetchSegmentBlob(segments[0]);
+  } catch (err) {
+    if (activeServerAbortController === abortController) activeServerAbortController = null;
+    if (playbackGeneration !== gen || abortController.signal.aborted) {
+      return { started: false, reason: 'superseded' };
+    }
+    pendingQueue.length = 0;
+    const message = extractServerTtsErrorMessage(err);
+    setState({ status: 'idle', activeMessageId: null, error: message });
+    return { started: false, reason: 'error', error: message };
+  }
+
+  if (playbackGeneration !== gen || abortController.signal.aborted) {
+    if (activeServerAbortController === abortController) activeServerAbortController = null;
+    return { started: false, reason: 'superseded' };
+  }
+
+  let firstPlayback: { completion: Promise<{ ok: boolean; error?: string }> };
+  try {
+    firstPlayback = await beginAudioBlobPlayback(firstBlob, gen, abortController);
+  } catch (err) {
+    if (activeServerAbortController === abortController) activeServerAbortController = null;
+    if (playbackGeneration !== gen || abortController.signal.aborted) {
+      return { started: false, reason: 'superseded' };
+    }
+    pendingQueue.length = 0;
+    const message = extractServerTtsErrorMessage(err);
+    setState({ status: 'idle', activeMessageId: null, error: message });
+    return { started: false, reason: 'error', error: message };
+  }
+
+  const startPrefetch = (index: number): Promise<Blob> | null => {
+    if (index >= segments.length || playbackGeneration !== gen || abortController.signal.aborted) {
+      return null;
+    }
+    const p = fetchSegmentBlob(segments[index]);
+    p.catch(() => { /* handled when awaited */ });
+    return p;
+  };
+
+  let nextPrefetch = startPrefetch(1);
+
+  void (async () => {
+    try {
+      let result = await firstPlayback.completion;
+      for (let i = 1; i < segments.length; i++) {
+        if (playbackGeneration !== gen || abortController.signal.aborted || !result.ok) break;
+        const blobPromise = nextPrefetch ?? fetchSegmentBlob(segments[i]);
+        nextPrefetch = startPrefetch(i + 1);
+        const blob = await blobPromise;
+        if (playbackGeneration !== gen || abortController.signal.aborted) break;
+        const segPlayback = await beginAudioBlobPlayback(blob, gen, abortController);
+        result = await segPlayback.completion;
+      }
+
+      if (activeServerAbortController === abortController) activeServerAbortController = null;
+      if (playbackGeneration === gen && !abortController.signal.aborted) {
+        if (!result.ok) {
+          pendingQueue.length = 0;
+          setState({
+            status: 'idle',
+            activeMessageId: null,
+            error: result.error ?? 'Server TTS playback failed',
+          });
+        } else if (pendingQueue.length > 0) {
+          const next = pendingQueue.shift()!;
+          void startQueuedPlayback(next);
+        } else {
+          setState({ status: 'idle', activeMessageId: null, error: null });
+        }
+      }
+    } catch (err) {
+      if (activeServerAbortController === abortController) activeServerAbortController = null;
+      if (playbackGeneration === gen && !abortController.signal.aborted) {
+        pendingQueue.length = 0;
+        setState({
+          status: 'idle',
+          activeMessageId: null,
+          error: extractServerTtsErrorMessage(err),
+        });
+      }
+    }
+  })();
+
+  return { started: true };
+}
+
 function startPlayback(
   segments: TtsSegment[],
   rate: number,
   messageId: string | null,
 ): Promise<SpeakTextResult> {
+  cleanupActiveServerPlayback();
   const gen = ++playbackGeneration;
   nativeStateWaiter = null;
   clearActiveWebUtterance();
   cancelWebSpeechSynthesis();
+
+  if (getTtsMode() === 'server') {
+    return speakWithServerTts(segments, rate, gen, messageId);
+  }
 
   const nativeTts = isNative() ? getNativeSystemTts() : null;
   if (nativeTts) {
@@ -749,10 +1105,11 @@ function clearActiveWebUtterance(): void {
   }
 }
 
-/** Stop any active Web or native system TTS playback and reset playback state. */
+/** Stop any active Web, native, or server TTS playback and reset playback state. */
 export async function stopSpeaking(): Promise<void> {
   pendingQueue.length = 0;
   playbackGeneration += 1;
+  cleanupActiveServerPlayback();
   clearActiveWebUtterance();
   const pendingWaiter = nativeStateWaiter;
   nativeStateWaiter = null;
@@ -772,7 +1129,9 @@ export async function stopSpeaking(): Promise<void> {
 export async function __resetTtsForTests(): Promise<void> {
   pendingQueue.length = 0;
   playbackGeneration += 1;
+  cleanupActiveServerPlayback();
   clearActiveWebUtterance();
+  cachedServerTtsConfig = null;
   nativeStateWaiter = null;
   if (nativeTtsListenerHandle) {
     try { await nativeTtsListenerHandle.remove(); } catch { /* ignore */ }
