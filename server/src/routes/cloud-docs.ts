@@ -29,7 +29,6 @@ import {
   createDbDocBuilderScriptStore,
   executeOnlyOfficeDocBuilder,
   verifyDocBuilderScriptToken,
-  type OnlyOfficeDocBuilderTemplate,
 } from '../services/onlyoffice-docbuilder.js';
 import {
   PayloadTooLargeError,
@@ -269,34 +268,16 @@ function validateTimeoutMs(
   return { ok: true, value: raw };
 }
 
-const ALLOWED_DOCBUILDER_TEMPLATES = new Set<OnlyOfficeDocBuilderTemplate>([
-  'create_document',
-  'append_text',
-  'replace_text',
-]);
-
 function validateDocBuilderScriptAndArgument(
   c: RouteContext,
   rawScript: unknown,
   rawArgument: unknown,
   rawTimeoutMs: unknown,
-  rawTemplate?: unknown,
-): { script?: string; template?: OnlyOfficeDocBuilderTemplate; argument?: Record<string, unknown>; timeoutMs?: number } | Response {
-  const hasScript = typeof rawScript === 'string' && rawScript.trim().length > 0;
-  const hasTemplate = rawTemplate !== undefined;
-  if (hasScript && hasTemplate) {
-    return c.json({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT, message: 'Cannot specify both script and template' }, 400);
-  }
-  let template: OnlyOfficeDocBuilderTemplate | undefined;
-  if (hasTemplate) {
-    if (typeof rawTemplate !== 'string' || !ALLOWED_DOCBUILDER_TEMPLATES.has(rawTemplate.trim() as OnlyOfficeDocBuilderTemplate)) {
-      return c.json({ error: CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT, message: 'Unsupported DocBuilder template' }, 400);
-    }
-    template = rawTemplate.trim() as OnlyOfficeDocBuilderTemplate;
-  } else if (!hasScript) {
+): { script: string; argument?: Record<string, unknown>; timeoutMs?: number } | Response {
+  if (typeof rawScript !== 'string' || !rawScript.trim()) {
     return c.json({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT }, 400);
   }
-  if (hasScript && Buffer.byteLength(rawScript as string, 'utf8') > CLOUD_DOC_DOCBUILDER_MAX_SCRIPT_BYTES) {
+  if (Buffer.byteLength(rawScript, 'utf8') > CLOUD_DOC_DOCBUILDER_MAX_SCRIPT_BYTES) {
     return c.json(
       { error: CLOUD_DOC_ERROR_CODES.SCRIPT_TOO_LARGE, maxBytes: CLOUD_DOC_DOCBUILDER_MAX_SCRIPT_BYTES },
       413,
@@ -323,12 +304,7 @@ function validateDocBuilderScriptAndArgument(
   if (!timeout.ok) {
     return c.json({ error: timeout.error }, 400);
   }
-  return {
-    ...(hasScript ? { script: rawScript as string } : {}),
-    ...(template ? { template } : {}),
-    argument,
-    timeoutMs: timeout.value,
-  };
+  return { script: rawScript, argument, timeoutMs: timeout.value };
 }
 
 async function resolveTargetFolderOwner(
@@ -874,7 +850,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       content?: unknown;
       engine?: unknown;
       docbuilderScript?: unknown;
-      docbuilderTemplate?: unknown;
       argument?: unknown;
       timeoutMs?: unknown;
     };
@@ -893,16 +868,14 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
 
     const useDocBuilder =
       body.engine === 'docbuilder' ||
-      body.docbuilderTemplate !== undefined ||
       (typeof body.docbuilderScript === 'string' && body.docbuilderScript.trim().length > 0);
-    let validatedBuilder: { script?: string; template?: OnlyOfficeDocBuilderTemplate; argument?: Record<string, unknown>; timeoutMs?: number } | null = null;
+    let validatedBuilder: { script: string; argument?: Record<string, unknown>; timeoutMs?: number } | null = null;
     if (useDocBuilder) {
       const checked = validateDocBuilderScriptAndArgument(
         c,
         body.docbuilderScript,
         body.argument,
         body.timeoutMs,
-        body.docbuilderTemplate,
       );
       if (checked instanceof Response) return checked;
       validatedBuilder = checked;
@@ -930,7 +903,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
           env: c.env,
           db: c.env.DB,
           script: validatedBuilder.script,
-          template: validatedBuilder.template,
           argument: mergedArg,
           requiredExt: meta.ext,
           timeoutMs: validatedBuilder.timeoutMs,
@@ -974,7 +946,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
 
     let body: {
       script?: unknown;
-      template?: unknown;
       type?: unknown;
       name?: unknown;
       folderId?: unknown;
@@ -993,7 +964,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       body.script,
       body.argument,
       body.timeoutMs,
-      body.template,
     );
     if (validated instanceof Response) return validated;
 
@@ -1052,7 +1022,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         env: c.env,
         db: c.env.DB,
         script: validated.script,
-        template: validated.template,
         argument: validated.argument,
         outputName,
         requiredExt,
@@ -1771,7 +1740,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       folderId?: unknown;
       engine?: unknown;
       docbuilderScript?: unknown;
-      docbuilderTemplate?: unknown;
       argument?: unknown;
       timeoutMs?: unknown;
     };
@@ -1783,16 +1751,14 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
 
     const useDocBuilder =
       body.engine === 'docbuilder' ||
-      body.docbuilderTemplate !== undefined ||
       (typeof body.docbuilderScript === 'string' && body.docbuilderScript.trim().length > 0);
-    let validatedBuilder: { script?: string; template?: OnlyOfficeDocBuilderTemplate; argument?: Record<string, unknown>; timeoutMs?: number } | null = null;
+    let validatedBuilder: { script: string; argument?: Record<string, unknown>; timeoutMs?: number } | null = null;
     if (useDocBuilder) {
       const checked = validateDocBuilderScriptAndArgument(
         c,
         body.docbuilderScript,
         body.argument,
         body.timeoutMs,
-        body.docbuilderTemplate,
       );
       if (checked instanceof Response) return checked;
       validatedBuilder = checked;
@@ -1882,7 +1848,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
             env: c.env,
             db: c.env.DB,
             script: validatedBuilder.script,
-            template: validatedBuilder.template,
             argument: effectiveArgument,
             requiredExt: targetExt,
             timeoutMs: validatedBuilder.timeoutMs,
@@ -1961,7 +1926,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
 
     let body: {
       script?: unknown;
-      template?: unknown;
       argument?: unknown;
       outputType?: unknown;
       outputName?: unknown;
@@ -1982,7 +1946,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       body.script,
       body.argument,
       body.timeoutMs,
-      body.template,
     );
     if (validated instanceof Response) return validated;
 
@@ -2107,7 +2070,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
           env: c.env,
           db: c.env.DB,
           script: validated.script,
-          template: validated.template,
           argument: effectiveArgument,
           outputName,
           requiredExt: persistedExt,

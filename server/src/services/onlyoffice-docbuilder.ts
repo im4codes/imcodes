@@ -371,22 +371,17 @@ async function downloadOnlyOfficeArtifact(
   }
 }
 
-export type OnlyOfficeDocBuilderTemplate = 'create_document' | 'append_text' | 'replace_text';
-
 export interface ExecuteDocBuilderOptions {
   env: Pick<
     Env,
     | 'ONLYOFFICE_ENABLED'
     | 'ONLYOFFICE_INTERNAL_URL'
     | 'ONLYOFFICE_PUBLIC_URL'
-    | 'ONLYOFFICE_DOCBUILDER_ISOLATED_URL'
-    | 'ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED'
     | 'ONLYOFFICE_JWT_SECRET'
     | 'SERVER_URL'
     | 'JWT_SIGNING_KEY'
   >;
-  script?: string;
-  template?: OnlyOfficeDocBuilderTemplate;
+  script: string;
   argument?: Record<string, unknown>;
   outputName?: string;
   requiredExt?: string;
@@ -727,7 +722,6 @@ function stepJsLexicalToken(
   start: number,
   state: JsLexState,
   inputUrl: string | undefined,
-  onTemplateExpr?: (exprStart: number, exprEnd: number) => void,
 ): JsLexToken {
   const ch = src[start]!;
 
@@ -760,7 +754,7 @@ function stepJsLexicalToken(
     state.afterDot = false;
     state.pendingControlParen = false;
     state.nextBraceIsObject = false;
-    return { ...scanTemplateLiteral(src, start, inputUrl, onTemplateExpr), punct: false };
+    return { ...scanTemplateLiteral(src, start, inputUrl), punct: false };
   }
 
   if (ch === '/' && state.canStartRegex) {
@@ -901,7 +895,6 @@ function scanTemplateExpression(
   src: string,
   start: number,
   inputUrl: string | undefined,
-  onTemplateExpr?: (exprStart: number, exprEnd: number) => void,
 ): { text: string; nextIndex: number } {
   const state = createLexState(true);
   let i = start;
@@ -909,7 +902,7 @@ function scanTemplateExpression(
   let out = '';
 
   while (i < src.length) {
-    const token = stepJsLexicalToken(src, i, state, inputUrl, onTemplateExpr);
+    const token = stepJsLexicalToken(src, i, state, inputUrl);
     out += token.text;
     i = token.nextIndex;
     if (token.punct) {
@@ -918,14 +911,12 @@ function scanTemplateExpression(
       } else if (token.text === '}') {
         depth -= 1;
         if (depth === 0) {
-          onTemplateExpr?.(start, i - 1);
           return { text: out, nextIndex: i };
         }
       }
     }
   }
 
-  onTemplateExpr?.(start, i);
   return { text: out, nextIndex: i };
 }
 
@@ -933,7 +924,6 @@ function scanTemplateLiteral(
   src: string,
   start: number,
   inputUrl: string | undefined,
-  onTemplateExpr?: (exprStart: number, exprEnd: number) => void,
 ): { text: string; nextIndex: number } {
   const replacement = inputUrl !== undefined ? escapeJsStringBody(inputUrl, '`') : null;
   let i = start + 1;
@@ -957,7 +947,7 @@ function scanTemplateLiteral(
     }
     if (src.startsWith('${', i)) {
       out += '${';
-      const expr = scanTemplateExpression(src, i + 2, inputUrl, onTemplateExpr);
+      const expr = scanTemplateExpression(src, i + 2, inputUrl);
       out += expr.text;
       i = expr.nextIndex;
       continue;
@@ -1012,421 +1002,19 @@ function replaceInputUrlInLiterals(src: string, inputUrl: string | undefined): s
   return out;
 }
 
-function splitTopLevelJsArgs(rawArgs: string): string[] {
-  if (!rawArgs.trim()) return [];
-  const state = createLexState(true);
-  const args: string[] = [];
-  let i = 0;
-  let argStart = 0;
-  let parenDepth = 0;
-  let bracketDepth = 0;
-  let braceDepth = 0;
-
-  while (i < rawArgs.length) {
-    const token = stepJsLexicalToken(rawArgs, i, state, undefined);
-    const t = token.text;
-    if (t === '(') parenDepth += 1;
-    else if (t === ')') parenDepth = Math.max(0, parenDepth - 1);
-    else if (t === '[') bracketDepth += 1;
-    else if (t === ']') bracketDepth = Math.max(0, bracketDepth - 1);
-    else if (t === '{') braceDepth += 1;
-    else if (t === '}') braceDepth = Math.max(0, braceDepth - 1);
-    else if (t === ',' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
-      args.push(rawArgs.slice(argStart, i).trim());
-      argStart = token.nextIndex;
-    }
-    i = token.nextIndex;
-  }
-  const tail = rawArgs.slice(argStart).trim();
-  if (tail || args.length > 0) {
-    args.push(tail);
-  }
-  return args;
-}
-
-function decodeSimpleLiteralString(tokenText: string): string | null {
-  if (tokenText.length < 2) return null;
-  const quote = tokenText[0];
-  if (quote !== '"' && quote !== "'" && quote !== '`') return null;
-  if (tokenText[tokenText.length - 1] !== quote) return null;
-  if (quote === '`' && tokenText.includes('${')) return null;
-  if (tokenText.includes('\\')) return null;
-  return tokenText.slice(1, -1);
-}
-
-function assertAllowedOpenFileCall(
-  methodName: string,
-  rawArgs: string,
-  inputUrl: string | undefined,
-): void {
-  const args = splitTopLevelJsArgs(rawArgs);
-  if (methodName === 'OpenTmpFile') {
-    if (args.length === 0) return;
-    throw new OnlyOfficeServiceError(
-      CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-      'DocBuilder OpenTmpFile with arbitrary path/URL is not permitted',
-      400,
-    );
-  }
-
-  if (args.length === 0) return;
-  const firstArg = args[0] ?? '';
-  const isAllowedPlaceholder =
-    INPUT_URL_ARG_RE.test(firstArg) ||
-    firstArg === '"{{INPUT_URL}}"' ||
-    firstArg === "'{{INPUT_URL}}'" ||
-    firstArg === '`{{INPUT_URL}}`' ||
-    (inputUrl !== undefined && firstArg === JSON.stringify(inputUrl));
-
-  if (!isAllowedPlaceholder || inputUrl === undefined) {
-    throw new OnlyOfficeServiceError(
-      CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-      'DocBuilder OpenFile only permits server-controlled inputUrl',
-      400,
-    );
-  }
-}
-
-const FORBIDDEN_DOCBUILDER_IDENTIFIERS = new Set([
-  'builderJS',
-  'eval',
-  'Function',
-  'AsyncFunction',
-  'GeneratorFunction',
-  'AsyncGeneratorFunction',
-  'globalThis',
-  'window',
-  'self',
-  'global',
-  'frames',
-  'parent',
-  'top',
-  'process',
-  'require',
-  'module',
-  'exports',
-  'Buffer',
-  'Deno',
-  'Bun',
-  'fetch',
-  'XMLHttpRequest',
-  'WebSocket',
-  'EventSource',
-  'ActiveXObject',
-  'WScript',
-  'importScripts',
-  'Worker',
-  'SharedWorker',
-  'ServiceWorker',
-  'WebAssembly',
-  'Proxy',
-  'Reflect',
-  'with',
-  'this',
-  '__proto__',
-  'constructor',
-  'prototype',
-  'getOwnPropertyDescriptor',
-  'getOwnPropertyDescriptors',
-  'getPrototypeOf',
-  'setPrototypeOf',
-  'defineProperty',
-  'defineProperties',
-  '__lookupGetter__',
-  '__defineGetter__',
-  'setTimeout',
-  'setInterval',
-  'setImmediate',
-  'import',
-]);
-
-const FORBIDDEN_RESOURCE_METHODS = new Set([
-  'OpenTmpFile',
-  'SaveTmpFile',
-  'SetTmpFolder',
-  'LoadFile',
-  'LoadFromFile',
-  'SaveToFile',
-  'CreateImage',
-  'AddImage',
-  'InsertImage',
-  'SetImage',
-  'AddOleObject',
-  'Download',
-  'ImportFile',
-]);
-
-const ALLOWED_GLOBAL_BUILDER_METHODS = new Set([
-  'CreateFile',
-  'OpenFile',
-  'SaveFile',
-  'CloseFile',
-  'OpenFileAsync',
-]);
-
-export function compileOnlyOfficeDocBuilderTemplate(
-  template: OnlyOfficeDocBuilderTemplate,
-  options: {
-    inputUrl?: string;
-    argument?: Record<string, unknown>;
-    outputType?: string;
-    outputName?: string;
-  } = {},
-): string {
-  const rawType = typeof options.argument?.type === 'string'
-    ? options.argument.type
-    : options.outputType;
-  const normalizedType = (rawType || 'docx').trim().replace(/^\./, '').toLowerCase();
-  const safeFormat = ['docx', 'xlsx', 'pptx', 'pdf'].includes(normalizedType) ? normalizedType : 'docx';
-  const rawOutputName = typeof options.outputName === 'string' && options.outputName.trim()
-    ? options.outputName.trim()
-    : `generated.${safeFormat}`;
-  if (rawOutputName.includes('/') || rawOutputName.includes('\\') || rawOutputName.includes('..')) {
-    throw new OnlyOfficeServiceError(
-      CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT,
-      'Invalid DocBuilder template outputName',
-      400,
-    );
-  }
-
-  switch (template) {
-    case 'create_document': {
-      return [
-        `builder.CreateFile(${JSON.stringify(safeFormat)});`,
-        'var oDoc = Api.GetDocument();',
-        'if (Argument && typeof Argument.title === "string" && Argument.title.length > 0) {',
-        '  var oTitlePara = oDoc.GetElement(0);',
-        '  if (oTitlePara && oTitlePara.AddText) { oTitlePara.AddText(Argument.title); }',
-        '}',
-        'var lines = Array.isArray(Argument && Argument.paragraphs) ? Argument.paragraphs : (Argument && typeof Argument.text === "string" ? [Argument.text] : (Argument && typeof Argument.content === "string" ? [Argument.content] : []));',
-        'for (var i = 0; i < lines.length; i += 1) {',
-        '  if (typeof lines[i] === "string") {',
-        '    var oPara = Api.CreateParagraph();',
-        '    oPara.AddText(lines[i]);',
-        '    oDoc.Push(oPara);',
-        '  }',
-        '}',
-        `builder.SaveFile(${JSON.stringify(safeFormat)}, ${JSON.stringify(rawOutputName)});`,
-        'builder.CloseFile();',
-      ].join('\n');
-    }
-    case 'append_text': {
-      if (!options.inputUrl) {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT,
-          'append_text template requires a target document',
-          400,
-        );
-      }
-      return [
-        `builder.OpenFile(${JSON.stringify(options.inputUrl)});`,
-        'var oDoc = Api.GetDocument();',
-        'var lines = Array.isArray(Argument && Argument.paragraphs) ? Argument.paragraphs : (Argument && typeof Argument.text === "string" ? [Argument.text] : (Argument && typeof Argument.content === "string" ? [Argument.content] : []));',
-        'for (var i = 0; i < lines.length; i += 1) {',
-        '  if (typeof lines[i] === "string") {',
-        '    var oPara = Api.CreateParagraph();',
-        '    oPara.AddText(lines[i]);',
-        '    oDoc.Push(oPara);',
-        '  }',
-        '}',
-        `builder.SaveFile(${JSON.stringify(safeFormat)}, ${JSON.stringify(rawOutputName)});`,
-        'builder.CloseFile();',
-      ].join('\n');
-    }
-    case 'replace_text': {
-      if (!options.inputUrl) {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT,
-          'replace_text template requires a target document',
-          400,
-        );
-      }
-      return [
-        `builder.OpenFile(${JSON.stringify(options.inputUrl)});`,
-        'var oDoc = Api.GetDocument();',
-        'if (Argument && typeof Argument.search === "string" && Argument.search.length > 0 && typeof Argument.replace === "string") {',
-        '  oDoc.SearchAndReplace({ searchString: Argument.search, replaceString: Argument.replace, matchCase: Boolean(Argument.matchCase) });',
-        '}',
-        `builder.SaveFile(${JSON.stringify(safeFormat)}, ${JSON.stringify(rawOutputName)});`,
-        'builder.CloseFile();',
-      ].join('\n');
-    }
-    default: {
-      throw new OnlyOfficeServiceError(
-        CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT,
-        'Unsupported DocBuilder template',
-        400,
-      );
-    }
-  }
-}
-
-function validateDocBuilderScriptSafety(src: string, inputUrl: string | undefined): void {
-  const state = createLexState(false);
-  const templateSpans: Array<{ start: number; end: number }> = [];
-  const tokens: Array<{
-    kind: 'ident' | 'string' | 'template' | 'other';
-    text: string;
-    start: number;
-  }> = [];
-
-  let i = 0;
-  while (i < src.length) {
-    const ch = src[i]!;
-    const token = stepJsLexicalToken(src, i, state, undefined, (exprStart, exprEnd) => {
-      templateSpans.push({ start: exprStart, end: exprEnd });
-    });
-
-    const isTrivia =
-      isWhitespace(ch) ||
-      (ch === '/' && (src[i + 1] === '/' || src[i + 1] === '*'));
-    if (!isTrivia) {
-      let kind: 'ident' | 'string' | 'template' | 'other' = 'other';
-      if (ch === '"' || ch === "'") kind = 'string';
-      else if (ch === '`') kind = 'template';
-      else if (isIdentifierStart(ch)) kind = 'ident';
-      else if (ch === '\\' && token.text.includes('\\u')) {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          'Unicode escape sequences outside literals are not permitted in DocBuilder scripts',
-          400,
-        );
-      }
-      if (kind === 'ident' && token.text.includes('\\u')) {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          'Unicode escape sequences in identifiers are not permitted in DocBuilder scripts',
-          400,
-        );
-      }
-      tokens.push({ kind, text: token.text, start: i });
-    }
-    i = token.nextIndex;
-  }
-
-  for (let idx = 0; idx < tokens.length; idx += 1) {
-    const tok = tokens[idx]!;
-    const prev = idx > 0 ? tokens[idx - 1] : undefined;
-    const next = idx + 1 < tokens.length ? tokens[idx + 1] : undefined;
-    const next2 = idx + 2 < tokens.length ? tokens[idx + 2] : undefined;
-    const next3 = idx + 3 < tokens.length ? tokens[idx + 3] : undefined;
-
-    if (tok.kind === 'ident') {
-      if (FORBIDDEN_DOCBUILDER_IDENTIFIERS.has(tok.text)) {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          `Identifier "${tok.text}" is not permitted in DocBuilder scripts`,
-          400,
-        );
-      }
-      if (FORBIDDEN_RESOURCE_METHODS.has(tok.text)) {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          `Method or reference "${tok.text}" is not permitted in DocBuilder scripts`,
-          400,
-        );
-      }
-    }
-
-    if (
-      tok.kind === 'ident' &&
-      tok.text === 'builder' &&
-      prev?.text !== '.' &&
-      prev?.text !== '?.'
-    ) {
-      if (next?.text === '[') {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          'Bracket property access on builder is not permitted',
-          400,
-        );
-      }
-      if (
-        (next?.text !== '.' && next?.text !== '?.') ||
-        next2?.kind !== 'ident' ||
-        !ALLOWED_GLOBAL_BUILDER_METHODS.has(next2.text) ||
-        next3?.text !== '('
-      ) {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          'Direct aliasing or unsupported property access on builder is not permitted',
-          400,
-        );
-      }
-    }
-
-    if (
-      tok.kind === 'ident' &&
-      tok.text === 'Api' &&
-      prev?.text !== '.' &&
-      prev?.text !== '?.' &&
-      next?.text === '['
-    ) {
-      throw new OnlyOfficeServiceError(
-        CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-        'Bracket property access on Api is not permitted',
-        400,
-      );
-    }
-
-    if ((tok.kind === 'string' || tok.kind === 'template') && prev?.text === '[') {
-      const propName = decodeSimpleLiteralString(tok.text);
-      if (
-        propName &&
-        (propName === 'OpenFile' ||
-          propName === 'OpenFileAsync' ||
-          FORBIDDEN_RESOURCE_METHODS.has(propName) ||
-          FORBIDDEN_DOCBUILDER_IDENTIFIERS.has(propName))
-      ) {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          `Bracket access to ${propName} is not permitted`,
-          400,
-        );
-      }
-    }
-
-    if (tok.kind === 'ident' && (tok.text === 'OpenFile' || tok.text === 'OpenTmpFile' || tok.text === 'OpenFileAsync')) {
-      if ((prev?.text !== '.' && prev?.text !== '?.') || next?.text !== '(') {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          `Direct reference to ${tok.text} is not permitted`,
-          400,
-        );
-      }
-      const closeParenIdx = findMatchingParen(src, next.start);
-      if (closeParenIdx === -1) {
-        throw new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          `Unterminated ${tok.text} call`,
-          400,
-        );
-      }
-      const rawArgs = src.slice(next.start + 1, closeParenIdx);
-      assertAllowedOpenFileCall(tok.text, rawArgs, inputUrl);
-    }
-  }
-
-  for (const span of templateSpans) {
-    validateDocBuilderScriptSafety(src.slice(span.start, span.end), inputUrl);
-  }
-}
-
 /**
  * Prepare a DocBuilder JS script for ONLYOFFICE's outer C++ `.docbuilder` line parser:
- * 1. Validate that `OpenFile`/`OpenTmpFile` calls only reference server-managed `inputUrl`.
- * 2. Substitute `{{INPUT_URL}}` inside string/template literals without touching comments or regexes.
- * 3. Rewrite `builder.OpenFile(Argument.inputUrl|_imcodesInputUrl|Argument['inputUrl']|Argument["inputUrl"])`
+ * 1. Substitute `{{INPUT_URL}}` inside string/template literals without touching comments or regexes.
+ * 2. Rewrite `builder.OpenFile(Argument.inputUrl|_imcodesInputUrl|Argument['inputUrl']|Argument["inputUrl"])`
  *    into a string literal `builder.OpenFile("<url>")`.
- * 4. Ensure every `builder.(CreateFile|OpenFile|SaveFile|CloseFile)(...)` call stands on its own line.
+ * 3. Ensure every `builder.(CreateFile|OpenFile|SaveFile|CloseFile)(...)` call stands on its own line.
  */
 export function prepareOnlyOfficeDocBuilderScript(
   script: string,
   options: PrepareOnlyOfficeDocBuilderScriptOptions = {},
 ): string {
   const inputUrl = options.inputUrl;
-  validateDocBuilderScriptSafety(script, inputUrl);
-  const builderCallRe = /builder\s*\.\s*(CreateFile|OpenFile|SaveFile|CloseFile)\s*\(/y;
+  const builderCallRe = /builder\s*\.\s*(CreateFile|OpenFile|OpenTmpFile|SaveFile|CloseFile)\s*\(/y;
   const state = createLexState(false);
   let i = 0;
   let out = '';
@@ -1456,11 +1044,35 @@ export function prepareOnlyOfficeDocBuilderScript(
           }
 
           const rawArgs = script.slice(openParenIdx + 1, closeParenIdx);
+          const trimmedArgs = rawArgs.trim();
+          if (method === 'OpenTmpFile' && trimmedArgs.length > 0) {
+            throw new OnlyOfficeServiceError(
+              CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+              'DocBuilder OpenTmpFile with arbitrary path/URL is not permitted',
+              400,
+            );
+          }
+          if (method === 'OpenFile' && trimmedArgs.length > 0) {
+            const firstArg = trimmedArgs.split(',')[0]?.trim() ?? '';
+            const allowedPlaceholder =
+              INPUT_URL_ARG_RE.test(firstArg) ||
+              firstArg === '"{{INPUT_URL}}"' ||
+              firstArg === "'{{INPUT_URL}}'" ||
+              firstArg === '`{{INPUT_URL}}`' ||
+              (inputUrl !== undefined && firstArg === JSON.stringify(inputUrl));
+            if (!allowedPlaceholder || inputUrl === undefined) {
+              throw new OnlyOfficeServiceError(
+                CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+                'DocBuilder OpenFile only permits server-controlled inputUrl',
+                400,
+              );
+            }
+          }
           let callText: string;
           if (
             method === 'OpenFile' &&
             inputUrl !== undefined &&
-            INPUT_URL_ARG_RE.test(rawArgs.trim())
+            INPUT_URL_ARG_RE.test(trimmedArgs)
           ) {
             callText = `builder.OpenFile(${JSON.stringify(inputUrl)})${hasSemicolon ? ';' : ''}`;
           } else {
@@ -1519,18 +1131,7 @@ export async function executeOnlyOfficeDocBuilder(
     );
   }
 
-  const isTrustedTemplate = options.template !== undefined && !options.script?.trim();
-  const isolatedUrl = options.env.ONLYOFFICE_DOCBUILDER_ISOLATED_URL?.trim().replace(/\/+$/, '');
-  if (!isTrustedTemplate && !isolatedUrl && options.env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED === 'true') {
-    throw new OnlyOfficeServiceError(
-      CLOUD_DOC_ERROR_CODES.ONLYOFFICE_DISABLED,
-      'Generic DocBuilder scripts require an isolated executor (ONLYOFFICE_DOCBUILDER_ISOLATED_URL) when ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED=true',
-      503,
-    );
-  }
-
   const internalUrl = resolveOnlyOfficeInternalBaseUrl(options.env);
-  const runnerBaseUrl = !isTrustedTemplate && isolatedUrl ? isolatedUrl : internalUrl;
   const serverBaseUrl = (options.env.SERVER_URL || 'http://localhost:19138').replace(/\/+$/, '');
   const ooSecret = resolveOnlyOfficeJwtSecret(options.env);
   const scriptStore =
@@ -1544,24 +1145,7 @@ export async function executeOnlyOfficeDocBuilder(
       : typeof options.argument?._imcodesInputUrl === 'string'
         ? options.argument._imcodesInputUrl
         : undefined;
-  let preparedScript: string;
-  if (isTrustedTemplate) {
-    preparedScript = compileOnlyOfficeDocBuilderTemplate(options.template!, {
-      inputUrl,
-      argument: options.argument,
-      outputType: options.requiredExt,
-      outputName: options.outputName,
-    });
-  } else {
-    if (typeof options.script !== 'string' || !options.script.trim()) {
-      throw new OnlyOfficeServiceError(
-        CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-        'DocBuilder script or template is required',
-        400,
-      );
-    }
-    preparedScript = prepareOnlyOfficeDocBuilderScript(options.script, { inputUrl });
-  }
+  const preparedScript = prepareOnlyOfficeDocBuilderScript(options.script, { inputUrl });
   const scriptId = await scriptStore.put(preparedScript, scriptTtlMs);
   const scriptToken = signDocBuilderScriptToken(
     scriptId,
@@ -1583,7 +1167,7 @@ export async function executeOnlyOfficeDocBuilder(
 
     const { headerToken, bodyToken } = signOnlyOfficeServiceJwt(initialPayload, ooSecret);
     let responseData = await fetchJsonWithTimeout<DocBuilderHttpResponse>(
-      `${runnerBaseUrl}/docbuilder`,
+      `${internalUrl}/docbuilder`,
       {
         method: 'POST',
         headers: {
@@ -1642,7 +1226,7 @@ export async function executeOnlyOfficeDocBuilder(
       };
       const pollJwt = signOnlyOfficeServiceJwt(pollPayload, ooSecret);
       responseData = await fetchJsonWithTimeout<DocBuilderHttpResponse>(
-        `${runnerBaseUrl}/docbuilder`,
+        `${internalUrl}/docbuilder`,
         {
           method: 'POST',
           headers: {
@@ -1698,10 +1282,7 @@ export async function executeOnlyOfficeDocBuilder(
 
     const bytes = await downloadOnlyOfficeArtifact(
       selected.url,
-      {
-        ...options.env,
-        ONLYOFFICE_INTERNAL_URL: runnerBaseUrl,
-      },
+      options.env,
       remaining,
       CLOUD_DOC_ERROR_CODES.DOCBUILDER_FAILED,
     );

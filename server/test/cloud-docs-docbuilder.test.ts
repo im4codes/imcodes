@@ -9,7 +9,6 @@ import type { Env } from '../src/env.js';
 import { sha256Hex, signJwt, verifyJwt } from '../src/security/crypto.js';
 import { LocalCloudDocStorage } from '../src/storage/cloud-doc-storage.js';
 import {
-  OnlyOfficeServiceError,
   clearEphemeralDocBuilderScriptsForTests,
   createDbDocBuilderScriptStore,
   prepareOnlyOfficeDocBuilderScript,
@@ -406,7 +405,6 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       SERVER_URL: appBaseUrl,
       ONLYOFFICE_ENABLED: 'true',
       ONLYOFFICE_INTERNAL_URL: ooBaseUrl,
-      ONLYOFFICE_DOCBUILDER_ISOLATED_URL: ooBaseUrl,
       ONLYOFFICE_PUBLIC_URL: 'https://public.example.com/onlyoffice',
       ONLYOFFICE_JWT_SECRET: OO_SECRET,
       DB: memDb.db,
@@ -1244,146 +1242,5 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       'builder.SaveFile("docx", "edited2.docx");',
       'builder.CloseFile();',
     ].join('\n'));
-  });
-
-  it('rejects arbitrary OpenFile/OpenTmpFile SSRF & bypasses while rejecting client-smuggled argument.inputUrl', async () => {
-    const sampleUrl = 'https://docs.example.test/file?tok=abc';
-    const ssrfPayloads = [
-      'builder.OpenFile("http://169.254.169.254/latest/meta-data/");',
-      'builder.OpenFile("/etc/passwd");',
-      'builder.OpenFile("file:///etc/passwd");',
-      'builder.OpenTmpFile("/etc/passwd");',
-      'builder["OpenFile"]("http://127.0.0.1:8080/admin");',
-      "builder['OpenTmpFile']('http://127.0.0.1:8080/');",
-      'builder["Open" + "File"]("http://127.0.0.1:8080/");',
-      'const m = "OpenFile"; builder[m]("http://127.0.0.1:8080/");',
-      'const b = builder; b["OpenFile"]("http://127.0.0.1:8080/");',
-      'builder /*comment*/ . /*c*/ OpenFile("http://127.0.0.1:8080/");',
-      'var s = `${builder.OpenFile("http://127.0.0.1:8080/")}`;',
-      'builder.OpenFile("{{INPUT_URL}}" + "/extra");',
-    ];
-
-    for (const bad of ssrfPayloads) {
-      expect(() => prepareOnlyOfficeDocBuilderScript(bad, { inputUrl: sampleUrl })).toThrowError(OnlyOfficeServiceError);
-    }
-
-    // Zero-arg OpenFile() and CreateFile() are still accepted cleanly
-    expect(prepareOnlyOfficeDocBuilderScript('builder.OpenFile(); builder.CreateFile("docx");')).toBe(
-      'builder.OpenFile();\nbuilder.CreateFile("docx");',
-    );
-
-    // HTTP POST /api/cloud-docs/docbuilder blocks arbitrary OpenFile and strips smuggled argument.inputUrl
-    const createSsrfRes = await app.request('/api/cloud-docs/docbuilder', {
-      method: 'POST',
-      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'docx',
-        name: 'Evil',
-        script: 'builder.OpenFile("http://169.254.169.254/latest/meta-data/"); builder.SaveFile("docx", "out.docx");',
-      }),
-    });
-    expect(createSsrfRes.status).toBe(400);
-    expect(await createSsrfRes.json()).toMatchObject({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT });
-
-    const smuggledArgRes = await app.request('/api/cloud-docs/docbuilder', {
-      method: 'POST',
-      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'docx',
-        name: 'EvilSmuggle',
-        script: 'builder.OpenFile(Argument.inputUrl); builder.SaveFile("docx", "out.docx");',
-        argument: { inputUrl: 'http://169.254.169.254/latest/meta-data/' },
-      }),
-    });
-    expect(smuggledArgRes.status).toBe(400);
-    expect(await smuggledArgRes.json()).toMatchObject({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT });
-
-    // Supports trusted data-only template create + edit and rejects builderJS/tmp/dynamic obfuscation via HTTP routes
-    const tplCreateRes = await app.request('/api/cloud-docs/docbuilder', {
-      method: 'POST',
-      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'docx',
-        name: 'TemplateDoc.docx',
-        template: 'create_document',
-        argument: { title: 'Quarterly Brief', text: 'Safe body' },
-      }),
-    });
-    expect(tplCreateRes.status).toBe(201);
-    expect(lastScriptDownloaded).toContain('builder.CreateFile("docx");');
-
-    const tplDoc = ((await tplCreateRes.json()) as { doc: { id: string } }).doc;
-    const tplEditRes = await app.request(`/api/cloud-docs/${tplDoc.id}/docbuilder`, {
-      method: 'POST',
-      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        template: 'append_text',
-        argument: { text: 'Appended line', inputUrl: 'http://169.254.169.254/ignored' },
-      }),
-    });
-    expect(tplEditRes.status).toBe(200);
-    expect(lastScriptDownloaded).not.toContain('169.254.169.254');
-
-    const prevDownloaded = lastScriptDownloaded;
-    for (const bypassScript of [
-      'builderJS.OpenFile("http://169.254.169.254/");',
-      'builder.SaveTmpFile("docx", "/tmp/evil.docx");',
-      'Api.CreateImage("http://127.0.0.1:9000/ssrf.png");',
-      'builder.Op\\u0065nFile("http://127.0.0.1/");',
-      '(0, eval)("builder.CreateFile(\\"docx\\")");',
-    ]) {
-      const badRouteRes = await app.request(`/api/cloud-docs/${tplDoc.id}/docbuilder`, {
-        method: 'POST',
-        headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ script: bypassScript }),
-      });
-      expect(badRouteRes.status).toBe(400);
-      expect(await badRouteRes.json()).toMatchObject({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT });
-      expect(lastScriptDownloaded).toBe(prevDownloaded);
-    }
-
-    // Default deployment WITHOUT ONLYOFFICE_DOCBUILDER_ISOLATED_URL:
-    // validated raw script continues working on shared ONLYOFFICE_INTERNAL_URL (unsafe scripts still rejected with 400),
-    // and opt-in ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED='true' rejects raw scripts with 503 while trusted templates still work.
-    delete env.ONLYOFFICE_DOCBUILDER_ISOLATED_URL;
-    const defaultRawOk = await app.request('/api/cloud-docs/docbuilder', {
-      method: 'POST',
-      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'docx',
-        name: 'AllowedRawDefault.docx',
-        script: 'builder.CreateFile("docx"); builder.SaveFile("docx", "AllowedRawDefault.docx"); builder.CloseFile();',
-      }),
-    });
-    expect(defaultRawOk.status).toBe(201);
-
-    env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED = 'true';
-    const beforeScriptsCount = memDb.scripts.size;
-    const prevDownloadedBeforeStrict = lastScriptDownloaded;
-    const defaultRawCreate = await app.request('/api/cloud-docs/docbuilder', {
-      method: 'POST',
-      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'docx',
-        name: 'BlockedRaw.docx',
-        script: 'builder.CreateFile("docx");',
-      }),
-    });
-    expect(defaultRawCreate.status).toBe(503);
-    expect((await defaultRawCreate.json()).error).toBe(CLOUD_DOC_ERROR_CODES.ONLYOFFICE_DISABLED);
-    expect(memDb.scripts.size).toBe(beforeScriptsCount);
-    expect(lastScriptDownloaded).toBe(prevDownloadedBeforeStrict);
-
-    const defaultTemplateRes = await app.request(`/api/cloud-docs/${tplDoc.id}/docbuilder`, {
-      method: 'POST',
-      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        template: 'replace_text',
-        argument: { search: 'Appended', replace: 'Updated' },
-      }),
-    });
-    expect(defaultTemplateRes.status).toBe(200);
-    expect(lastScriptDownloaded).toContain('SearchAndReplace');
-    delete env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED;
   });
 });
