@@ -5668,7 +5668,7 @@
     "tts_brain_prefix": "「{{server}}」{{text}}",
     "auditor_none": "无审计",
     "project_label": "项目",
-    "enter_session": "进入该会话",
+    "enter_session": "打开对话",
     "send_failed": "发送失败",
     "cancel_task": "取消任务",
     "close_task_done": "标记完成并关闭",

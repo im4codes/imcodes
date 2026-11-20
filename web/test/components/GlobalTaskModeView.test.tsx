@@ -2165,18 +2165,31 @@ describe('GlobalTaskModeView', () => {
     expect(onJumpToSession).toHaveBeenCalledWith('srv-1', 'bootmainxowfy6');
   });
 
-  it('provides an Open session button in the Quick Composer header for both reply and dispatch targets', async () => {
+  it('provides an Open session button in the Quick Composer footer alongside Mic and Send for reply, dispatch, and add-dispatch modals', async () => {
     const { onJumpToSession } = await mountWithSnapshot();
 
-    // 1. Reply composer mode: header button closes modal and jumps to session
+    // 1. Reply composer mode: Open session button lives in the footer alongside Mic and Send
     fireEvent.click(screen.getByTestId('task-mode-reply-tsk_pair_1'));
-    expect(screen.getByTestId('task-mode-composer')).toBeTruthy();
-    fireEvent.click(screen.getByTestId('task-mode-composer-enter-session'));
+    const replyDialog = screen.getByTestId('task-mode-composer');
+    const replyEnterBtn = screen.getByTestId('task-mode-composer-enter-session');
+    const replyFooter = replyDialog.querySelector('.global-task-composer-footer')!;
+    expect(replyFooter.contains(replyEnterBtn)).toBe(true);
+    expect(replyFooter.contains(screen.getByTestId('task-mode-composer-voice-btn'))).toBe(true);
+    expect(replyFooter.contains(screen.getByTestId('task-mode-composer-send-btn'))).toBe(true);
+    fireEvent.click(replyEnterBtn);
     expect(screen.queryByTestId('task-mode-composer')).toBeNull();
     expect(onJumpToSession).toHaveBeenNthCalledWith(1, 'srv-1', 'deck_imcodes_brain');
 
-    // 2. Pin a Brain pill -> open Dispatch composer mode -> header button closes modal and jumps to session
+    // 2. + Add / Dispatch modal: Open session button lives in the footer for selected server+Brain
     fireEvent.click(screen.getByTestId('task-mode-add-brain-btn'));
+    const addModal = screen.getByTestId('task-mode-add-modal');
+    const addEnterBtn = screen.getByTestId('task-mode-add-enter-session') as HTMLButtonElement;
+    const addFooter = addModal.querySelector('.global-task-composer-footer')!;
+    expect(addFooter.contains(addEnterBtn)).toBe(true);
+    expect(addFooter.contains(screen.getByTestId('task-mode-add-voice-btn'))).toBe(true);
+    expect(addFooter.contains(screen.getByTestId('task-mode-add-submit-btn'))).toBe(true);
+    expect(addEnterBtn.disabled).toBe(false);
+
     const srvSelect = screen.getByTestId('task-mode-add-server-select') as HTMLSelectElement;
     await waitFor(() => expect(srvSelect.value).toBe('srv-1'));
     await act(async () => {
@@ -2185,13 +2198,38 @@ describe('GlobalTaskModeView', () => {
     });
     await waitFor(() => expect((screen.getByTestId('task-mode-add-brain-select') as HTMLSelectElement).value).toBe('deck_gpu_brain'));
     fireEvent.click(screen.getByTestId('task-mode-add-pin-toggle'));
-    fireEvent.click(screen.getByTestId('task-mode-add-modal').querySelector('.global-task-modal-close')!);
 
-    fireEvent.click(screen.getByTestId('task-mode-brain-pill-srv-2-deck_gpu_brain'));
-    expect(screen.getByTestId('task-mode-composer')).toBeTruthy();
-    fireEvent.click(screen.getByTestId('task-mode-composer-enter-session'));
-    expect(screen.queryByTestId('task-mode-composer')).toBeNull();
+    // Clicking Open session from + Add / Dispatch closes modal and jumps to srv-2/deck_gpu_brain
+    fireEvent.click(addEnterBtn);
+    expect(screen.queryByTestId('task-mode-add-modal')).toBeNull();
     expect(onJumpToSession).toHaveBeenNthCalledWith(2, 'srv-2', 'deck_gpu_brain');
+
+    // 3. Pinned Brain pill -> Quick Dispatch composer mode: footer button closes modal and jumps to session
+    fireEvent.click(screen.getByTestId('task-mode-brain-pill-srv-2-deck_gpu_brain'));
+    const dispatchDialog = screen.getByTestId('task-mode-composer');
+    const dispatchEnterBtn = screen.getByTestId('task-mode-composer-enter-session');
+    expect(dispatchDialog.querySelector('.global-task-composer-footer')!.contains(dispatchEnterBtn)).toBe(true);
+    fireEvent.click(dispatchEnterBtn);
+    expect(screen.queryByTestId('task-mode-composer')).toBeNull();
+    expect(onJumpToSession).toHaveBeenNthCalledWith(3, 'srv-2', 'deck_gpu_brain');
+  });
+
+  it('disables the Open session button in Add / Dispatch modal when the selected server has no Brain', async () => {
+    const { ws } = await mountWithSnapshot();
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: 20_000,
+        servers: [
+          { id: 'srv-empty', name: 'empty-host', online: true },
+        ],
+        brains: [],
+        tasks: [],
+      });
+    });
+    fireEvent.click(screen.getByTestId('task-mode-add-brain-btn'));
+    const addEnterBtn = screen.getByTestId('task-mode-add-enter-session') as HTMLButtonElement;
+    expect(addEnterBtn.disabled).toBe(true);
   });
 
   it('supports horizontal swipe-left with confirmation to cancel an active task while ignoring vertical scroll and partial swipes', async () => {

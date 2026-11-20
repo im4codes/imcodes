@@ -24164,15 +24164,24 @@ html.native-ios-mac .global-task-mode-entry-btn {
 }
 
 .global-task-composer-enter-btn {
-  padding: 3px 8px;
-  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 6px 12px;
+  border-radius: 8px;
   border: 1px solid rgba(56, 189, 248, 0.45);
   background: rgba(14, 165, 233, 0.16);
   color: #bae6fd;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
   cursor: pointer;
+}
+
+.global-task-composer-enter-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .global-task-modal-close {
@@ -24214,9 +24223,14 @@ html.native-ios-mac .global-task-mode-entry-btn {
 
 .global-task-composer-footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.global-task-composer-footer .global-task-composer-enter-btn {
+  margin-right: auto;
 }
 
 .global-task-composer-voice-btn {
