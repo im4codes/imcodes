@@ -158,7 +158,15 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [ttsMode, serverConfigured]);
+  }, [
+    ttsMode,
+    serverConfigured,
+    serverConfig?.baseUrl,
+    serverConfig?.hasApiKey,
+    serverConfig?.apiKeyMasked,
+    serverConfig?.apiKeyFingerprint,
+    serverConfig?.serverDefaultConfigured,
+  ]);
 
   const voiceSelectOptions = useMemo(() => {
     const base = serverVoices.length > 0 ? serverVoices : getDefaultPresetTtsVoices(currentServerVoice);

@@ -64,6 +64,7 @@ export interface TtsPublicConfig {
   baseUrl: string;
   hasApiKey: boolean;
   apiKeyMasked: string | null;
+  apiKeyFingerprint?: string | null;
   model: string;
   voice: string;
   voicesByLang?: Record<string, string>;

@@ -99,7 +99,8 @@ let nativeTtsListenerHandle: { remove: () => Promise<void> } | null = null;
 let nativeStateWaiter: ((event: NativeTtsStateEvent) => void) | null = null;
 let cachedServerTtsConfig: TtsPublicConfig | null = null;
 let cachedServerTtsVoices: TtsVoicesResponse | null = null;
-let cachedServerTtsVoicesBaseUrl = '';
+let cachedServerTtsVoicesScope = '';
+let voicesCacheGeneration = 0;
 let inFlightVoicesFetch: Promise<TtsVoicesResponse | null> | null = null;
 let activeServerAbortController: AbortController | null = null;
 let activeAudioElement: HTMLAudioElement | null = null;
@@ -230,6 +231,16 @@ export function setTtsMode(mode: TtsEngineMode): void {
   notifyPreferences();
 }
 
+function buildTtsVoiceCacheScope(config: TtsPublicConfig): string {
+  return JSON.stringify({
+    baseUrl: config.baseUrl.trim(),
+    hasApiKey: config.hasApiKey === true,
+    apiKeyMasked: typeof config.apiKeyMasked === 'string' ? config.apiKeyMasked : null,
+    apiKeyFingerprint: typeof config.apiKeyFingerprint === 'string' ? config.apiKeyFingerprint : null,
+    serverDefaultConfigured: config.serverDefaultConfigured === true,
+  });
+}
+
 export function getCachedServerTtsConfig(): TtsPublicConfig | null {
   if (cachedServerTtsConfig) return { ...cachedServerTtsConfig };
   try {
@@ -242,6 +253,9 @@ export function getCachedServerTtsConfig(): TtsPublicConfig | null {
       baseUrl: typeof parsed.baseUrl === 'string' ? parsed.baseUrl : '',
       hasApiKey: parsed.hasApiKey === true,
       apiKeyMasked: typeof parsed.apiKeyMasked === 'string' ? parsed.apiKeyMasked : null,
+      ...(parsed.apiKeyFingerprint !== undefined
+        ? { apiKeyFingerprint: typeof parsed.apiKeyFingerprint === 'string' ? parsed.apiKeyFingerprint : null }
+        : {}),
       model: typeof parsed.model === 'string' ? parsed.model : 'gpt-4o-mini-tts',
       voice: typeof parsed.voice === 'string' ? parsed.voice : TTS_DEFAULT_VOICE,
       voicesByLang: sanitizeTtsVoicesByLang(parsed.voicesByLang),
@@ -255,8 +269,8 @@ export function getCachedServerTtsConfig(): TtsPublicConfig | null {
 }
 
 export function applyServerTtsConfig(config: TtsPublicConfig): void {
-  const previousBaseUrl = cachedServerTtsConfig?.baseUrl?.trim() ?? '';
-  const nextBaseUrl = config.baseUrl.trim();
+  const previousConfig = getCachedServerTtsConfig();
+  const previousScope = previousConfig ? buildTtsVoiceCacheScope(previousConfig) : null;
   const configured = isServerTtsConfigured(config);
   let explicitSystem = false;
   try {
@@ -274,12 +288,21 @@ export function applyServerTtsConfig(config: TtsPublicConfig): void {
     voicesByLang: sanitizeTtsVoicesByLang(config.voicesByLang),
     mode: effectiveMode,
   };
-  if ((previousBaseUrl !== nextBaseUrl && (previousBaseUrl || nextBaseUrl)) || (cachedServerTtsVoices && cachedServerTtsVoicesBaseUrl !== nextBaseUrl)) {
-    cachedServerTtsVoices = null;
-    cachedServerTtsVoicesBaseUrl = '';
+  const nextScope = buildTtsVoiceCacheScope(cachedServerTtsConfig);
+  const scopeChanged =
+    (previousScope !== null && previousScope !== nextScope)
+    || (cachedServerTtsVoices !== null && cachedServerTtsVoicesScope !== nextScope);
+  if (scopeChanged) {
+    voicesCacheGeneration += 1;
     inFlightVoicesFetch = null;
+    clearPersistedServerTtsVoices();
+  } else if (previousScope === null) {
+    // Drop any orphaned persisted voices list from a different endpoint/key on cold boot.
     try {
-      globalThis.localStorage?.removeItem(TTS_SERVER_VOICES_CACHE_KEY);
+      const persistedRaw = globalThis.localStorage?.getItem(TTS_SERVER_VOICES_CACHE_KEY);
+      if (persistedRaw && !readPersistedServerTtsVoices(nextScope)) {
+        globalThis.localStorage?.removeItem(TTS_SERVER_VOICES_CACHE_KEY);
+      }
     } catch { /* ignore */ }
   }
   try {
@@ -305,17 +328,18 @@ export function getDefaultPresetTtsVoices(currentVoice?: string): TtsVoiceOption
 
 function clearPersistedServerTtsVoices(): void {
   cachedServerTtsVoices = null;
-  cachedServerTtsVoicesBaseUrl = '';
+  cachedServerTtsVoicesScope = '';
   try {
     globalThis.localStorage?.removeItem(TTS_SERVER_VOICES_CACHE_KEY);
   } catch { /* ignore */ }
 }
 
-function readPersistedServerTtsVoices(expectedBaseUrl: string | null): TtsVoicesResponse | null {
+function readPersistedServerTtsVoices(expectedScope: string | null): TtsVoicesResponse | null {
   try {
     const raw = globalThis.localStorage?.getItem(TTS_SERVER_VOICES_CACHE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as {
+      scope?: unknown;
       baseUrl?: unknown;
       fetchedAt?: unknown;
       voices?: unknown;
@@ -325,8 +349,8 @@ function readPersistedServerTtsVoices(expectedBaseUrl: string | null): TtsVoices
     if (!parsed || typeof parsed !== 'object' || parsed.source !== 'upstream' || !Array.isArray(parsed.voices) || parsed.voices.length === 0) {
       return null;
     }
-    const storedBaseUrl = typeof parsed.baseUrl === 'string' ? parsed.baseUrl.trim() : '';
-    if (expectedBaseUrl !== null && storedBaseUrl !== expectedBaseUrl) {
+    const storedScope = typeof parsed.scope === 'string' ? parsed.scope : '';
+    if (expectedScope !== null && storedScope !== expectedScope) {
       return null;
     }
     const fetchedAt = typeof parsed.fetchedAt === 'number' && Number.isFinite(parsed.fetchedAt) ? parsed.fetchedAt : 0;
@@ -337,7 +361,7 @@ function readPersistedServerTtsVoices(expectedBaseUrl: string | null): TtsVoices
       .filter((v): v is TtsVoiceOption => Boolean(v && typeof v === 'object' && typeof (v as TtsVoiceOption).id === 'string' && (v as TtsVoiceOption).id.trim()))
       .map((v) => ({ ...v }));
     if (voices.length === 0) return null;
-    cachedServerTtsVoicesBaseUrl = storedBaseUrl;
+    cachedServerTtsVoicesScope = storedScope;
     return {
       voices,
       source: 'upstream',
@@ -350,11 +374,11 @@ function readPersistedServerTtsVoices(expectedBaseUrl: string | null): TtsVoices
 
 export function getCachedServerTtsVoices(): TtsVoicesResponse | null {
   const cfg = getCachedServerTtsConfig();
-  const expectedBaseUrl = cfg ? cfg.baseUrl.trim() : null;
+  const expectedScope = cfg ? buildTtsVoiceCacheScope(cfg) : null;
   if (cachedServerTtsVoices) {
-    if (expectedBaseUrl !== null && cachedServerTtsVoicesBaseUrl !== expectedBaseUrl) {
+    if (expectedScope !== null && cachedServerTtsVoicesScope !== expectedScope) {
       cachedServerTtsVoices = null;
-      cachedServerTtsVoicesBaseUrl = '';
+      cachedServerTtsVoicesScope = '';
     } else {
       return {
         ...cachedServerTtsVoices,
@@ -362,7 +386,7 @@ export function getCachedServerTtsVoices(): TtsVoicesResponse | null {
       };
     }
   }
-  const hydrated = readPersistedServerTtsVoices(expectedBaseUrl);
+  const hydrated = readPersistedServerTtsVoices(expectedScope);
   if (hydrated) {
     cachedServerTtsVoices = hydrated;
     return {
@@ -405,22 +429,33 @@ export async function fetchServerTtsVoices(
     return inFlightVoicesFetch;
   }
 
+  const startGeneration = voicesCacheGeneration;
+  const requestConfig = getCachedServerTtsConfig();
+  const requestScope = requestConfig ? buildTtsVoiceCacheScope(requestConfig) : '';
+
   const promise = (async (): Promise<TtsVoicesResponse | null> => {
     const fn = await loadTtsApiExport<(opts?: { refresh?: boolean }) => Promise<TtsVoicesResponse>>('getServerTtsVoices');
     if (!fn) return null;
     const res = await (forceRefresh ? fn({ refresh: true }) : fn());
+    if (voicesCacheGeneration !== startGeneration) {
+      // Endpoint or API key changed while this fetch was in-flight; never poison the new scope's cache.
+      return res;
+    }
     if (res && Array.isArray(res.voices)) {
-      const baseUrlScope = getCachedServerTtsConfig()?.baseUrl?.trim() ?? '';
+      const activeConfig = getCachedServerTtsConfig();
+      const voiceScope = activeConfig ? buildTtsVoiceCacheScope(activeConfig) : requestScope;
       if (res.source === 'upstream' && res.voices.length > 0) {
         const snapshot: TtsVoicesResponse = {
           ...res,
           voices: res.voices.map((v) => ({ ...v })),
         };
         cachedServerTtsVoices = snapshot;
-        cachedServerTtsVoicesBaseUrl = baseUrlScope;
+        cachedServerTtsVoicesScope = voiceScope;
         try {
           globalThis.localStorage?.setItem(TTS_SERVER_VOICES_CACHE_KEY, JSON.stringify({
-            baseUrl: baseUrlScope,
+            scope: voiceScope,
+            baseUrl: activeConfig?.baseUrl?.trim() ?? requestConfig?.baseUrl?.trim() ?? '',
+            apiKeyMasked: activeConfig?.apiKeyMasked ?? requestConfig?.apiKeyMasked ?? null,
             fetchedAt: Date.now(),
             voices: snapshot.voices,
             source: 'upstream',
@@ -432,7 +467,7 @@ export async function fetchServerTtsVoices(
       if (!res.endpointConfigured) {
         clearPersistedServerTtsVoices();
         cachedServerTtsVoices = { ...res, voices: res.voices.map((v) => ({ ...v })) };
-        cachedServerTtsVoicesBaseUrl = baseUrlScope;
+        cachedServerTtsVoicesScope = voiceScope;
         return res;
       }
       // Endpoint is configured, but transient preset fallback returned: keep prior upstream cache if present.
@@ -441,7 +476,7 @@ export async function fetchServerTtsVoices(
         return existingUpstream;
       }
       cachedServerTtsVoices = { ...res, voices: res.voices.map((v) => ({ ...v })) };
-      cachedServerTtsVoicesBaseUrl = baseUrlScope;
+      cachedServerTtsVoicesScope = voiceScope;
     }
     return res;
   })();
@@ -1460,7 +1495,8 @@ export async function __resetTtsForTests(): Promise<void> {
   clearActiveWebUtterance();
   cachedServerTtsConfig = null;
   cachedServerTtsVoices = null;
-  cachedServerTtsVoicesBaseUrl = '';
+  cachedServerTtsVoicesScope = '';
+  voicesCacheGeneration = 0;
   inFlightVoicesFetch = null;
   nativeStateWaiter = null;
   if (nativeTtsListenerHandle) {

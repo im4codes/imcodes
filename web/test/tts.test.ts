@@ -830,6 +830,121 @@ describe('server TTS playback', () => {
     expect(localStorage.getItem(reloaded.TTS_SERVER_VOICES_CACHE_KEY)).toBeNull();
   });
 
+  it('invalidates memory, inFlight, and localStorage voice cache on apiKeyMasked / apiKeyFingerprint change for the same baseUrl', async () => {
+    let resolveKeyAFetch!: (res: Response) => void;
+    let fetchCount = 0;
+    globalThis.fetch = vi.fn((url) => {
+      if (String(url).includes('/voices')) {
+        fetchCount += 1;
+        if (fetchCount === 1) {
+          return Promise.resolve(new Response(JSON.stringify({
+            voices: [{ id: 'voice-key-a', name: 'Key A Voice', locale: 'en-US' }],
+            source: 'upstream',
+            endpointConfigured: true,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        }
+        if (fetchCount === 2) {
+          return new Promise<Response>((resolve) => {
+            resolveKeyAFetch = resolve;
+          });
+        }
+        return Promise.resolve(new Response(JSON.stringify({
+          voices: [{ id: 'voice-key-b', name: 'Key B Voice', locale: 'en-US' }],
+          source: 'upstream',
+          endpointConfigured: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://shared-tts.example.com/v1',
+      hasApiKey: true,
+      apiKeyMasked: 'sk-a...1111',
+      apiKeyFingerprint: 'fp-alpha',
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+
+    await tts.fetchServerTtsVoices();
+    expect(tts.getCachedServerTtsVoices()?.voices.map((v) => v.id)).toEqual(['voice-key-a']);
+    expect(localStorage.getItem(tts.TTS_SERVER_VOICES_CACHE_KEY)).toBeTruthy();
+
+    // Rotate API key on the EXACT SAME baseUrl (different apiKeyMasked) -> immediate invalidation
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://shared-tts.example.com/v1',
+      hasApiKey: true,
+      apiKeyMasked: 'sk-b...2222',
+      apiKeyFingerprint: 'fp-beta',
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+    expect(tts.getCachedServerTtsVoices()).toBeNull();
+    expect(localStorage.getItem(tts.TTS_SERVER_VOICES_CACHE_KEY)).toBeNull();
+
+    // Start an in-flight fetch under key B, then rotate to key C (same '****' mask, different fingerprint) mid-flight
+    const staleInFlight = tts.fetchServerTtsVoices();
+    await vi.waitFor(() => expect(fetchCount).toBe(2));
+
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://shared-tts.example.com/v1',
+      hasApiKey: true,
+      apiKeyMasked: 'sk-b...2222',
+      apiKeyFingerprint: 'fp-gamma',
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+    expect(tts.getCachedServerTtsVoices()).toBeNull();
+
+    // A fresh fetch under key C must NOT share key B's abandoned inFlight promise
+    const keyCPromise = tts.fetchServerTtsVoices();
+    expect(keyCPromise).not.toBe(staleInFlight);
+    await vi.waitFor(() => expect(fetchCount).toBe(3));
+    const keyCRes = await keyCPromise;
+    expect(keyCRes?.voices.map((v) => v.id)).toEqual(['voice-key-b']);
+
+    // Resolving the abandoned key B fetch late MUST NOT overwrite key C's cache or localStorage
+    resolveKeyAFetch(new Response(JSON.stringify({
+      voices: [{ id: 'stale-key-a-poison', name: 'Stale' }],
+      source: 'upstream',
+      endpointConfigured: true,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    await staleInFlight;
+    expect(tts.getCachedServerTtsVoices()?.voices.map((v) => v.id)).toEqual(['voice-key-b']);
+
+    // Cold reload with stale persisted cache from key C, then sync returns key D -> clears localStorage too
+    vi.resetModules();
+    const reloaded = await import('../src/tts.js');
+    expect(reloaded.getCachedServerTtsVoices()?.voices.map((v) => v.id)).toEqual(['voice-key-b']);
+    reloaded.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://shared-tts.example.com/v1',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      apiKeyFingerprint: null,
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+    expect(reloaded.getCachedServerTtsVoices()).toBeNull();
+    expect(localStorage.getItem(reloaded.TTS_SERVER_VOICES_CACHE_KEY)).toBeNull();
+  });
+
   it('previewServerTtsVoice chooses language-matched sample text and aborts active preview on rapid switch', async () => {
     URL.createObjectURL = vi.fn(() => 'blob:mock/preview');
     URL.revokeObjectURL = vi.fn();

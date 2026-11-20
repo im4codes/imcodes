@@ -171,11 +171,15 @@ function buildPublicTtsConfig(stored: StoredUserTtsConfig, env: Env): TtsPublicC
     }
   }
   const effectiveConfigured = Boolean(stored.baseUrl?.trim() || envDefaults.serverDefaultConfigured);
+  const apiKeyFingerprint = userApiKey
+    ? createHash('sha256').update(userApiKey).digest('hex').slice(0, 16)
+    : null;
   return {
     mode: stored.mode ?? (effectiveConfigured ? 'server' : 'system'),
     baseUrl: stored.baseUrl ?? '',
     hasApiKey: Boolean(userApiKey),
     apiKeyMasked: maskTtsApiKey(userApiKey),
+    apiKeyFingerprint,
     model: stored.model?.trim() || envDefaults.model,
     voice: stored.voice?.trim() || envDefaults.voice,
     voicesByLang: { ...envDefaults.voicesByLang, ...(stored.voicesByLang ?? {}) },

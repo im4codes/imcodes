@@ -713,5 +713,30 @@ describe('TTS routes & preferences isolation', () => {
     const otherRes = await otherApp.request(TTS_VOICES_PATH, { method: 'GET', headers: { Cookie: cookie } }, otherKeyEnv);
     const otherBody = await otherRes.json() as { voices: Array<{ id: string }>; source: string };
     expect(otherBody.source).toBe('preset');
+
+    // 6. GET /api/tts/config exposes non-secret apiKeyFingerprint so colliding masks ('****') still distinguish keys
+    await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ baseUrl: 'https://edge-tts.example.com/v1', apiKey: 'key-one1' }),
+    }, env);
+    const cfgA = await (await app.request(TTS_CONFIG_PATH, { method: 'GET', headers: { Cookie: cookie } }, env)).json() as {
+      apiKeyMasked: string | null;
+      apiKeyFingerprint: string | null;
+    };
+    await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ apiKey: 'key-two2' }),
+    }, env);
+    const cfgB = await (await app.request(TTS_CONFIG_PATH, { method: 'GET', headers: { Cookie: cookie } }, env)).json() as {
+      apiKeyMasked: string | null;
+      apiKeyFingerprint: string | null;
+    };
+    expect(cfgA.apiKeyMasked).toBe('****');
+    expect(cfgB.apiKeyMasked).toBe('****');
+    expect(cfgA.apiKeyFingerprint).toBeTruthy();
+    expect(cfgB.apiKeyFingerprint).toBeTruthy();
+    expect(cfgA.apiKeyFingerprint).not.toBe(cfgB.apiKeyFingerprint);
   });
 });

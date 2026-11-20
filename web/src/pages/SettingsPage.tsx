@@ -1013,6 +1013,7 @@ export function SettingsPage({
                                     setTtsApiKeyMasked(res.config.apiKeyMasked);
                                     setTtsApiKeyInput('');
                                     setTtsServerMsg({ type: 'ok', text: t('settings.tts_server_saved') });
+                                    void refreshTtsVoices();
                                   }
                                 } catch (err) {
                                   setTtsServerMsg({ type: 'err', text: err instanceof Error ? err.message : t('settings.tts_server_save_error') });
