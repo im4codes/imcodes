@@ -64,6 +64,8 @@ export interface GlobalTaskSummaryRow {
   checklist: GlobalTaskChecklistProgress;
   executorLabel?: string;
   auditorLabel?: string;
+  executorModel?: string;
+  auditorModel?: string;
   auditor?: string;
   liveSummary?: string;
   startedAt?: number;
@@ -132,6 +134,8 @@ export interface GlobalTaskFleetSnapshotPair {
   checklist: GlobalTaskChecklistProgress;
   executorLabel?: string;
   auditorLabel?: string;
+  executorModel?: string;
+  auditorModel?: string;
   auditor?: string;
   liveSummary?: string;
   startedAt?: number;
@@ -164,6 +168,11 @@ const utf8Encoder = new TextEncoder();
 
 export function isGlobalTaskTerminalStatus(status: string): boolean {
   return TERMINAL_STATUSES.has(status);
+}
+
+export function isNoAuditorSentinel(value: string | null | undefined): boolean {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  return trimmed === 'none' || trimmed === '__none__';
 }
 
 /**

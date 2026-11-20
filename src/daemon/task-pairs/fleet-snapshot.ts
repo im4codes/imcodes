@@ -3,6 +3,7 @@ import {
   GLOBAL_TASK_RECENT_FINISHED_LIMIT,
   GLOBAL_TASK_TERMINAL_WINDOW_MS,
   isGlobalTaskTerminalStatus,
+  isNoAuditorSentinel,
   type GlobalTaskFleetSnapshotFrame,
   type GlobalTaskFleetSnapshotPair,
 } from '../../../shared/global-task-mode.js';
@@ -22,11 +23,25 @@ function sessionLabel(sessionName: string | undefined): string | undefined {
   return undefined;
 }
 
+function sessionModel(sessionName: string | undefined, fallback?: string): string | undefined {
+  if (!sessionName || isNoAuditorSentinel(sessionName)) return undefined;
+  const sess = getSession(sessionName);
+  const raw = sess?.modelDisplay?.trim()
+    || sess?.activeModel?.trim()
+    || sess?.requestedModel?.trim()
+    || sess?.qwenModel?.trim()
+    || fallback?.trim();
+  if (!raw || isNoAuditorSentinel(raw)) return undefined;
+  return raw;
+}
+
 export function toGlobalTaskFleetSnapshotPair(stored: StoredTaskPair): GlobalTaskFleetSnapshotPair {
   const { state, project } = stored;
   const checklist = state.brief ? taskPairChecklistCounts(state.brief) : { total: 0, implemented: 0, audited: 0 };
   const executorLabel = sessionLabel(state.executor);
   const auditorLabel = sessionLabel(state.auditor);
+  const executorModel = sessionModel(state.executor, state.executorModel);
+  const auditorModel = sessionModel(state.auditor, state.auditorModel);
   const liveSummary = state.blockedNote?.trim() || state.lastVerdict?.noticeText?.trim() || undefined;
   const startedAt = typeof state.startedAt === 'number' && Number.isFinite(state.startedAt) && state.startedAt > 0
     ? state.startedAt
@@ -46,6 +61,8 @@ export function toGlobalTaskFleetSnapshotPair(stored: StoredTaskPair): GlobalTas
     checklist,
     ...(executorLabel ? { executorLabel } : {}),
     ...(auditorLabel ? { auditorLabel } : {}),
+    ...(executorModel ? { executorModel } : {}),
+    ...(auditorModel ? { auditorModel } : {}),
     ...(state.auditor ? { auditor: state.auditor } : {}),
     ...(liveSummary ? { liveSummary: liveSummary.slice(0, 240) } : {}),
     ...(startedAt !== undefined ? { startedAt } : {}),

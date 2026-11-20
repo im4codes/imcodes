@@ -2688,4 +2688,140 @@ describe('GlobalTaskModeView', () => {
     expect(screen.getByTestId('task-mode-stat-w1').textContent).toBe('· 1w 0');
     expect(screen.getByTestId('task-mode-stat-m1').textContent).toBe('· 1m 0');
   });
+
+  it('renders compact last-2-segment executor and auditor models inline in card meta with full hover titles and none/missing guards', async () => {
+    const { formatTaskCardModels, GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+
+    expect(formatTaskCardModels('claude-opus-4-6-high', 'gpt-6.2-sol', 'deck_sub_aud')).toEqual({
+      label: 'opus-4.6 / 6.2-sol',
+      title: 'claude-opus-4-6-high / gpt-6.2-sol',
+    });
+    expect(formatTaskCardModels('sonnet', 'o3', 'deck_sub_aud')).toEqual({
+      label: 'sonnet / o3',
+      title: 'sonnet / o3',
+    });
+    expect(formatTaskCardModels('gpt-5.4-mini', 'none', 'none')).toEqual({
+      label: '5.4-mini',
+      title: 'gpt-5.4-mini',
+    });
+    expect(formatTaskCardModels('gpt-5.4-mini', '__none__', '__none__')).toEqual({
+      label: '5.4-mini',
+      title: 'gpt-5.4-mini',
+    });
+    expect(formatTaskCardModels(undefined, '__none__', '__none__')).toBeNull();
+    expect(formatTaskCardModels(undefined, undefined, undefined)).toBeNull();
+
+    const nowMs = Date.now();
+    render(<GlobalTaskModeView onExit={vi.fn()} onJumpToSession={vi.fn()} />);
+    await waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
+    const ws = MockWebSocket.instances[0]!;
+
+    await act(async () => {
+      ws.simulateOpen();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: nowMs,
+        servers: [{ id: 'srv-1', name: 'M3-Mac', online: true }],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-both-models',
+            title: 'Pair with both models',
+            status: 'working',
+            flags: [],
+            round: 2,
+            checklist: { total: 2, implemented: 1, audited: 0 },
+            executorModel: 'claude-opus-4-6-high',
+            auditorModel: 'gpt-6.2-sol',
+            auditor: 'deck_sub_aud',
+            createdAt: nowMs - 10_000,
+            updatedAt: nowMs - 1_000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-short-models',
+            title: 'Pair with short models',
+            status: 'in_audit',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 1, audited: 0 },
+            executorModel: 'sonnet',
+            auditorModel: 'o3',
+            auditor: 'deck_sub_aud',
+            createdAt: nowMs - 20_000,
+            updatedAt: nowMs - 2_000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-no-auditor',
+            title: 'No auditor task',
+            status: 'working',
+            flags: [],
+            round: 0,
+            checklist: { total: 0, implemented: 0, audited: 0 },
+            executorModel: 'gpt-5.4-mini',
+            auditorModel: '__none__',
+            auditor: '__none__',
+            createdAt: nowMs - 30_000,
+            updatedAt: nowMs - 3_000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-no-models',
+            title: 'Legacy task without models',
+            status: 'queued',
+            flags: [],
+            round: 0,
+            checklist: { total: 0, implemented: 0, audited: 0 },
+            createdAt: nowMs - 40_000,
+            updatedAt: nowMs - 4_000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+
+    const bothEl = screen.getByTestId('task-mode-models-t-both-models');
+    expect(bothEl.textContent).toBe('opus-4.6 / 6.2-sol');
+    expect(bothEl.getAttribute('title')).toBe('claude-opus-4-6-high / gpt-6.2-sol');
+    expect(screen.getByTestId('task-mode-card-t-both-models').querySelector('.global-task-card-meta')?.contains(bothEl)).toBe(true);
+
+    const shortEl = screen.getByTestId('task-mode-models-t-short-models');
+    expect(shortEl.textContent).toBe('sonnet / o3');
+    expect(shortEl.getAttribute('title')).toBe('sonnet / o3');
+
+    const noAudEl = screen.getByTestId('task-mode-models-t-no-auditor');
+    expect(noAudEl.textContent).toBe('5.4-mini');
+    expect(noAudEl.getAttribute('title')).toBe('gpt-5.4-mini');
+
+    expect(screen.queryByTestId('task-mode-models-t-no-models')).toBeNull();
+  });
 });

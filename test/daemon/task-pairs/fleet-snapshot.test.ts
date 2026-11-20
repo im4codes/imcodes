@@ -3,7 +3,7 @@ import {
   GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
   GLOBAL_TASK_TERMINAL_WINDOW_MS,
 } from '../../../shared/global-task-mode.js';
-import type { TaskPairState } from '../../../shared/task-pair.js';
+import { TASK_PAIR_NO_AUDITOR, type TaskPairState } from '../../../shared/task-pair.js';
 import { buildGlobalTaskFleetSnapshotPayload } from '../../../src/daemon/task-pairs/fleet-snapshot.js';
 import { setTaskPairStoreForTests, TaskPairStore } from '../../../src/daemon/task-pairs/store.js';
 import { removeSession, upsertSession, type SessionRecord } from '../../../src/store/session-store.js';
@@ -184,6 +184,66 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
     } finally {
       removeSession('deck_proj_w1');
       removeSession('deck_sub_pair_auto_6ac6fe82aa0aecfc');
+    }
+  });
+
+  it('propagates executorModel and auditorModel from session records and pair fallback while omitting auditorModel for __none__', () => {
+    upsertSession({
+      name: 'deck_sub_m_exec',
+      projectName: 'proj',
+      role: 'sub',
+      agentType: 'claude-code',
+      projectDir: '/tmp/proj',
+      state: 'running',
+      label: 'Exec M',
+      modelDisplay: 'claude-opus-4-6-high',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as SessionRecord);
+    upsertSession({
+      name: 'deck_sub_m_aud',
+      projectName: 'proj',
+      role: 'sub',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/proj',
+      state: 'idle',
+      label: 'Aud M',
+      requestedModel: 'gpt-6.2-sol',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as SessionRecord);
+
+    try {
+      store.savePair('proj', makePairState({
+        taskId: 'tsk_models_live',
+        executor: 'deck_sub_m_exec',
+        auditor: 'deck_sub_m_aud',
+        updatedAt: 6_000,
+      }));
+      store.savePair('proj', makePairState({
+        taskId: 'tsk_models_none_auditor',
+        executor: 'deck_sub_missing_exec',
+        executorModel: 'sonnet',
+        auditor: TASK_PAIR_NO_AUDITOR,
+        auditorModel: TASK_PAIR_NO_AUDITOR,
+        updatedAt: 6_000,
+      }));
+
+      const frame = buildGlobalTaskFleetSnapshotPayload(10_000);
+      const live = frame.pairs.find((p) => p.taskId === 'tsk_models_live');
+      expect(live?.executorModel).toBe('claude-opus-4-6-high');
+      expect(live?.auditorModel).toBe('gpt-6.2-sol');
+
+      const noAud = frame.pairs.find((p) => p.taskId === 'tsk_models_none_auditor');
+      expect(noAud?.executorModel).toBe('sonnet');
+      expect(noAud?.auditorModel).toBeUndefined();
+    } finally {
+      removeSession('deck_sub_m_exec');
+      removeSession('deck_sub_m_aud');
     }
   });
 });

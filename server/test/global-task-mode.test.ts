@@ -78,6 +78,8 @@ interface MemSummaryRow {
   checklist_audited: number;
   executor_label: string | null;
   auditor_label: string | null;
+  executor_model?: string | null;
+  auditor_model?: string | null;
   auditor: string | null;
   live_summary: string | null;
   is_terminal: boolean;
@@ -232,6 +234,8 @@ class InMemoryGlobalTaskDb {
             updatedAt,
             startedAt,
             endedAt,
+            executorModel,
+            auditorModel,
           ] = params;
 
           const key = this.summaryKey(String(serverId), String(taskId));
@@ -248,6 +252,8 @@ class InMemoryGlobalTaskDb {
           const sExecLabel = String(executorLabel ?? '') || null;
           const sAuditLabel = String(auditorLabel ?? '') || null;
           const sAuditor = String(auditor ?? '') || null;
+          const sExecModel = String(executorModel ?? '') || null;
+          const sAuditModel = (sAuditor === 'none' || sAuditor === '__none__') ? null : (String(auditorModel ?? '') || null);
           const sLive = String(liveSummary ?? '') || null;
           const bTerminal = Boolean(isTerminal);
           const bAttention = Boolean(needsAttention);
@@ -272,6 +278,8 @@ class InMemoryGlobalTaskDb {
               checklist_audited: nAudit,
               executor_label: sExecLabel,
               auditor_label: sAuditLabel,
+              executor_model: sExecModel,
+              auditor_model: sAuditModel,
               auditor: sAuditor,
               live_summary: sLive,
               is_terminal: bTerminal,
@@ -298,6 +306,8 @@ class InMemoryGlobalTaskDb {
               checklist_audited: isNewerOrEqual && nTotal > 0 ? nAudit : existing.checklist_audited,
               executor_label: sExecLabel ?? existing.executor_label,
               auditor_label: sAuditLabel ?? existing.auditor_label,
+              executor_model: sExecModel ?? existing.executor_model ?? null,
+              auditor_model: (sAuditor === 'none' || sAuditor === '__none__') ? null : (sAuditModel ?? existing.auditor_model ?? null),
               auditor: sAuditor ?? existing.auditor,
               live_summary: isNewerOrEqual ? (sLive ?? existing.live_summary) : existing.live_summary,
               is_terminal: isNewerOrEqual ? bTerminal : existing.is_terminal,
@@ -1660,5 +1670,46 @@ describe('global-task-mode server engine', () => {
       w1: { completedCount: 0, avgDurationMs: null },
       m1: { completedCount: 0, avgDurationMs: null },
     });
+  });
+
+  it('persists executorModel/auditorModel, preserves them on partial updates, and clears auditorModel for __none__', async () => {
+    const now = Date.now();
+    const initial = await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_models_db',
+      projectName: 'imcodes',
+      brainSession: 'deck_proj_brain',
+      title: 'Model persistence',
+      status: 'working',
+      executorModel: 'claude-opus-4-6-high',
+      auditorModel: 'gpt-6.2-sol',
+      auditor: 'deck_sub_aud',
+      createdAt: now - 5_000,
+      updatedAt: now - 4_000,
+    });
+    expect(initial?.executorModel).toBe('claude-opus-4-6-high');
+    expect(initial?.auditorModel).toBe('gpt-6.2-sol');
+
+    // Backward-compatible partial update omitting model fields keeps stored models
+    const partial = await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_models_db',
+      status: 'in_audit',
+      updatedAt: now - 2_000,
+    });
+    expect(partial?.executorModel).toBe('claude-opus-4-6-high');
+    expect(partial?.auditorModel).toBe('gpt-6.2-sol');
+
+    // Switching to auditor=__none__ clears any stale/sent auditorModel
+    const cleared = await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_models_db',
+      status: 'working',
+      auditor: '__none__',
+      auditorModel: '__none__',
+      updatedAt: now - 1_000,
+    });
+    expect(cleared?.executorModel).toBe('claude-opus-4-6-high');
+    expect(cleared?.auditorModel).toBeUndefined();
   });
 });

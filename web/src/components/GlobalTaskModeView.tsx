@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { useTranslation } from 'react-i18next';
 import {
   computeGlobalTaskCompletionStats,
+  isNoAuditorSentinel,
   type GlobalTaskBrainSummary,
   type GlobalTaskCompletionStats,
   type GlobalTaskSummaryRow,
@@ -10,6 +11,7 @@ import {
 import { isInternalSessionDisplayValue, pickReadableSessionDisplay } from '@shared/session-display.js';
 import { taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { formatLabel } from '../format-label.js';
+import { formatModelPresentation } from '../model-label.js';
 import {
   brainKey,
   computeDefaultMutedServerIds,
@@ -95,6 +97,37 @@ export const GLOBAL_TASK_TTS_CLOCK_SKEW_MS = 30 * 1000;
 export const GLOBAL_TASK_TTS_QUEUE_CAP = 64;
 
 export type TaskMode24hStats = GlobalTaskWindowStats;
+
+export interface TaskModeCardModelDisplay {
+  label: string;
+  title?: string;
+}
+
+/**
+ * Format compact inline executor/auditor model names (last 2 segments via
+ * `formatModelPresentation`) for the card meta bar, omitting auditor when none.
+ */
+export function formatTaskCardModels(
+  executorModel?: string,
+  auditorModel?: string,
+  auditor?: string,
+): TaskModeCardModelDisplay | null {
+  const execRaw = executorModel?.trim();
+  const audRaw = isNoAuditorSentinel(auditor) || isNoAuditorSentinel(auditorModel)
+    ? undefined
+    : auditorModel?.trim();
+  const execLabel = execRaw ? formatModelPresentation(execRaw).label?.trim() || null : null;
+  const audLabel = audRaw ? formatModelPresentation(audRaw).label?.trim() || null : null;
+  if (!execLabel && !audLabel) return null;
+  const label = execLabel && audLabel
+    ? `${execLabel} / ${audLabel}`
+    : (execLabel ?? audLabel)!;
+  const fullParts = [execRaw, audRaw].filter((v): v is string => Boolean(v));
+  return {
+    label,
+    ...(fullParts.length > 0 ? { title: fullParts.join(' / ') } : {}),
+  };
+}
 
 /**
  * Compute compact 24h completion count & average duration for finished (`done`)
@@ -1258,6 +1291,7 @@ export function GlobalTaskModeView({
     ) : null;
 
     const taskBrainLabel = resolveTaskBrainLabel(task);
+    const modelDisplay = formatTaskCardModels(task.executorModel, task.auditorModel, task.auditor);
     const executorDisplay = (() => {
       const normalized = taskPairDisplaySessionLabel('', task.executorLabel) ?? task.executorLabel?.trim();
       const readable = pickReadableSessionDisplay([normalized]);
@@ -1378,6 +1412,15 @@ export function GlobalTaskModeView({
               <span class={`global-task-status-badge is-${tone}`}>{renderTaskStatusLabel(task)}</span>
               {task.round > 0 && (
                 <span class="global-task-round-badge">R{task.round}</span>
+              )}
+              {modelDisplay && (
+                <span
+                  class="global-task-model-tag"
+                  data-testid={`task-mode-models-${task.taskId}`}
+                  title={modelDisplay.title}
+                >
+                  {modelDisplay.label}
+                </span>
               )}
               <button
                 type="button"

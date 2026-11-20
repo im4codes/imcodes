@@ -23824,6 +23824,21 @@ html.native-ios-mac .global-task-mode-entry-btn {
   white-space: nowrap;
 }
 
+.global-task-model-tag {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 150px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(30, 41, 59, 0.72);
+  color: #94a3b8;
+  font-size: 10px;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .global-task-status-badge {
   flex-shrink: 0;
   padding: 1px 5px;

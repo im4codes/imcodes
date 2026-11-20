@@ -15735,6 +15735,8 @@ export class WsBridge {
         } : undefined,
         executorLabel: typeof item.executorLabel === 'string' ? item.executorLabel : undefined,
         auditorLabel: typeof item.auditorLabel === 'string' ? item.auditorLabel : undefined,
+        executorModel: typeof item.executorModel === 'string' ? item.executorModel : undefined,
+        auditorModel: typeof item.auditorModel === 'string' ? item.auditorModel : undefined,
         auditor: typeof item.auditor === 'string' ? item.auditor : undefined,
         liveSummary: typeof item.liveSummary === 'string' ? item.liveSummary : undefined,
         startedAt: typeof item.startedAt === 'number' ? item.startedAt : undefined,
@@ -15785,6 +15787,8 @@ export class WsBridge {
       } : undefined,
       executorLabel: typeof pair.executorLabel === 'string' ? pair.executorLabel : undefined,
       auditorLabel: typeof pair.auditorLabel === 'string' ? pair.auditorLabel : undefined,
+      executorModel: typeof pair.executorModel === 'string' ? pair.executorModel : undefined,
+      auditorModel: typeof pair.auditorModel === 'string' ? pair.auditorModel : undefined,
       auditor: typeof pair.auditor === 'string' ? pair.auditor : undefined,
       liveSummary,
       startedAt: typeof pair.startedAt === 'number'
@@ -15850,6 +15854,8 @@ export class WsBridge {
           } : undefined,
           executorLabel: typeof payload.executorLabel === 'string' ? payload.executorLabel : undefined,
           auditorLabel: typeof payload.auditorLabel === 'string' ? payload.auditorLabel : undefined,
+          executorModel: typeof payload.executorModel === 'string' ? payload.executorModel : undefined,
+          auditorModel: typeof payload.auditorModel === 'string' ? payload.auditorModel : undefined,
           auditor: typeof payload.auditor === 'string' ? payload.auditor : undefined,
           liveSummary,
           startedAt: typeof payload.startedAt === 'number'
