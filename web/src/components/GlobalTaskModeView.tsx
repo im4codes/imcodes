@@ -67,6 +67,33 @@ const MOVE_CANCEL_PX = 12;
 
 export const GLOBAL_TASK_TTS_MAX_AGE_MS = 2 * 60 * 1000;
 export const GLOBAL_TASK_TTS_CLOCK_SKEW_MS = 30 * 1000;
+export const GLOBAL_TASK_TTS_QUEUE_CAP = 64;
+
+export interface QueuedTaskModeTtsItem {
+  text: string;
+  messageId: string;
+  lang: string;
+  eventTs: number;
+  arrivalSeq: number;
+}
+
+export function compareTaskModeTtsItems(a: QueuedTaskModeTtsItem, b: QueuedTaskModeTtsItem): number {
+  if (a.eventTs !== b.eventTs) return a.eventTs - b.eventTs;
+  return a.arrivalSeq - b.arrivalSeq;
+}
+
+export function enqueueChronologicalTtsItems(
+  queue: QueuedTaskModeTtsItem[],
+  items: readonly QueuedTaskModeTtsItem[],
+  cap: number = GLOBAL_TASK_TTS_QUEUE_CAP,
+): void {
+  if (items.length === 0) return;
+  queue.push(...items);
+  queue.sort(compareTaskModeTtsItems);
+  if (queue.length > cap) {
+    queue.splice(0, queue.length - cap);
+  }
+}
 
 export function shouldAutoSpeakTaskUpdate(input: {
   row: GlobalTaskSummaryRow;
@@ -336,11 +363,17 @@ export function GlobalTaskModeView({
   translateRef.current = t;
   const taskModeSpokenIdsRef = useRef<Set<string>>(new Set());
   const seenTtsKeysRef = useRef<Set<string>>(new Set());
+  const pendingTtsQueueRef = useRef<QueuedTaskModeTtsItem[]>([]);
+  const ttsArrivalSeqRef = useRef<number>(0);
+  const mountedRef = useRef<boolean>(false);
+  const inSyncTtsDispatchRef = useRef<boolean>(false);
+  const drainScheduledRef = useRef<boolean>(false);
   const mountAtRef = useRef<number>(Date.now());
   const entrySnapshotSeqRef = useRef<number>(globalTaskModeStore.getState().snapshotSeq);
   const lastSnapshotSeqRef = useRef<number>(globalTaskModeStore.getState().snapshotSeq);
   const seededLifecycleRef = useRef<boolean>(false);
   const prevMutedSetRef = useRef<Set<string>>(new Set(globalTaskModeStore.getState().mutedServerIds));
+  const pendingUnmuteServersRef = useRef<Set<string>>(new Set());
   const prevTasksRef = useRef<Map<string, GlobalTaskSummaryRow>>(new Map());
   const pressTrackersRef = useRef<Map<string, PressTracker>>(new Map());
   const suppressClickKeysRef = useRef<Set<string>>(new Set());
@@ -350,12 +383,59 @@ export function GlobalTaskModeView({
   // Store & TTS subscriptions + single-connection lifecycle
   useEffect(() => {
     const initial = globalTaskModeStore.getState();
+    mountedRef.current = true;
     mountAtRef.current = Date.now();
     entrySnapshotSeqRef.current = initial.snapshotSeq;
     lastSnapshotSeqRef.current = initial.snapshotSeq;
     seededLifecycleRef.current = false;
     prevMutedSetRef.current = new Set(initial.mutedServerIds);
+    pendingUnmuteServersRef.current.clear();
+    pendingTtsQueueRef.current = [];
     prevTasksRef.current = new Map(initial.tasks.map((row) => [taskKey(row.serverId, row.taskId), row]));
+
+    const drainPendingTts = () => {
+      if (!mountedRef.current || !ttsAutoReadRef.current || !isTtsSupported()) return;
+      if (inSyncTtsDispatchRef.current) return;
+
+      while (
+        pendingTtsQueueRef.current.length > 0
+        && mountedRef.current
+        && ttsAutoReadRef.current
+        && getTtsState().status === 'idle'
+      ) {
+        const nextItem = pendingTtsQueueRef.current.shift()!;
+        taskModeSpokenIdsRef.current.add(nextItem.messageId);
+        inSyncTtsDispatchRef.current = true;
+        let resultPromise: ReturnType<typeof speakText>;
+        try {
+          resultPromise = speakText(nextItem.text, {
+            messageId: nextItem.messageId,
+            lang: nextItem.lang,
+            queue: true,
+          });
+        } finally {
+          inSyncTtsDispatchRef.current = false;
+        }
+        void resultPromise.then((res) => {
+          if (!res.started && mountedRef.current && ttsAutoReadRef.current && getTtsState().status === 'idle') {
+            scheduleDrainPendingTts();
+          }
+        }).catch(() => {
+          if (mountedRef.current && ttsAutoReadRef.current && getTtsState().status === 'idle') {
+            scheduleDrainPendingTts();
+          }
+        });
+      }
+    };
+
+    const scheduleDrainPendingTts = () => {
+      if (drainScheduledRef.current) return;
+      drainScheduledRef.current = true;
+      queueMicrotask(() => {
+        drainScheduledRef.current = false;
+        drainPendingTts();
+      });
+    };
 
     const unsubStore = globalTaskModeStore.subscribe((next) => {
       setState(next);
@@ -363,18 +443,29 @@ export function GlobalTaskModeView({
       const mutedSet = new Set(next.mutedServerIds);
       const prevMutedSet = prevMutedSetRef.current;
 
-      if (next.snapshotSeq > lastSnapshotSeqRef.current) {
-        // Initial post-mount snapshot or reconnect snapshot: silently re-seed without speaking history.
-        lastSnapshotSeqRef.current = next.snapshotSeq;
-        if (next.snapshotSeq > entrySnapshotSeqRef.current) {
-          seededLifecycleRef.current = true;
+      for (const id of prevMutedSet) {
+        if (!mutedSet.has(id)) {
+          pendingUnmuteServersRef.current.add(id);
         }
-        prevMutedSetRef.current = mutedSet;
-        prevTasksRef.current = new Map(next.tasks.map((row) => [taskKey(row.serverId, row.taskId), row]));
-        return;
+      }
+      for (const id of mutedSet) {
+        pendingUnmuteServersRef.current.delete(id);
       }
 
-      if (!seededLifecycleRef.current) {
+      const isSnapshot = next.snapshotSeq > lastSnapshotSeqRef.current;
+      if (isSnapshot) {
+        lastSnapshotSeqRef.current = next.snapshotSeq;
+        if (!seededLifecycleRef.current) {
+          // Initial post-mount snapshot: silently seed without speaking history.
+          if (next.snapshotSeq > entrySnapshotSeqRef.current) {
+            seededLifecycleRef.current = true;
+          }
+          prevMutedSetRef.current = mutedSet;
+          pendingUnmuteServersRef.current.clear();
+          prevTasksRef.current = new Map(next.tasks.map((row) => [taskKey(row.serverId, row.taskId), row]));
+          return;
+        }
+      } else if (!seededLifecycleRef.current) {
         prevMutedSetRef.current = mutedSet;
         prevTasksRef.current = new Map(next.tasks.map((row) => [taskKey(row.serverId, row.taskId), row]));
         return;
@@ -382,10 +473,12 @@ export function GlobalTaskModeView({
 
       const now = Date.now();
       const nextMap = new Map<string, GlobalTaskSummaryRow>();
+      const candidates: QueuedTaskModeTtsItem[] = [];
       for (const row of next.tasks) {
         const key = taskKey(row.serverId, row.taskId);
         nextMap.set(key, row);
         if (mutedSet.has(row.serverId) || prevMutedSet.has(row.serverId)) continue;
+        if (isSnapshot && pendingUnmuteServersRef.current.has(row.serverId)) continue;
 
         const prev = prevTasksRef.current.get(key);
         if (!shouldAutoSpeakTaskUpdate({ row, prev, now, mountAt: mountAtRef.current })) continue;
@@ -415,9 +508,26 @@ export function GlobalTaskModeView({
           text: announcement.text,
         });
         if (!prepareTextForTts(spoken, localeRef.current)) continue;
-        const msgId = `gt-tp:${row.serverId}:${row.taskId}:${row.status}:${row.round}:${Date.now()}`;
-        taskModeSpokenIdsRef.current.add(msgId);
-        void speakText(spoken, { messageId: msgId, lang: localeRef.current, queue: true });
+        const arrivalSeq = ++ttsArrivalSeqRef.current;
+        const msgId = `gt-tp:${row.serverId}:${row.taskId}:${row.status}:${row.round}:${row.updatedAt}:${arrivalSeq}`;
+        candidates.push({
+          text: spoken,
+          messageId: msgId,
+          lang: localeRef.current,
+          eventTs: row.updatedAt || now,
+          arrivalSeq,
+        });
+      }
+      if (candidates.length > 0) {
+        enqueueChronologicalTtsItems(pendingTtsQueueRef.current, candidates);
+        scheduleDrainPendingTts();
+      }
+      if (isSnapshot) {
+        for (const id of [...pendingUnmuteServersRef.current]) {
+          if (!mutedSet.has(id)) {
+            pendingUnmuteServersRef.current.delete(id);
+          }
+        }
       }
       prevMutedSetRef.current = mutedSet;
       prevTasksRef.current = nextMap;
@@ -438,14 +548,30 @@ export function GlobalTaskModeView({
         text: event.text,
       });
       if (!prepareTextForTts(spoken, localeRef.current)) return;
+      const arrivalSeq = ++ttsArrivalSeqRef.current;
       const msgId = `gt-brain:${event.eventId}`;
-      taskModeSpokenIdsRef.current.add(msgId);
-      void speakText(spoken, { messageId: msgId, lang: localeRef.current, queue: true });
+      enqueueChronologicalTtsItems(pendingTtsQueueRef.current, [{
+        text: spoken,
+        messageId: msgId,
+        lang: localeRef.current,
+        eventTs: event.ts,
+        arrivalSeq,
+      }]);
+      scheduleDrainPendingTts();
     });
 
-    const unsubTtsState = subscribeTtsState(setTtsState);
+    const unsubTtsState = subscribeTtsState((nextTts) => {
+      setTtsState(nextTts);
+      if (nextTts.status === 'idle' && !inSyncTtsDispatchRef.current) {
+        drainPendingTts();
+      }
+    });
     const unsubTtsPrefs = subscribeTtsPreferences(() => {
-      setTtsAutoRead(getTtsAutoReadEnabled());
+      const enabled = getTtsAutoReadEnabled();
+      setTtsAutoRead(enabled);
+      if (!enabled) {
+        pendingTtsQueueRef.current.length = 0;
+      }
     });
 
     const releaseStream = typeof globalTaskModeStore.acquire === 'function'
@@ -456,6 +582,9 @@ export function GlobalTaskModeView({
       })();
 
     return () => {
+      mountedRef.current = false;
+      pendingTtsQueueRef.current.length = 0;
+      pendingUnmuteServersRef.current.clear();
       for (const tracker of pressTrackersRef.current.values()) {
         if (tracker.timer) clearTimeout(tracker.timer);
         tracker.cleanup?.();
@@ -819,6 +948,7 @@ export function GlobalTaskModeView({
 
   const handleToggleManualSpeak = useCallback((task: GlobalTaskSummaryRow, previewText: string, eventId: string) => {
     const manualMsgId = `gt-manual:${task.serverId}:${task.taskId}:${eventId}`;
+    pendingTtsQueueRef.current.length = 0;
     if (ttsState.status === 'speaking' && ttsState.activeMessageId === manualMsgId) {
       void stopSpeaking();
       return;
@@ -1128,6 +1258,7 @@ export function GlobalTaskModeView({
                   setTtsAutoReadEnabled(next);
                   setTtsAutoRead(next);
                   if (!next) {
+                    pendingTtsQueueRef.current.length = 0;
                     void stopSpeaking();
                   }
                 }}

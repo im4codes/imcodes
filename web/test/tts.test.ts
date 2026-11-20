@@ -431,7 +431,8 @@ describe('tts service', () => {
     spokenUtterances[2].onend?.();
     expect(getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
 
-    // 2. Bounded FIFO cap drops oldest unplayed items
+    // 2. Bounded FIFO cap preserves bursts above 6 items (up to TTS_MAX_QUEUE_SIZE) and only drops oldest overflow past the cap
+    expect(TTS_MAX_QUEUE_SIZE).toBeGreaterThanOrEqual(64);
     await speakText('Active item.', { messageId: 'cap-0', queue: true });
     for (let i = 1; i <= TTS_MAX_QUEUE_SIZE + 3; i++) {
       await speakText(`Queued ${i}.`, { messageId: `cap-${i}`, queue: true });

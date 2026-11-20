@@ -1646,4 +1646,284 @@ describe('GlobalTaskModeView', () => {
     expect(mobileBlock).toMatch(/\.global-task-card-timing\s*\{[^}]*font-size:\s*9\.5px;/s);
     expect(mobileBlock).toMatch(/\.global-task-progress-track\s*\{[^}]*min-width:\s*20px;/s);
   });
+
+  it('plays Task Mode announcements in true chronological execution order across BRAIN_TEXT and UI-prioritized task transitions', async () => {
+    const { setTtsAutoReadEnabled } = await import('../../src/tts.js');
+    const { compareTaskModeTtsItems, enqueueChronologicalTtsItems } = await import('../../src/components/GlobalTaskModeView.js');
+    setTtsAutoReadEnabled(true);
+
+    // Pure queue ordering check: chronological eventTs ASC, then arrivalSeq ASC
+    const sorted: Array<{ text: string; messageId: string; lang: string; eventTs: number; arrivalSeq: number }> = [];
+    enqueueChronologicalTtsItems(sorted, [
+      { text: 'Second', messageId: 'm2', lang: 'en', eventTs: 200, arrivalSeq: 1 },
+      { text: 'FirstB', messageId: 'm1b', lang: 'en', eventTs: 100, arrivalSeq: 3 },
+      { text: 'FirstA', messageId: 'm1a', lang: 'en', eventTs: 100, arrivalSeq: 2 },
+    ]);
+    expect(sorted.map((x) => x.messageId)).toEqual(['m1a', 'm1b', 'm2']);
+    expect(compareTaskModeTtsItems(sorted[0]!, sorted[1]!)).toBeLessThan(0);
+
+    const { ws } = await mountWithSnapshot();
+    expect(spokenUtterances).toHaveLength(0);
+
+    const baseTs = Date.now();
+    // Send newer high-priority attention task + newer brain text BEFORE older transitions in the same turn
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
+        event: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          sessionName: 'deck_imcodes_brain',
+          projectName: 'imcodes',
+          eventId: 'evt-order-3',
+          text: 'Third brain update',
+          ts: baseTs + 300,
+        },
+      });
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.UPSERT,
+        task: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          serverOnline: true,
+          projectName: 'imcodes',
+          brainSession: 'deck_imcodes_brain',
+          brainLabel: 'IM Brain',
+          taskId: 'tsk_later_urgent',
+          title: 'Urgent Later Task',
+          status: 'awaiting_brain_decision',
+          flags: ['blocked'],
+          round: 1,
+          checklist: { total: 1, implemented: 0, audited: 0 },
+          createdAt: baseTs + 150,
+          updatedAt: baseTs + 200,
+          isTerminal: false,
+          needsAttention: true,
+        },
+      });
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.UPSERT,
+        task: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          serverOnline: true,
+          projectName: 'imcodes',
+          brainSession: 'deck_imcodes_brain',
+          brainLabel: 'IM Brain',
+          taskId: 'tsk_earlier_done',
+          title: 'Earlier Done Task',
+          status: 'done',
+          flags: [],
+          round: 1,
+          checklist: { total: 1, implemented: 1, audited: 1 },
+          createdAt: baseTs + 50,
+          updatedAt: baseTs + 100,
+          isTerminal: true,
+          needsAttention: false,
+        },
+      });
+    });
+
+    // Earliest item (baseTs + 100) must speak first, even though Urgent Later Task sorts first in UI cards
+    expect(spokenUtterances).toHaveLength(1);
+    expect(spokenUtterances[0]!.text).toContain('Earlier Done Task');
+
+    await act(async () => {
+      spokenUtterances[0]!.onend?.();
+    });
+    expect(spokenUtterances).toHaveLength(2);
+    expect(spokenUtterances[1]!.text).toContain('Urgent Later Task');
+
+    await act(async () => {
+      spokenUtterances[1]!.onend?.();
+    });
+    expect(spokenUtterances).toHaveLength(3);
+    expect(spokenUtterances[2]!.text).toContain('Third brain update');
+  });
+
+  it('queues bursts of more than 6 announcements without dropping earlier items and clears pending buffer on unmount', async () => {
+    const { setTtsAutoReadEnabled, getTtsAutoReadEnabled } = await import('../../src/tts.js');
+    setTtsAutoReadEnabled(true);
+
+    const { ws } = await mountWithSnapshot();
+    const baseTs = Date.now();
+
+    // Burst 10 announcements out of reverse order (10 down to 1) -> all 10 must speak in chronological order 1..10
+    await act(async () => {
+      for (let i = 10; i >= 1; i--) {
+        ws.simulateMessage({
+          type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
+          event: {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            sessionName: 'deck_imcodes_brain',
+            projectName: 'imcodes',
+            eventId: `evt-burst-${i}`,
+            text: `Burst announcement ${i}`,
+            ts: baseTs + i * 100,
+          },
+        });
+      }
+    });
+
+    expect(spokenUtterances).toHaveLength(1);
+    expect(spokenUtterances[0]!.text).toContain('Burst announcement 1');
+
+    // Play items 2..10 sequentially without losing any item > 6
+    for (let i = 1; i < 10; i++) {
+      await act(async () => {
+        spokenUtterances[i - 1]!.onend?.();
+      });
+      expect(spokenUtterances).toHaveLength(i + 1);
+      expect(spokenUtterances[i]!.text).toContain(`Burst announcement ${i + 1}`);
+    }
+
+    // Queue another burst, finish current, then unmount -> unplayed buffered items stop & do not leak post-unmount
+    await act(async () => {
+      spokenUtterances[9]!.onend?.();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
+        event: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          sessionName: 'deck_imcodes_brain',
+          projectName: 'imcodes',
+          eventId: 'evt-after-1',
+          text: 'Before unmount 1',
+          ts: baseTs + 2000,
+        },
+      });
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.BRAIN_TEXT,
+        event: {
+          serverId: 'srv-1',
+          serverName: 'M3-Mac',
+          sessionName: 'deck_imcodes_brain',
+          projectName: 'imcodes',
+          eventId: 'evt-after-2',
+          text: 'Should not leak after unmount 2',
+          ts: baseTs + 2100,
+        },
+      });
+    });
+    expect(spokenUtterances).toHaveLength(11);
+    cleanup();
+    expect(getTtsAutoReadEnabled()).toBe(true);
+    expect(spokenUtterances).toHaveLength(11);
+  });
+
+  it('recovers missed live transitions chronologically on post-seed reconnect snapshot without speaking unchanged or pre-mount history', async () => {
+    const { setTtsAutoReadEnabled } = await import('../../src/tts.js');
+    setTtsAutoReadEnabled(true);
+
+    const { ws } = await mountWithSnapshot();
+    expect(spokenUtterances).toHaveLength(0);
+
+    const liveTs = Date.now();
+    // Simulate WS drop + reconnect SNAPSHOT containing:
+    // 1. Existing tsk_pair_1 transitioned working -> passed (newer timestamp: liveTs + 200)
+    // 2. Newly appeared live task tsk_reconnect_new (earlier timestamp: liveTs + 100)
+    // 3. Pre-mount historical task tsk_premount_hist (old timestamp) -> must NOT speak
+    // 4. Unchanged existing task tsk_done_1 -> must NOT speak
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: liveTs + 300,
+        servers: [
+          { id: 'srv-1', name: 'M3-Mac', online: true },
+          { id: 'srv-2', name: 'Linux-GPU', online: true },
+        ],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 'tsk_pair_1',
+            title: 'Build Global View',
+            status: 'passed',
+            flags: [],
+            round: 2,
+            checklist: { total: 5, implemented: 5, audited: 5 },
+            createdAt: 100,
+            updatedAt: liveTs + 200,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 'tsk_reconnect_new',
+            title: 'Reconnect New Task',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 2, implemented: 0, audited: 0 },
+            createdAt: liveTs + 50,
+            updatedAt: liveTs + 100,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 'tsk_premount_hist',
+            title: 'Pre-mount Historical Task',
+            status: 'done',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 1, audited: 1 },
+            createdAt: 10,
+            updatedAt: liveTs - 5 * 60 * 1000,
+            isTerminal: true,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 'tsk_done_1',
+            title: 'Ship WS backend',
+            status: 'done',
+            flags: [],
+            round: 1,
+            checklist: { total: 3, implemented: 3, audited: 3 },
+            createdAt: 50,
+            updatedAt: 200,
+            isTerminal: true,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+
+    // tsk_reconnect_new (liveTs + 100) speaks BEFORE tsk_pair_1 passed (liveTs + 200); historical & unchanged stay silent
+    expect(spokenUtterances).toHaveLength(1);
+    expect(spokenUtterances[0]!.text).toContain('Reconnect New Task');
+
+    await act(async () => {
+      spokenUtterances[0]!.onend?.();
+    });
+    expect(spokenUtterances).toHaveLength(2);
+    expect(spokenUtterances[1]!.text).toContain('Build Global View');
+
+    await act(async () => {
+      spokenUtterances[1]!.onend?.();
+    });
+    expect(spokenUtterances).toHaveLength(2);
+  });
 });

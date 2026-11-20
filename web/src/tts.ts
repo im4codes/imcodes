@@ -17,7 +17,7 @@ export const TTS_MIN_RATE = 0.5;
 export const TTS_MAX_RATE = 2.0;
 export const TTS_RATE_OPTIONS = [0.9, 1.0, 1.1, 1.25, 1.5] as const;
 export const TTS_MAX_CHUNK_CHARS = 1200;
-export const TTS_MAX_QUEUE_SIZE = 6;
+export const TTS_MAX_QUEUE_SIZE = 64;
 
 export type TtsPlaybackStatus = 'idle' | 'speaking';
 
