@@ -264,7 +264,7 @@ export interface CloudDocTextSegment {
 
 const CLOUD_DOC_ID_BODY = 'cdoc_[A-Za-z0-9_-]{4,}';
 const CLOUD_DOC_QUOTE_TAG_EXACT_RE = /^\s*\[CloudDoc:\s*([^\]|\n]+?)\s*\|\s*id=([^\]\s]+)\]\s*$/;
-const CLOUD_DOC_QUOTE_TAG_GLOBAL_RE = /\[CloudDoc:\s*([^\]|\n]+?)\s*\|\s*id=([^\]\s]+)\]/g;
+const CLOUD_DOC_QUOTE_TAG_GLOBAL_RE = /\[CloudDoc:\s*([^\]|\n]{1,300}?)\s*\|\s*id=([^\]\s]{1,128})\]/g;
 const CLOUD_DOC_ID_EXACT_RE = new RegExp(`^\\s*(?:id\\s*=\\s*)?(${CLOUD_DOC_ID_BODY})\\s*$`);
 const CLOUD_DOC_ID_GLOBAL_RE = new RegExp(`(?<![A-Za-z0-9_])(?:id\\s*=\\s*)?(${CLOUD_DOC_ID_BODY})(?![A-Za-z0-9_-])`, 'g');
 const CLOUD_DOC_FIRST_ID_RE = new RegExp(`(?<![A-Za-z0-9_])(?:id\\s*=\\s*)?(${CLOUD_DOC_ID_BODY})(?![A-Za-z0-9_-])`);

@@ -201,47 +201,94 @@ interface MarkdownLinkMatch {
   value: string;
 }
 
-function buildMatchingCloseBracketMap(source: string): Map<number, number> {
-  const closeAtOpen = new Map<number, number>();
-  const openStack: number[] = [];
+interface MatchingDelimiters {
+  closeBracketByOpen: Map<number, number>;
+  closeParenByOpen: Map<number, number>;
+}
+
+interface MonotonicCharState {
+  pos: number;
+  dead: boolean;
+}
+
+function findNextCharMonotonic(text: string, needle: string, from: number, state: MonotonicCharState): number {
+  if (state.dead) return -1;
+  if (state.pos >= from) return state.pos;
+  const idx = text.indexOf(needle, from);
+  if (idx < 0) {
+    state.dead = true;
+    return -1;
+  }
+  state.pos = idx;
+  return idx;
+}
+
+function findNextLineEndMonotonic(
+  text: string,
+  from: number,
+  lfState: MonotonicCharState,
+  crState: MonotonicCharState,
+): number {
+  const lf = findNextCharMonotonic(text, '\n', from, lfState);
+  const cr = findNextCharMonotonic(text, '\r', from, crState);
+  if (lf < 0) return cr < 0 ? text.length : cr;
+  if (cr < 0) return lf;
+  return Math.min(lf, cr);
+}
+
+function buildLineParenMap(source: string): Map<number, number> {
+  const closeParenByOpen = new Map<number, number>();
+  if (!source.includes('](')) return closeParenByOpen;
+  const parenStack: number[] = [];
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i];
+    if (char === '\n' || char === '\r') {
+      parenStack.length = 0;
+      continue;
+    }
+    if (char === '\\') {
+      if (parenStack.length > 0) i += 1;
+      continue;
+    }
+    if (char === '(' || char === '（') {
+      parenStack.push(i);
+    } else if ((char === ')' || char === '）') && parenStack.length > 0) {
+      closeParenByOpen.set(parenStack.pop()!, i);
+    }
+  }
+  return closeParenByOpen;
+}
+
+function buildMatchingDelimiters(source: string): MatchingDelimiters {
+  const closeBracketByOpen = new Map<number, number>();
+  const bracketStack: number[] = [];
   for (let i = 0; i < source.length; i += 1) {
     const char = source[i];
     if (char === '\\') {
-      if (openStack.length > 0) i += 1;
+      if (bracketStack.length > 0) i += 1;
       continue;
     }
     if (char === '[') {
-      openStack.push(i);
-    } else if (char === ']' && openStack.length > 0) {
-      closeAtOpen.set(openStack.pop()!, i);
+      bracketStack.push(i);
+    } else if (char === ']' && bracketStack.length > 0) {
+      closeBracketByOpen.set(bracketStack.pop()!, i);
     }
   }
-  return closeAtOpen;
+  return { closeBracketByOpen, closeParenByOpen: buildLineParenMap(source) };
 }
 
 function matchUnwrappedLocalMarkdownLink(
   source: string,
   start: number,
-  closeAtOpen: Map<number, number>,
+  delimiters: MatchingDelimiters,
 ): MarkdownLinkMatch | null {
   const labelStart = source[start] === '!' ? start + 1 : start;
   if (source[labelStart] !== '[') return null;
-  const labelEnd = closeAtOpen.get(labelStart) ?? -1;
+  const labelEnd = delimiters.closeBracketByOpen.get(labelStart) ?? -1;
   if (labelEnd < 0 || source[labelEnd + 1] !== '(' || source[labelEnd + 2] === '<') return null;
 
   const destinationStart = labelEnd + 2;
-  let depth = 0;
-  let destinationEnd = -1;
-  for (let i = destinationStart; i < source.length; i += 1) {
-    const char = source[i];
-    if (char === '\\') { i += 1; continue; }
-    if (char === '\n' || char === '\r') return null;
-    if (char === '(' || char === '（') { depth += 1; continue; }
-    if (char === ')' || char === '）') {
-      if (depth === 0) { destinationEnd = i; break; }
-      depth -= 1;
-    }
-  }
+  const destinationEnd = delimiters.closeParenByOpen.get(labelEnd + 1) ?? -1;
   if (destinationEnd < 0) return null;
   const destination = source.slice(destinationStart, destinationEnd);
   const normalized = normalizeChatFileReference(destination);
@@ -251,10 +298,10 @@ function matchUnwrappedLocalMarkdownLink(
 
 function transformOutsideMarkdownCode(
   source: string,
-  transform: (source: string, start: number, closeAtOpen: Map<number, number>) => MarkdownLinkMatch | null,
+  transform: (source: string, start: number, delimiters: MatchingDelimiters) => MarkdownLinkMatch | null,
 ): string {
   if (!source.includes('[')) return source;
-  const closeAtOpen = buildMatchingCloseBracketMap(source);
+  const delimiters = buildMatchingDelimiters(source);
   let output = '';
   let cursor = 0;
   let codeDelimiter: { char: '`' | '~'; length: number } | null = null;
@@ -274,7 +321,7 @@ function transformOutsideMarkdownCode(
       continue;
     }
     if (!codeDelimiter && (char === '[' || (char === '!' && source[cursor + 1] === '['))) {
-      const match = transform(source, cursor, closeAtOpen);
+      const match = transform(source, cursor, delimiters);
       if (match) { output += match.value; cursor = match.end; continue; }
     }
     output += char;
@@ -293,24 +340,26 @@ export function extractMarkdownLocalFileDestinations(source: string): string[] {
   if (!source.includes('[')) return [];
   const normalized = normalizeLocalMarkdownDestinations(source);
   const paths = new Set<string>();
-  transformOutsideMarkdownCode(normalized, (text, start, closeAtOpen) => {
+  const angleState: MonotonicCharState = { pos: -1, dead: false };
+  const angleParenState: MonotonicCharState = { pos: -1, dead: false };
+  const lfState: MonotonicCharState = { pos: -1, dead: false };
+  const crState: MonotonicCharState = { pos: -1, dead: false };
+  transformOutsideMarkdownCode(normalized, (text, start, delimiters) => {
     const labelStart = text[start] === '!' ? start + 1 : start;
     if (text[labelStart] !== '[') return null;
-    const labelEnd = closeAtOpen.get(labelStart) ?? -1;
+    const labelEnd = delimiters.closeBracketByOpen.get(labelStart) ?? -1;
     if (labelEnd < 0 || text[labelEnd + 1] !== '(') return null;
     const destinationStart = labelEnd + 2;
     let end = -1;
     if (text[destinationStart] === '<') {
-      const angleEnd = text.indexOf('>', destinationStart + 1);
-      if (angleEnd >= 0) end = text.indexOf(')', angleEnd + 1);
-    } else {
-      let parenDepth = 0;
-      for (let i = destinationStart; i < text.length; i += 1) {
-        if (text[i] === '\\') { i += 1; continue; }
-        if (text[i] === '(' || text[i] === '（') parenDepth += 1;
-        else if ((text[i] === ')' || text[i] === '）') && parenDepth-- === 0) { end = i; break; }
-        if (text[i] === '\n' || text[i] === '\r') break;
+      const lineEnd = findNextLineEndMonotonic(text, destinationStart, lfState, crState);
+      const angleEnd = findNextCharMonotonic(text, '>', destinationStart + 1, angleState);
+      if (angleEnd >= 0 && angleEnd < lineEnd) {
+        const parenEnd = findNextCharMonotonic(text, ')', angleEnd + 1, angleParenState);
+        if (parenEnd >= 0 && parenEnd < lineEnd) end = parenEnd;
       }
+    } else {
+      end = delimiters.closeParenByOpen.get(labelEnd + 1) ?? -1;
     }
     if (end < 0) return null;
     const raw = text.slice(start, end + 1);
@@ -355,9 +404,14 @@ export function findChatFileReferencesInText(text: string): ChatFileReferenceMat
 
 function maskMarkdownLinks(source: string): string {
   if (!source.includes('](')) return source;
+  const closeParenByOpen = buildLineParenMap(source);
   const out: string[] = [];
   let cursor = 0;
   let openStart = -1;
+  const angleState: MonotonicCharState = { pos: -1, dead: false };
+  const parenState: MonotonicCharState = { pos: -1, dead: false };
+  const lfState: MonotonicCharState = { pos: -1, dead: false };
+  const crState: MonotonicCharState = { pos: -1, dead: false };
   for (let i = 0; i < source.length; i += 1) {
     const ch = source[i];
     if (ch === '\n' || ch === '\r') {
@@ -371,23 +425,22 @@ function maskMarkdownLinks(source: string): string {
     if (ch === ']') {
       if (openStart >= 0 && source[i + 1] === '(') {
         const destStart = i + 2;
+        const lineEnd = findNextLineEndMonotonic(source, destStart, lfState, crState);
         let end = -1;
         if (source[destStart] === '<') {
-          const angleEnd = source.indexOf('>', destStart + 1);
-          if (angleEnd >= 0) {
-            const newlineIdx = source.slice(destStart + 1, angleEnd).search(/[\r\n]/);
-            if (newlineIdx < 0 && source[angleEnd + 1] === ')') {
-              end = angleEnd + 2;
-            }
+          const angleEnd = findNextCharMonotonic(source, '>', destStart + 1, angleState);
+          if (angleEnd >= 0 && angleEnd < lineEnd && source[angleEnd + 1] === ')') {
+            end = angleEnd + 2;
           }
         }
         if (end < 0) {
-          for (let j = destStart; j < source.length; j += 1) {
-            const dch = source[j];
-            if (dch === '\r' || dch === '\n') break;
-            if (dch === ')') {
-              end = j + 1;
-              break;
+          const balancedClose = closeParenByOpen.get(i + 1);
+          if (balancedClose !== undefined && balancedClose < lineEnd) {
+            end = balancedClose + 1;
+          } else {
+            const closeParen = findNextCharMonotonic(source, ')', destStart, parenState);
+            if (closeParen >= 0 && closeParen < lineEnd) {
+              end = closeParen + 1;
             }
           }
         }
