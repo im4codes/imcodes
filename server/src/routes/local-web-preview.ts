@@ -161,7 +161,7 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
   if (!access.ok) {
     return c.json({ error: access.error }, access.status);
   }
-  const { preview } = access;
+  const { preview, previewAccessToken: validatedPreviewAccessToken } = access;
 
   // Authorization passed (owner + current role + token/session) → re-set the
   // preview scoped cookie so post-initial-load same-origin requests carry it
@@ -172,8 +172,8 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
   // is deferred past the daemon-online gate below so a long-offline daemon can
   // no longer keep a preview alive (occupying a per-user slot) just because the
   // owner keeps polling/refreshing it (S1/N3, audit run 394c114e-11f).
-  if (previewAccessToken) {
-    setPreviewAccessCookie(c, serverId, previewId, previewAccessToken);
+  if (validatedPreviewAccessToken) {
+    setPreviewAccessCookie(c, serverId, previewId, validatedPreviewAccessToken);
   }
 
   const bridge = WsBridge.get(serverId);
@@ -280,7 +280,7 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
       // separately by getUpstreamPath. Shared, unit-tested helper.
       const isLoopbackRedirect = rewritten !== location;
       const nextLocation = isLoopbackRedirect
-        ? appendPreviewAccessTokenIfMissing(rewritten, c.req.url, previewAccessToken)
+        ? appendPreviewAccessTokenIfMissing(rewritten, c.req.url, validatedPreviewAccessToken)
         : rewritten;
       upstreamHeaders.set('location', nextLocation);
     }
@@ -307,7 +307,7 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
 
     if (shouldRewritePreviewHtml(responseHeaders)) {
       const html = await new Response(started.body).text();
-      const rewrittenHtml = rewritePreviewHtmlDocument(html, serverId, previewId, preview.port, previewAccessToken ?? undefined);
+      const rewrittenHtml = rewritePreviewHtmlDocument(html, serverId, previewId, preview.port, validatedPreviewAccessToken ?? undefined);
       responseHeaders.delete('content-length');
       return new Response(rewrittenHtml, {
         status: started.status,

@@ -153,4 +153,34 @@ describe('local web preview access (resolveLocalPreviewAccess / commitAuthorized
     expect(afterCommit.lastAccessAt).toBe(now + 60_000);
     expect(afterCommit.expiresAt).toBe((now + 60_000) + PREVIEW_LIMITS.DEFAULT_TTL_MS);
   });
+
+  it('drops an unvalidated previewAccessToken when authenticated via session cookie, while preserving a valid token', async () => {
+    const userId = 'user-a';
+    const { preview, accessToken } = seedPreview(userId);
+    const db = makeDb({ ownerUserId: userId });
+
+    const invalid = await resolveLocalPreviewAccess({
+      db,
+      serverId,
+      previewId: preview.id,
+      previewAccessToken: '</script><script>alert(1)</script>',
+      session: { userId },
+    });
+    expect(invalid.ok).toBe(true);
+    if (invalid.ok) {
+      expect(invalid.previewAccessToken).toBeNull();
+    }
+
+    const valid = await resolveLocalPreviewAccess({
+      db,
+      serverId,
+      previewId: preview.id,
+      previewAccessToken: accessToken,
+      session: { userId },
+    });
+    expect(valid.ok).toBe(true);
+    if (valid.ok) {
+      expect(valid.previewAccessToken).toBe(accessToken);
+    }
+  });
 });

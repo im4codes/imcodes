@@ -10305,15 +10305,31 @@ async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath:
   };
 }
 
+function extractFsCommandSessionName(cmd: Record<string, unknown>): string {
+  for (const key of ['sessionName', 'session', 'sessionId', 'parentSession']) {
+    const value = cmd[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function isNonServerSharedActor(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const actor = raw as { origin?: unknown; snapshot?: { target?: { kind?: unknown } } };
+  if (actor.origin === 'shared-server') return false;
+  if (actor.snapshot?.target?.kind === 'server') return false;
+  return true;
+}
+
 async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
   | { ok: true; realRoot?: string; allowedRootIsFile?: boolean }
   | { ok: false; error: string }
 > {
-  const sessionName = typeof cmd.sessionName === 'string'
-    ? cmd.sessionName
-    : typeof cmd.session === 'string'
-      ? cmd.session
-      : '';
+  const sessionName = extractFsCommandSessionName(cmd);
+  const nonServerShare = isNonServerSharedActor(cmd.sharedActor);
+  if (nonServerShare && !sessionName) {
+    return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+  }
   let sessionRealRoot: string | undefined;
   if (sessionName) {
     const record = getSession(sessionName);
@@ -10326,9 +10342,15 @@ async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
       return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND };
     }
   }
+  if (nonServerShare && !sessionRealRoot) {
+    return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+  }
 
   const rawAllowedRoot = typeof cmd.allowedRoot === 'string' ? cmd.allowedRoot.trim() : '';
   if (rawAllowedRoot) {
+    if (nonServerShare) {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+    }
     const expanded = rawAllowedRoot.startsWith('~') ? rawAllowedRoot.replace(/^~/, homedir()) : rawAllowedRoot;
     const resolved = nodePath.resolve(expanded);
     try {
@@ -11237,11 +11259,7 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
         return;
       }
     }
-    const sessionName = typeof cmd.sessionName === 'string'
-      ? cmd.sessionName
-      : typeof cmd.session === 'string'
-        ? cmd.session
-        : '';
+    const sessionName = extractFsCommandSessionName(cmd);
     if (!sessionName) {
       try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
@@ -11293,7 +11311,7 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
         : null;
       const legacyPublished = !hasExplicitAllowedRoot && !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveAssistantPublishedReadTarget(
-          typeof cmd.sessionName === 'string' ? cmd.sessionName : typeof cmd.session === 'string' ? cmd.session : '',
+          extractFsCommandSessionName(cmd),
           rawPath,
         )
         : null;

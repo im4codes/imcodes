@@ -12,7 +12,8 @@ import {
   SESSION_TEXT_TAIL_CACHE_LIMIT,
 } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
-import { authorizeTimelineSession } from './timeline-session-access.js';
+import { authorizeTimelineSession, type TimelineSessionActorRole } from './timeline-session-access.js';
+import { redactPairTimelineEventForShareRole } from '../ws/share-policy.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
@@ -252,6 +253,13 @@ function textTailSignature(events: Array<{ eventId: string; ts: number; type?: s
     last?.ts ?? '',
     rolling >>> 0,
   ].join(':');
+}
+
+function redactTimelineEventForCaller(event: unknown, actorRole?: TimelineSessionActorRole): unknown {
+  if (actorRole === 'viewer' || actorRole === 'participant') {
+    return redactPairTimelineEventForShareRole(event, actorRole);
+  }
+  return event;
 }
 
 function sanitizeWatchTimelineEvent(raw: unknown): {
@@ -510,7 +518,7 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
     c.header(IMCODES_POD_HEADER, getPodIdentity());
 
     const events = (Array.isArray(response.events) ? response.events : [])
-      .map((event) => sanitizeWatchTimelineEvent(event))
+      .map((event) => sanitizeWatchTimelineEvent(redactTimelineEventForCaller(event, authorization.actorRole)))
       .filter((event): event is NonNullable<typeof event> => event !== null);
     const earliestTs = events.length > 0 && typeof events[0].ts === 'number'
       ? events[0].ts
@@ -606,7 +614,7 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
         && typeof e.sessionId === 'string'
         && typeof e.ts === 'number'
         && typeof e.type === 'string';
-    });
+    }).map((event) => redactTimelineEventForCaller(event, authorization.actorRole) as Record<string, unknown>);
     // The daemon normally enforces this too, but keep the HTTP boundary safe
     // for older daemons and protocol-faithful test daemons that may return an
     // expanded content-aware page. Retain the newest tail and expose a cursor

@@ -1174,4 +1174,91 @@ describe('Watch routes', () => {
     expect(peak).toBeGreaterThan(1);
     expect(peak).toBeLessThanOrEqual(20);
   });
+
+  it('redacts TASK_PAIR_TIMELINE_EVENT sensitive fields for viewer shares on HTTP timeline/history and timeline/history/full, while keeping participant and owner access', async () => {
+    const { TASK_PAIR_TIMELINE_EVENT } = await import('../../shared/task-pair.js');
+    const pairEvent = {
+      eventId: 'evt-pair-1',
+      sessionId: 'deck_proj_brain',
+      seq: 10,
+      epoch: 1,
+      ts: 1_000,
+      type: TASK_PAIR_TIMELINE_EVENT,
+      payload: {
+        taskId: 'tsk_secret_1',
+        verb: 'DISPATCH',
+        toStatus: 'working',
+        round: 1,
+        flags: [],
+        title: 'Secret Task Title',
+        brief: 'Confidential brief details',
+        objective: 'Secret objective',
+        executorModel: 'claude-opus-secret',
+        auditorModel: 'gpt-secret',
+        blockedNote: 'Internal blocker note',
+        decisions: [{ summary: 'Secret decision' }],
+        text: 'Leaked free-text quoting Secret Task Title and claude-opus-secret',
+      },
+    };
+    mockRequestTimelineHistory.mockResolvedValue({ epoch: 1, events: [pairEvent] });
+    const app = await buildTestApp();
+
+    // 1. Tab-share viewer: full and watch history endpoints redact sensitive keys & free-text notice
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: { effectiveRole: 'viewer', primaryShareId: 'sh-v', coveringShareIds: ['sh-v'], shares: [] },
+      },
+    });
+    const viewerFullRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain');
+    expect(viewerFullRes.status).toBe(200);
+    const viewerFullBody = await viewerFullRes.json() as { events: Array<{ payload: Record<string, unknown> }> };
+    expect(viewerFullBody.events[0]?.payload).toEqual({
+      taskId: 'tsk_secret_1',
+      verb: 'DISPATCH',
+      toStatus: 'working',
+      round: 1,
+      flags: [],
+    });
+
+    const viewerHistRes = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain');
+    expect(viewerHistRes.status).toBe(200);
+    const viewerHistBody = await viewerHistRes.json() as { events: Array<{ payload: Record<string, unknown> }> };
+    expect(viewerHistBody.events[0]?.payload.text).toBeUndefined();
+
+    // 2. Tab-share participant: retains pair brief/model/title fields matching WS policy
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: { effectiveRole: 'participant', primaryShareId: 'sh-p', coveringShareIds: ['sh-p'], shares: [] },
+      },
+    });
+    const partFullRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain');
+    expect(partFullRes.status).toBe(200);
+    const partFullBody = await partFullRes.json() as { events: Array<{ payload: Record<string, unknown> }> };
+    expect(partFullBody.events[0]?.payload).toMatchObject({
+      taskId: 'tsk_secret_1',
+      title: 'Secret Task Title',
+      brief: 'Confidential brief details',
+      executorModel: 'claude-opus-secret',
+    });
+
+    // 3. Server member / owner: retains full unredacted fields
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'owner',
+      actor: { kind: 'server-member', effectiveActorRole: 'server-manager' },
+    });
+    const ownerFullRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain');
+    expect(ownerFullRes.status).toBe(200);
+    const ownerFullBody = await ownerFullRes.json() as { events: Array<{ payload: Record<string, unknown> }> };
+    expect(ownerFullBody.events[0]?.payload).toMatchObject({
+      title: 'Secret Task Title',
+      brief: 'Confidential brief details',
+      decisions: [{ summary: 'Secret decision' }],
+    });
+  });
 });

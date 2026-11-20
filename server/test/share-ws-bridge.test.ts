@@ -3448,4 +3448,153 @@ describe('WsBridge share-scoped sockets', () => {
     expect(participantFull.sentJson.some((m) => m.type === TIMELINE_MESSAGES.EVENT)).toBe(false);
     expect(daemon.sentJson.some((m) => m.type === TIMELINE_MESSAGES.SUBSCRIBE || m.type === TIMELINE_MESSAGES.UNSUBSCRIBE)).toBe(false);
   });
+
+  it('blocks browser WS capability.* frames in both isBrowserForbiddenDaemonCommandType and sendToDaemon while allowing server-originated capability dispatch', async () => {
+    const { CAPABILITY_OPERATION_MSG, CAPABILITY_SYNC_MSG } = await import('../../shared/capability-management.js');
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    const db = makeDb(null, [], { ownerUserId: 'owner-user' });
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const browser = new MockWs();
+    bridge.handleBrowserConnection(browser as never, 'member-user', db);
+    await flushAsync();
+    browser.sent.length = 0;
+
+    browser.emit('message', JSON.stringify({
+      type: CAPABILITY_OPERATION_MSG.INSTALL,
+      requestId: 'cap-req-1',
+      operationId: 'op-evil',
+      ownerId: 'member-user',
+      revision: 1,
+    }));
+    browser.emit('message', JSON.stringify({
+      type: CAPABILITY_SYNC_MSG.REQUEST,
+      requestId: 'cap-req-2',
+    }));
+    await flushAsync();
+
+    expect(browser.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'error', code: 'server_only_command', originalType: CAPABILITY_OPERATION_MSG.INSTALL, requestId: 'cap-req-1' }),
+      expect.objectContaining({ type: 'error', code: 'server_only_command', originalType: CAPABILITY_SYNC_MSG.REQUEST, requestId: 'cap-req-2' }),
+    ]));
+    expect(daemon.sentJson.some((m) => typeof m.type === 'string' && m.type.startsWith('capability.'))).toBe(false);
+
+    // Generic sendToDaemon also drops capability.* frames unconditionally.
+    bridge.sendToDaemon(JSON.stringify({ type: CAPABILITY_OPERATION_MSG.INSTALL, operationId: 'op-direct-bypass' }));
+    await flushAsync();
+    expect(daemon.sentJson.some((m) => m.operationId === 'op-direct-bypass')).toBe(false);
+
+    // Legitimate server-originated capability route dispatch delivers directly to daemonWs.
+    const ok = bridge.dispatchCapabilityInstall('owner-user', {
+      type: CAPABILITY_OPERATION_MSG.INSTALL,
+      operationId: 'op-legit',
+      ownerId: 'owner-user',
+      revision: 1,
+      request: { kind: 'mcp', scope: 'local', source: { kind: 'url', value: 'https://example.com/mcp' } },
+    } as never);
+    expect(ok).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === CAPABILITY_OPERATION_MSG.INSTALL && m.operationId === 'op-legit')).toBe(true);
+  });
+
+  it('canonicalizes sessionName and strips client allowedRoot for non-server share fs.*/file.search frames while preserving whole-server picker', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+
+    // 1. Tab-share viewer using sessionId without sessionName + malicious allowedRoot
+    const tabTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async (params) => (
+      params.target.kind === 'server'
+        ? coverage({ kind: 'server', serverId }, 'participant', now)
+        : coverage(tabTarget, params.userId.includes('part') ? 'participant' : 'viewer', now)
+    ));
+
+    const viewerWs = new MockWs();
+    bridge.handleShareBrowserConnection(viewerWs as never, 'tab-viewer-user', makeDb(), {
+      ticketId: 'tkt-tab-viewer',
+      target: tabTarget,
+      snapshot: coverage(tabTarget, 'viewer', now),
+    });
+    daemon.sent.length = 0;
+
+    viewerWs.emit('message', JSON.stringify({
+      type: 'fs.read',
+      sessionId: 'deck_proj_brain',
+      allowedRoot: '/etc',
+      path: '/etc/passwd',
+      requestId: 'fs-viewer-read-1',
+    }));
+    viewerWs.emit('message', JSON.stringify({
+      type: 'file.search',
+      parentSession: 'deck_proj_brain',
+      allowedRoot: '/',
+      projectDir: '/',
+      query: 'secret',
+      requestId: 'fs-viewer-search-1',
+    }));
+    await flushAsync();
+
+    const readMsg = daemon.sentJson.find((m) => m.requestId === 'fs-viewer-read-1');
+    expect(readMsg).toBeDefined();
+    expect(readMsg?.sessionName).toBe('deck_proj_brain');
+    expect(readMsg?.allowedRoot).toBeUndefined();
+    expect((readMsg?.sharedActor as { origin?: string; effectiveActorRole?: string })?.origin).toBe('shared-tab');
+    expect((readMsg?.sharedActor as { origin?: string; effectiveActorRole?: string })?.effectiveActorRole).toBe('viewer');
+
+    const searchMsg = daemon.sentJson.find((m) => m.requestId === 'fs-viewer-search-1');
+    expect(searchMsg).toBeDefined();
+    expect(searchMsg?.sessionName).toBe('deck_proj_brain');
+    expect(searchMsg?.allowedRoot).toBeUndefined();
+    expect((searchMsg?.sharedActor as { origin?: string })?.origin).toBe('shared-tab');
+
+    // 2. Tab-share participant using parentSession without sessionName + malicious allowedRoot
+    const partWs = new MockWs();
+    bridge.handleShareBrowserConnection(partWs as never, 'tab-part-user', makeDb(), {
+      ticketId: 'tkt-tab-part',
+      target: tabTarget,
+      snapshot: coverage(tabTarget, 'participant', now),
+    });
+    daemon.sent.length = 0;
+
+    partWs.emit('message', JSON.stringify({
+      type: 'fs.write',
+      parentSession: 'deck_proj_brain',
+      allowedRoot: '/tmp',
+      path: '/tmp/evil.txt',
+      content: 'x',
+      requestId: 'fs-part-write-1',
+    }));
+    await flushAsync();
+
+    const writeMsg = daemon.sentJson.find((m) => m.requestId === 'fs-part-write-1');
+    expect(writeMsg).toBeDefined();
+    expect(writeMsg?.sessionName).toBe('deck_proj_brain');
+    expect(writeMsg?.allowedRoot).toBeUndefined();
+    expect((writeMsg?.sharedActor as { origin?: string; effectiveActorRole?: string })?.origin).toBe('shared-tab');
+
+    // 3. Whole-server participant directory picker (targetless fs.ls) remains allowed
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+    const serverPartWs = new MockWs();
+    bridge.handleShareBrowserConnection(serverPartWs as never, 'srv-part-user', makeDb(), {
+      ticketId: 'tkt-srv-part',
+      target: serverTarget,
+      snapshot: coverage(serverTarget, 'participant', now),
+    });
+    daemon.sent.length = 0;
+
+    serverPartWs.emit('message', JSON.stringify({
+      type: 'fs.ls',
+      path: '~',
+      requestId: 'fs-srv-picker-1',
+    }));
+    await flushAsync();
+    expect(serverPartWs.sentJson.some((m) => m.type === 'error')).toBe(false);
+    expect(daemon.sentJson.some((m) => m.requestId === 'fs-srv-picker-1')).toBe(true);
+  });
 });

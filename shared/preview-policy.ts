@@ -6,7 +6,20 @@ export const PREVIEW_SENSITIVE_HEADERS = new Set([
   'set-cookie',
   'authorization',
   'proxy-authorization',
+  'x-csrf-token',
   'x-preview-auth',
+  'x-shared-machine-authority',
+]);
+
+const PREVIEW_STRIP_REQUEST_HEADERS = new Set([
+  'host',
+  'content-length',
+  'authorization',
+  'proxy-authorization',
+  'x-csrf-token',
+  'x-preview-auth',
+  'x-server-id',
+  'x-shared-machine-authority',
 ]);
 
 export const PREVIEW_HOP_BY_HOP_HEADERS = new Set([
@@ -125,7 +138,7 @@ export function sanitizePreviewRequestHeaders(headers: Headers, previewId: strin
   const isWs = isWebSocketUpgrade(headers);
   headers.forEach((value, rawName) => {
     const name = rawName.toLowerCase();
-    if (name === 'host' || name === 'content-length') return;
+    if (PREVIEW_STRIP_REQUEST_HEADERS.has(name)) return;
     if (WS_UPGRADE_STRIP_HEADERS.has(name)) return;
     if (isWs && WS_UPGRADE_PRESERVE_HEADERS.has(name)) {
       out[name] = value;

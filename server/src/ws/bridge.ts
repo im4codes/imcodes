@@ -13610,6 +13610,7 @@ export class WsBridge {
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST
       || (typeof parsedType === 'string' && parsedType.startsWith('remote_desktop.'))
       || (typeof parsedType === 'string' && parsedType.startsWith('management_privacy.'))
+      || (typeof parsedType === 'string' && parsedType.startsWith('capability.'))
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
@@ -13672,10 +13673,11 @@ export class WsBridge {
   }
 
   private isBrowserForbiddenDaemonCommandType(type: string): boolean {
-    // Agent-skills and agent-MCP requests change what runs on the machine; they
+    // Agent-skills, agent-MCP, and capability requests change what runs on the machine; they
     // come only from the owner-checked routes, never straight from a browser.
     return type === DAEMON_COMMAND_TYPES.SERVER_DELETE
       || type.startsWith('daemon.')
+      || type.startsWith('capability.')
       || type.startsWith(AGENT_SKILLS_MESSAGE_PREFIX)
       || type.startsWith(AGENT_MCP_MESSAGE_PREFIX);
   }

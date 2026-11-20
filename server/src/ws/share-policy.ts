@@ -556,6 +556,42 @@ export function buildSharedActorEnvelope(
   };
 }
 
+const SHARE_FS_COMMANDS: ReadonlySet<string> = new Set([
+  'fs.ls',
+  'fs.read',
+  'file.search',
+  'fs.git_status',
+  'fs.git_diff',
+  'fs.mkdir',
+  'fs.write',
+  FS_TRANSPORT_MSG.RENAME,
+  FS_TRANSPORT_MSG.DELETE,
+  'fs.edit',
+  'fs.patch',
+]);
+
+function stampNonServerShareFsMessage(
+  msg: Record<string, unknown>,
+  state: ShareScopedSocketState,
+  sessionName: string,
+  now: number,
+): Record<string, unknown> {
+  const {
+    allowedRoot: _clientAllowedRoot,
+    sharedActor: _clientActor,
+    [SHARED_MACHINE_AUTHORITY_FIELD]: _clientAuthority,
+    ...rest
+  } = msg;
+  const actionId = typeof msg.requestId === 'string' && msg.requestId.trim()
+    ? msg.requestId.trim()
+    : `share-fs-${now}`;
+  return {
+    ...rest,
+    sessionName,
+    sharedActor: buildSharedActorEnvelope(state, actionId, now),
+  };
+}
+
 export function evaluateShareCommand(input: {
   msg: Record<string, unknown>;
   state: ShareScopedSocketState;
@@ -638,9 +674,16 @@ export function evaluateShareCommand(input: {
         ? { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED }
         : { allowed: true };
     }
-    return shareStateCoversSession(input.state, sessionName)
-      ? { allowed: true }
-      : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    if (!shareStateCoversSession(input.state, sessionName)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    if (input.state.target.kind !== 'server' && SHARE_FS_COMMANDS.has(type)) {
+      return {
+        allowed: true,
+        stampedMessage: stampNonServerShareFsMessage(input.msg, input.state, sessionName, input.now),
+      };
+    }
+    return { allowed: true };
   }
   if (policy.kind === 'allow-main-covered-read') {
     // A whole-server share (viewer or participant) covers every session, the
@@ -731,6 +774,12 @@ export function evaluateShareCommand(input: {
           ...rest,
           sharedActor: buildSharedActorEnvelope(input.state, `share-input-${input.state.userId}`, input.now),
         },
+      };
+    }
+    if (input.state.target.kind !== 'server' && SHARE_FS_COMMANDS.has(type)) {
+      return {
+        allowed: true,
+        stampedMessage: stampNonServerShareFsMessage(input.msg, input.state, sessionName!, input.now),
       };
     }
     return { allowed: true };
@@ -1394,22 +1443,26 @@ const SHARE_HIDDEN_PAIR_KEYS: ReadonlySet<string> = new Set([
   'brief', 'briefRevision', 'objective', 'blockedNote', 'decisionRequest', 'latestDecision', 'decisions',
 ]);
 
-function redactPairValue(value: unknown, state: ShareScopedSocketState): unknown {
-  if (Array.isArray(value)) return value.map((item) => redactPairValue(item, state));
+function redactPairValueByRole(value: unknown, effectiveRole: 'participant' | 'viewer'): unknown {
+  if (Array.isArray(value)) return value.map((item) => redactPairValueByRole(item, effectiveRole));
   if (!value || typeof value !== 'object') return value;
   const record = value as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   for (const [key, inner] of Object.entries(record)) {
-    if (key === TASK_PAIR_TITLE_ACCESS_FIELD || (state.snapshot.effectiveRole !== 'participant' && SHARE_HIDDEN_PAIR_KEYS.has(key))) continue;
-    out[key] = redactPairValue(inner, state);
+    if (key === TASK_PAIR_TITLE_ACCESS_FIELD || (effectiveRole !== 'participant' && SHARE_HIDDEN_PAIR_KEYS.has(key))) continue;
+    out[key] = redactPairValueByRole(inner, effectiveRole);
   }
   // Coverage is checked before this projection. Participants receive the
   // same Pair fields as owners; only obsolete grant identities are omitted.
   // Viewer redaction is unchanged.
   if (typeof record.taskId === 'string' && typeof record.title === 'string') {
-    out.title = state.snapshot.effectiveRole === 'participant' ? record.title : record.taskId;
+    out.title = effectiveRole === 'participant' ? record.title : record.taskId;
   }
   return out;
+}
+
+function redactPairValue(value: unknown, state: ShareScopedSocketState): unknown {
+  return redactPairValueByRole(value, state.snapshot.effectiveRole);
 }
 
 /** All console frame variants use the same participant/viewer policy; obsolete grant identities never reach a share. */
@@ -1434,15 +1487,22 @@ const SHARE_PAIR_EVENT_OPERATIONAL_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /** Covered participants receive full Pair history; viewers retain the operational allowlist. */
-function redactPairTimelineEvent(event: unknown, state: ShareScopedSocketState): unknown {
+export function redactPairTimelineEventForShareRole(
+  event: unknown,
+  effectiveRole: 'participant' | 'viewer',
+): unknown {
   if (!event || typeof event !== 'object' || Array.isArray(event)) return event;
   const record = event as Record<string, unknown>;
   if (record.type !== TASK_PAIR_TIMELINE_EVENT) return event;
-  if (state.snapshot.effectiveRole === 'participant') return redactPairValue(event, state);
+  if (effectiveRole === 'participant') return redactPairValueByRole(event, effectiveRole);
   const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
     ? Object.fromEntries(Object.entries(record.payload).filter(([key]) => SHARE_PAIR_EVENT_OPERATIONAL_KEYS.has(key)))
     : {};
   return { ...record, payload };
+}
+
+function redactPairTimelineEvent(event: unknown, state: ShareScopedSocketState): unknown {
+  return redactPairTimelineEventForShareRole(event, state.snapshot.effectiveRole);
 }
 
 function redactTimelineEventPairInfo(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {

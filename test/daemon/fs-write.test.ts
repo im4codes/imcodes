@@ -786,4 +786,52 @@ describe('fs.read handler — mtime field', () => {
     expect(mockReadFile).toHaveBeenCalledTimes(2);
     expect((sent.find((msg: any) => msg.requestId === 'req-post-write') as any)?.content).toBe('after write');
   });
+
+  it('blocks tab-share fs.write outside projectDir even when only sessionId is provided, while permitting writes inside projectDir', async () => {
+    const projectDir = path.join(homedir(), 'tab-write-proj');
+    const outsidePath = path.join(homedir(), 'outside-secret.txt');
+    const insidePath = path.join(projectDir, 'notes.txt');
+    const getSessionSpy = vi.spyOn(sessionStore, 'getSession').mockImplementation((name: string) => (
+      name === 'deck_tab_write'
+        ? { name: 'deck_tab_write', projectName: 'proj', role: 'brain', agentType: 'codex', state: 'idle', projectDir, restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1 }
+        : undefined
+    ));
+    try {
+      const tabActor = {
+        actorUserId: 'part-1',
+        origin: 'shared-tab',
+        snapshot: { target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_tab_write' }, effectiveRole: 'participant' },
+      };
+
+      mockRealpath.mockImplementation(async (target) => String(target) as unknown as string);
+      handleWebCommand({
+        type: 'fs.write',
+        sessionId: 'deck_tab_write',
+        path: outsidePath,
+        content: 'pwned',
+        requestId: 'req-write-escape',
+        sharedActor: tabActor,
+      }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[0]).toMatchObject({ requestId: 'req-write-escape', status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
+      expect(mockWriteFile).not.toHaveBeenCalled();
+
+      mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      mockWriteFile.mockResolvedValue(undefined);
+      mockStat.mockResolvedValue({ mtimeMs: 4000 } as fsp.Stats);
+      handleWebCommand({
+        type: 'fs.write',
+        sessionId: 'deck_tab_write',
+        path: insidePath,
+        content: 'allowed edit',
+        requestId: 'req-write-inside',
+        sharedActor: tabActor,
+      }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[1]).toMatchObject({ requestId: 'req-write-inside', status: 'ok', resolvedPath: insidePath });
+      expect(mockWriteFile).toHaveBeenCalledTimes(1);
+    } finally {
+      getSessionSpy.mockRestore();
+    }
+  });
 });

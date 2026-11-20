@@ -344,4 +344,55 @@ describe('local web preview routes', () => {
       expect(res.status).toBe(200);
     }
   });
+
+  it('never reflects or cookies an invalid preview_access_token XSS payload when authenticated via session cookie', async () => {
+    const daemon = new MockDaemonWs();
+    WsBridge.get(serverId).handleDaemonConnection(daemon as never, db as never, makeEnv(db) as never);
+    daemon.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId, token: 'daemon-token' })), false);
+    await new Promise((r) => setTimeout(r, 5));
+
+    const createRes = await app.request(`/api/server/${serverId}/local-web-preview`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer deck_test_key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port: 3000, path: '/' }),
+    });
+    const created = await createRes.json() as { preview: { id: string } };
+
+    // Swap daemon responder to return HTML so rewritePreviewHtmlDocument executes.
+    daemon.autoRespond = false;
+    const origSend = daemon.send.bind(daemon);
+    daemon.send = (data: string | Buffer, optsOrCb?: unknown, callback?: (err?: Error) => void) => {
+      origSend(data, optsOrCb, callback);
+      if (typeof data === 'string') {
+        const msg = JSON.parse(data) as { type?: string; requestId?: string };
+        if (msg.type === PREVIEW_MSG.REQUEST_END && msg.requestId) {
+          const requestId = msg.requestId;
+          queueMicrotask(() => {
+            daemon.emit('message', Buffer.from(JSON.stringify({
+              type: PREVIEW_MSG.RESPONSE_START,
+              requestId,
+              status: 200,
+              headers: { 'content-type': 'text/html; charset=utf-8' },
+            })), false);
+            daemon.emit('message', packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.RESPONSE_BODY, requestId, Buffer.from('<html><body>hi</body></html>')), true);
+            daemon.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.RESPONSE_END, requestId })), false);
+          });
+        }
+      }
+    };
+
+    const payload = encodeURIComponent('</script><script>alert(1)</script>');
+    const res = await app.request(
+      `/api/server/${serverId}/local-web/${created.preview.id}/?${PREVIEW_ACCESS_TOKEN_QUERY_PARAM}=${payload}`,
+      {
+        method: 'GET',
+        headers: { Cookie: sessionCookie() },
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('set-cookie')).toBeNull();
+    const html = await res.text();
+    expect(html).not.toContain('alert(1)');
+    expect(html).toContain('var ACCESS_TOKEN=null;');
+  });
 });

@@ -525,3 +525,37 @@ describe('T-R-CC1-3: shouldRewritePreviewRedirect resolves default port by proto
     expect(shouldRewritePreviewRedirect('http://127.0.0.1:9999/x', 3000)).toBe(false);
   });
 });
+
+describe('preview XSS escaping and credential header stripping', () => {
+  it('escapes </script>, HTML metacharacters, and JS line separators in buildPreviewRuntimePatch', () => {
+    const patch = buildPreviewRuntimePatch('/api/server/s</script><script>/local-web/p', 3000, 'tok</script>&\u2028\u2029');
+    // Only the outer wrapper tags exist; no embedded </script> or raw U+2028/U+2029 inside the script body.
+    expect(patch.match(/<\/script>/gi)).toHaveLength(1);
+    expect(patch).toContain('\\u003c/script\\u003e\\u003cscript\\u003e');
+    expect(patch).toContain('\\u0026');
+    expect(patch).toContain('\\u2028\\u2029');
+    expect(patch).not.toContain('\u2028');
+    expect(patch).not.toContain('\u2029');
+  });
+
+  it('strips Authorization, Proxy-Authorization, CSRF, preview auth, server id, and shared machine authority headers', () => {
+    const headers = new Headers({
+      Authorization: 'Bearer deck_secret',
+      'Proxy-Authorization': 'Basic c2VjcmV0',
+      'X-CSRF-Token': 'csrf-secret',
+      'X-Preview-Auth': 'preview-secret',
+      'X-Server-Id': 'srv-internal',
+      'X-Shared-Machine-Authority': 'signed-authority-token',
+      'X-App-Custom': 'keep-me',
+    });
+
+    const sanitized = sanitizePreviewRequestHeaders(headers, 'preview123');
+    expect(sanitized.authorization).toBeUndefined();
+    expect(sanitized['proxy-authorization']).toBeUndefined();
+    expect(sanitized['x-csrf-token']).toBeUndefined();
+    expect(sanitized['x-preview-auth']).toBeUndefined();
+    expect(sanitized['x-server-id']).toBeUndefined();
+    expect(sanitized['x-shared-machine-authority']).toBeUndefined();
+    expect(sanitized['x-app-custom']).toBe('keep-me');
+  });
+});

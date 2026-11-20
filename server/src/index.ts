@@ -1212,7 +1212,7 @@ async function handlePreviewWsUpgrade(
   const sessionCookieToken = parseCookieHeader(req.headers['cookie'] ?? '', COOKIE_SESSION);
   if (sessionCookieToken && env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(sessionCookieToken, env.JWT_SIGNING_KEY);
-    if (isAccountSessionJwt(payload)) {
+    if (isAccountSessionJwt(payload) && (payload as Record<string, unknown>).scope !== 'doc_collaborator') {
       // A disabled user's cookie is no identity (security/user-status.ts): the upgrade proceeds as an anonymous visitor, which the
       // access resolver below then decides (a preview access token may still be valid on its own).
       const decision = evaluateUserAccess(await loadUserAccess(env.DB, payload.sub), typeof payload.iat === 'number' ? payload.iat : undefined);

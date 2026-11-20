@@ -977,4 +977,86 @@ describe('fs.ls handler', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(sent).toHaveLength(0);
   });
+
+  it('enforces session projectDir for tab-share fs.ls even when only sessionId/parentSession is provided, and fails closed when unresolvable or allowedRoot escapes', async () => {
+    const projectDir = path.join(homedir(), 'shared-tab-proj');
+    const getSessionSpy = vi.spyOn(sessionStore, 'getSession').mockImplementation((name: string) => (
+      name === 'deck_tab_main'
+        ? { name: 'deck_tab_main', projectName: 'proj', role: 'brain', agentType: 'codex', state: 'idle', projectDir, restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1 }
+        : undefined
+    ));
+    try {
+      const tabSharedActor = {
+        actorUserId: 'viewer-1',
+        origin: 'shared-tab',
+        snapshot: { target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_tab_main' }, effectiveRole: 'viewer' },
+      };
+
+      // Outside path with sessionId only (no sessionName) MUST be blocked
+      mockRealpath.mockImplementation(async (p) => String(p) as unknown as string);
+      handleWebCommand({
+        type: 'fs.ls',
+        sessionId: 'deck_tab_main',
+        path: homedir(),
+        requestId: 'req-tab-escape-1',
+        sharedActor: tabSharedActor,
+      }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[0]).toMatchObject({ requestId: 'req-tab-escape-1', status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
+
+      // Client allowedRoot on a non-server share MUST fail closed
+      handleWebCommand({
+        type: 'fs.ls',
+        sessionName: 'deck_tab_main',
+        allowedRoot: homedir(),
+        path: projectDir,
+        requestId: 'req-tab-escape-2',
+        sharedActor: tabSharedActor,
+      }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[1]).toMatchObject({ requestId: 'req-tab-escape-2', status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
+
+      // Unknown session on a non-server share MUST fail closed (never skips containment)
+      handleWebCommand({
+        type: 'fs.ls',
+        sessionId: 'deck_unknown',
+        path: projectDir,
+        requestId: 'req-tab-unknown',
+        sharedActor: tabSharedActor,
+      }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[2]).toMatchObject({ requestId: 'req-tab-unknown', status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
+
+      // Legitimate in-project listing using parentSession succeeds
+      mockRealpath.mockResolvedValue(projectDir as unknown as string);
+      mockReaddir.mockResolvedValue([] as unknown as fsp.Dirent<string>[]);
+      handleWebCommand({
+        type: 'fs.ls',
+        parentSession: 'deck_tab_main',
+        path: projectDir,
+        requestId: 'req-tab-ok',
+        sharedActor: tabSharedActor,
+      }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[3]).toMatchObject({ requestId: 'req-tab-ok', status: 'ok', resolvedPath: projectDir });
+
+      // Whole-server share targetless fs.ls (directory picker) remains allowed
+      const expandedHome = homedir();
+      mockRealpath.mockResolvedValue(expandedHome as unknown as string);
+      handleWebCommand({
+        type: 'fs.ls',
+        path: expandedHome,
+        requestId: 'req-server-picker-ok',
+        sharedActor: {
+          actorUserId: 'part-1',
+          origin: 'shared-server',
+          snapshot: { target: { kind: 'server', serverId: 'srv-1' }, effectiveRole: 'participant' },
+        },
+      }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[4]).toMatchObject({ requestId: 'req-server-picker-ok', status: 'ok', resolvedPath: expandedHome });
+    } finally {
+      getSessionSpy.mockRestore();
+    }
+  });
 });
