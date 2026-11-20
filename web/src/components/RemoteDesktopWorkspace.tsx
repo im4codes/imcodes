@@ -8,6 +8,7 @@ import {
   remoteDesktopHostKey,
 } from '../remote-desktop-connection-manager.js';
 import {
+  REMOTE_DESKTOP_WALL_TAB_ID,
   REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS,
   REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
   remoteDesktopWorkspaceHosts,
