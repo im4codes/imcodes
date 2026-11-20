@@ -1343,10 +1343,23 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
     }
 
     // Default deployment WITHOUT ONLYOFFICE_DOCBUILDER_ISOLATED_URL:
-    // generic raw script is rejected with 503 BEFORE writing to scriptStore or calling OO,
-    // while trusted template create & edit continue working on shared Document Server.
+    // validated raw script continues working on shared ONLYOFFICE_INTERNAL_URL (unsafe scripts still rejected with 400),
+    // and opt-in ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED='true' rejects raw scripts with 503 while trusted templates still work.
     delete env.ONLYOFFICE_DOCBUILDER_ISOLATED_URL;
+    const defaultRawOk = await app.request('/api/cloud-docs/docbuilder', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'docx',
+        name: 'AllowedRawDefault.docx',
+        script: 'builder.CreateFile("docx"); builder.SaveFile("docx", "AllowedRawDefault.docx"); builder.CloseFile();',
+      }),
+    });
+    expect(defaultRawOk.status).toBe(201);
+
+    env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED = 'true';
     const beforeScriptsCount = memDb.scripts.size;
+    const prevDownloadedBeforeStrict = lastScriptDownloaded;
     const defaultRawCreate = await app.request('/api/cloud-docs/docbuilder', {
       method: 'POST',
       headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
@@ -1359,7 +1372,7 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
     expect(defaultRawCreate.status).toBe(503);
     expect((await defaultRawCreate.json()).error).toBe(CLOUD_DOC_ERROR_CODES.ONLYOFFICE_DISABLED);
     expect(memDb.scripts.size).toBe(beforeScriptsCount);
-    expect(lastScriptDownloaded).toBe(prevDownloaded);
+    expect(lastScriptDownloaded).toBe(prevDownloadedBeforeStrict);
 
     const defaultTemplateRes = await app.request(`/api/cloud-docs/${tplDoc.id}/docbuilder`, {
       method: 'POST',
@@ -1371,5 +1384,6 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
     });
     expect(defaultTemplateRes.status).toBe(200);
     expect(lastScriptDownloaded).toContain('SearchAndReplace');
+    delete env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED;
   });
 });

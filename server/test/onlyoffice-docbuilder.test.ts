@@ -657,7 +657,25 @@ describe('onlyoffice-docbuilder service', () => {
     expect(compiledAppend).toContain(`builder.OpenFile("${authorizedInputServer.baseUrl}/api/cloud-docs/onlyoffice/file/authorized-tok");`);
 
     // 2. Default deployment (ONLYOFFICE_DOCBUILDER_ISOLATED_URL UNSET):
-    //    Normal raw generic script MUST fail closed BEFORE writing to scriptStore or hitting shared Document Server!
+    //    Validated raw generic script runs on shared ONLYOFFICE_INTERNAL_URL by default (preserving default Cloud Docs DocBuilder),
+    //    while ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED='true' fails closed with 503 BEFORE writing to scriptStore or hitting shared Document Server.
+    sharedHits = 0;
+    storePutCalls = 0;
+    const defaultRawResult = await executeOnlyOfficeDocBuilder({
+      env: {
+        ONLYOFFICE_ENABLED: 'true',
+        ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
+        ONLYOFFICE_JWT_SECRET: OO_SECRET,
+        SERVER_URL: 'http://127.0.0.1:19138',
+        JWT_SIGNING_KEY: JWT_KEY,
+      },
+      script: 'builder.CreateFile("docx"); builder.SaveFile("docx", "generated.docx"); builder.CloseFile();',
+      scriptStore: spyScriptStore,
+    });
+    expect(defaultRawResult.bytes.toString('utf8')).toBe('PK\x03\x04template-docx');
+    expect(storePutCalls).toBe(1);
+    expect(sharedHits).toBe(2);
+
     sharedHits = 0;
     storePutCalls = 0;
     await expect(
@@ -665,6 +683,7 @@ describe('onlyoffice-docbuilder service', () => {
         env: {
           ONLYOFFICE_ENABLED: 'true',
           ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
+          ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED: 'true',
           ONLYOFFICE_JWT_SECRET: OO_SECRET,
           SERVER_URL: 'http://127.0.0.1:19138',
           JWT_SIGNING_KEY: JWT_KEY,

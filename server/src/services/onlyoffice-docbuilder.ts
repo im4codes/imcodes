@@ -380,6 +380,7 @@ export interface ExecuteDocBuilderOptions {
     | 'ONLYOFFICE_INTERNAL_URL'
     | 'ONLYOFFICE_PUBLIC_URL'
     | 'ONLYOFFICE_DOCBUILDER_ISOLATED_URL'
+    | 'ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED'
     | 'ONLYOFFICE_JWT_SECRET'
     | 'SERVER_URL'
     | 'JWT_SIGNING_KEY'
@@ -1520,10 +1521,10 @@ export async function executeOnlyOfficeDocBuilder(
 
   const isTrustedTemplate = options.template !== undefined && !options.script?.trim();
   const isolatedUrl = options.env.ONLYOFFICE_DOCBUILDER_ISOLATED_URL?.trim().replace(/\/+$/, '');
-  if (!isTrustedTemplate && !isolatedUrl) {
+  if (!isTrustedTemplate && !isolatedUrl && options.env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED === 'true') {
     throw new OnlyOfficeServiceError(
       CLOUD_DOC_ERROR_CODES.ONLYOFFICE_DISABLED,
-      'Generic DocBuilder scripts require an isolated executor (ONLYOFFICE_DOCBUILDER_ISOLATED_URL); shared Document Server only accepts trusted templates',
+      'Generic DocBuilder scripts require an isolated executor (ONLYOFFICE_DOCBUILDER_ISOLATED_URL) when ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED=true',
       503,
     );
   }
