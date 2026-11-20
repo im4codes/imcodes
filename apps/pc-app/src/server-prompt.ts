@@ -1,3 +1,4 @@
+import { normalizePcAppLocale, tPcApp } from './i18n.js';
 import { MAIN_WINDOW_WEB_PREFERENCES } from './security.js';
 import { normalizeServerOrigin, type SavedServer } from './servers.js';
 
@@ -34,11 +35,6 @@ function escapeHtml(text: string): string {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
-}
-
-function isZhLocale(locale?: string): boolean {
-  const resolved = (locale ?? Intl.DateTimeFormat().resolvedOptions().locale ?? '').trim().toLowerCase();
-  return resolved.startsWith('zh');
 }
 
 function buildWelcomeServerItems(opts?: WelcomeDataUrlOptions): WelcomeServerItem[] {
@@ -98,17 +94,17 @@ function buildWelcomeServerItems(opts?: WelcomeDataUrlOptions): WelcomeServerIte
 
 export function buildWelcomeDataUrl(optsOrSavedCount: number | WelcomeDataUrlOptions = 0): string {
   const opts: WelcomeDataUrlOptions = typeof optsOrSavedCount === 'number' ? {} : optsOrSavedCount;
-  const zh = isZhLocale(opts.locale);
+  const locale = normalizePcAppLocale(opts.locale ?? Intl.DateTimeFormat().resolvedOptions().locale);
   const items = buildWelcomeServerItems(opts);
 
-  const subtitle = zh ? '选择或添加 IM.codes 服务器' : 'Select or add an IM.codes server';
-  const defaultBadge = zh ? '官方默认' : 'Default';
-  const detectedBadge = zh ? '本机已绑定' : 'Detected locally';
-  const addHeading = zh ? '添加服务器' : 'Add Server';
+  const subtitle = tPcApp(locale, 'welcome.subtitle');
+  const defaultBadge = tPcApp(locale, 'welcome.defaultBadge');
+  const detectedBadge = tPcApp(locale, 'welcome.detectedBadge');
+  const addHeading = tPcApp(locale, 'welcome.addHeading');
   const urlPlaceholder = DEFAULT_SERVER_ORIGIN;
-  const labelPlaceholder = zh ? '显示名称（可选）' : 'Display name (optional)';
-  const connectText = zh ? '连接' : 'Connect';
-  const removeLabel = zh ? '移除' : 'Remove';
+  const labelPlaceholder = tPcApp(locale, 'welcome.labelPlaceholder');
+  const connectText = tPcApp(locale, 'welcome.connect');
+  const removeLabel = tPcApp(locale, 'welcome.remove');
 
   const errorBanner = opts.errorMessage
     ? `<div class="server-setup-banner is-error" role="alert">${escapeHtml(opts.errorMessage)}</div>`
@@ -118,8 +114,8 @@ export function buildWelcomeDataUrl(optsOrSavedCount: number | WelcomeDataUrlOpt
     .map((item) => {
       const tags: string[] = [];
       if (item.label) tags.push(escapeHtml(item.label));
-      if (item.isDefault) tags.push(defaultBadge);
-      if (item.isDetected) tags.push(detectedBadge);
+      if (item.isDefault) tags.push(escapeHtml(defaultBadge));
+      if (item.isDetected) tags.push(escapeHtml(detectedBadge));
       const statusHtml = tags.length > 0
         ? `<div class="server-setup-status">${tags.join(' · ')}</div>`
         : '';
@@ -143,7 +139,7 @@ export function buildWelcomeDataUrl(optsOrSavedCount: number | WelcomeDataUrlOpt
   const initialLabel = escapeHtml(opts.initialLabel ?? '');
 
   const html = `<!doctype html>
-<html lang="${zh ? 'zh-CN' : 'en'}">
+<html lang="${locale}">
 <head>
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';" />
@@ -362,21 +358,30 @@ export function buildWelcomeDataUrl(optsOrSavedCount: number | WelcomeDataUrlOpt
 }
 
 export function buildServerPromptDataUrl(opts?: {
+  locale?: string;
   initialUrl?: string;
   initialLabel?: string;
   errorMessage?: string;
 }): string {
+  const locale = normalizePcAppLocale(opts?.locale ?? Intl.DateTimeFormat().resolvedOptions().locale);
   const initialUrl = escapeHtml(opts?.initialUrl ?? '');
   const initialLabel = escapeHtml(opts?.initialLabel ?? '');
+  const windowTitle = escapeHtml(tPcApp(locale, 'prompt.windowTitle'));
+  const heading = escapeHtml(tPcApp(locale, 'prompt.heading'));
+  const urlLabel = escapeHtml(tPcApp(locale, 'prompt.urlLabel'));
+  const labelLabel = escapeHtml(tPcApp(locale, 'prompt.labelLabel'));
+  const labelPlaceholder = escapeHtml(tPcApp(locale, 'prompt.labelPlaceholder'));
+  const cancelLabel = escapeHtml(tPcApp(locale, 'common.cancel'));
+  const submitLabel = escapeHtml(tPcApp(locale, 'prompt.submit'));
   const errorBlock = opts?.errorMessage
     ? `<div class="err" role="alert">${escapeHtml(opts.errorMessage)}</div>`
     : '';
   const html = `<!doctype html>
-<html lang="en">
+<html lang="${locale}">
 <head>
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';" />
-  <title>Add Server</title>
+  <title>${windowTitle}</title>
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
@@ -404,16 +409,16 @@ export function buildServerPromptDataUrl(opts?: {
   </style>
 </head>
 <body>
-  <h2>Add IM.codes Server</h2>
+  <h2>${heading}</h2>
   <form action="${PROMPT_SUBMIT_ORIGIN}/submit" method="GET">
-    <label for="url">Server URL (https:// or http://localhost)</label>
+    <label for="url">${urlLabel}</label>
     <input id="url" name="url" type="text" placeholder="https://app.im.codes" value="${initialUrl}" autofocus required />
-    <label for="label">Display Name (optional)</label>
-    <input id="label" name="label" type="text" placeholder="Production" value="${initialLabel}" />
+    <label for="label">${labelLabel}</label>
+    <input id="label" name="label" type="text" placeholder="${labelPlaceholder}" value="${initialLabel}" />
     ${errorBlock}
     <div class="actions">
-      <a class="btn" href="${PROMPT_SUBMIT_ORIGIN}/cancel">Cancel</a>
-      <button type="submit">Add Server</button>
+      <a class="btn" href="${PROMPT_SUBMIT_ORIGIN}/cancel">${cancelLabel}</a>
+      <button type="submit">${submitLabel}</button>
     </div>
   </form>
 </body>
@@ -447,7 +452,11 @@ export type PromptWindowFactory = (options: {
  * Open a sandboxed, preload-free, IPC-free modal window to capture a server URL
  * and optional label. Validated via `normalizeServerOrigin()` in main process.
  */
-export function openAddServerPrompt(createPromptWindow: PromptWindowFactory): Promise<ServerPromptInput | null> {
+export function openAddServerPrompt(
+  createPromptWindow: PromptWindowFactory,
+  opts?: { locale?: string },
+): Promise<ServerPromptInput | null> {
+  const locale = normalizePcAppLocale(opts?.locale ?? Intl.DateTimeFormat().resolvedOptions().locale);
   return new Promise((resolve) => {
     let settled = false;
     const finish = (result: ServerPromptInput | null) => {
@@ -463,7 +472,7 @@ export function openAddServerPrompt(createPromptWindow: PromptWindowFactory): Pr
       minimizable: false,
       maximizable: false,
       modal: true,
-      title: 'Add IM.codes Server',
+      title: tPcApp(locale, 'prompt.heading'),
       webPreferences: {
         ...MAIN_WINDOW_WEB_PREFERENCES,
         partition: 'pc-app-prompt-ephemeral',
@@ -502,6 +511,7 @@ export function openAddServerPrompt(createPromptWindow: PromptWindowFactory): Pr
         const errorMessage = err instanceof Error ? err.message : String(err);
         void modal.loadURL(
           buildServerPromptDataUrl({
+            locale,
             initialUrl: rawUrl,
             initialLabel: rawLabel,
             errorMessage,
@@ -514,6 +524,6 @@ export function openAddServerPrompt(createPromptWindow: PromptWindowFactory): Pr
       finish(null);
     });
 
-    void modal.loadURL(buildServerPromptDataUrl());
+    void modal.loadURL(buildServerPromptDataUrl({ locale }));
   });
 }

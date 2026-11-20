@@ -33,13 +33,28 @@ i18n
 
 installTranslationCache(i18n);
 
-if (typeof document !== 'undefined' && document.documentElement) {
-  document.documentElement.lang = i18n.resolvedLanguage || i18n.language || savedLang || 'en';
-}
-i18n.on('languageChanged', (lng) => {
-  if (typeof document !== 'undefined' && document.documentElement) {
-    document.documentElement.lang = lng || 'en';
+export function syncLanguageCookie(lng: string): void {
+  try {
+    if (typeof document === 'undefined') return;
+    const resolved = (lng || 'en').trim() || 'en';
+    document.cookie = `imcodes_lang=${encodeURIComponent(resolved)}; path=/; max-age=31536000; SameSite=Lax`;
+  } catch {
+    // Ignore restricted/SSR document.cookie environments.
   }
+}
+
+const initialResolvedLang = i18n.resolvedLanguage || i18n.language || savedLang || 'en';
+if (typeof document !== 'undefined' && document.documentElement) {
+  document.documentElement.lang = initialResolvedLang;
+}
+syncLanguageCookie(initialResolvedLang);
+
+i18n.on('languageChanged', (lng) => {
+  const next = lng || 'en';
+  if (typeof document !== 'undefined' && document.documentElement) {
+    document.documentElement.lang = next;
+  }
+  syncLanguageCookie(next);
 });
 
 export default i18n;

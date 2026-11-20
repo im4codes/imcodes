@@ -1,4 +1,10 @@
 import type { BoundServerSummary } from './bind.js';
+import {
+  normalizePcAppLocale,
+  tPcApp,
+  type PcAppLocale,
+  type PcAppMessageKey,
+} from './i18n.js';
 import type { SavedServer } from './servers.js';
 
 export interface MenuItemOptionsLike {
@@ -16,6 +22,7 @@ export interface MenuItemOptionsLike {
 export interface AppMenuOptions {
   platform: NodeJS.Platform;
   appName: string;
+  locale?: PcAppLocale | string;
   servers: SavedServer[];
   activeOrigin: string | null;
   boundServer?: BoundServerSummary | null;
@@ -62,6 +69,9 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     settingsEnabled,
   } = options;
 
+  const locale = normalizePcAppLocale(options.locale);
+  const t = (key: PcAppMessageKey, vars?: Record<string, string | number>) => tPcApp(locale, key, vars);
+
   const serverItems: MenuItemOptionsLike[] = servers.length > 0
     ? servers.map((srv) => ({
         id: `server:${srv.origin}`,
@@ -73,7 +83,7 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     : [
         {
           id: 'server:none',
-          label: 'No servers saved',
+          label: t('menu.server.none'),
           enabled: false,
         },
       ];
@@ -85,27 +95,27 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
   }));
 
   const serverMenu: MenuItemOptionsLike = {
-    label: 'Server',
+    label: t('menu.server.label'),
     submenu: [
       ...serverItems,
       { type: 'separator' },
       ...(onSwitchServer
         ? [{
             id: 'server:switch',
-            label: 'Switch Server…',
+            label: t('menu.server.switch'),
             accelerator: 'CmdOrCtrl+Shift+S',
             click: onSwitchServer,
           } satisfies MenuItemOptionsLike]
         : []),
       {
         id: 'server:add',
-        label: 'Add Server…',
+        label: t('menu.server.add'),
         accelerator: 'CmdOrCtrl+Shift+N',
         click: onAddServer,
       },
       {
         id: 'server:remove-menu',
-        label: 'Remove Server',
+        label: t('menu.server.remove'),
         enabled: servers.length > 0,
         submenu: removeSubmenu,
       },
@@ -113,14 +123,17 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
       {
         id: 'server:bind-fallback',
         label: boundServer
-          ? `Rebind Machine (${boundServer.serverName} · ${boundServer.workerUrl})…`
-          : 'Bind This Machine…',
+          ? t('menu.server.rebind', {
+              serverName: boundServer.serverName,
+              workerUrl: boundServer.workerUrl,
+            })
+          : t('menu.server.bind'),
         enabled: Boolean(activeOrigin),
         click: onBindFallback,
       },
       {
         id: 'server:clear-session',
-        label: 'Clear Current Server Session',
+        label: t('menu.server.clearSession'),
         enabled: Boolean(activeOrigin),
         click: onClearSession,
       },
@@ -133,67 +146,75 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     template.push({
       label: appName,
       submenu: [
-        { role: 'about' },
+        { role: 'about', label: t('menu.app.about', { appName }) },
         { type: 'separator' },
         {
           id: 'app:settings',
-          label: 'Settings…',
+          label: t('menu.app.settings'),
           accelerator: 'CmdOrCtrl+,',
           enabled: settingsEnabled ?? Boolean(activeOrigin),
           click: () => onOpenSettings?.(),
         },
         { type: 'separator' },
-        { role: 'services' },
+        { role: 'services', label: t('menu.app.services') },
         { type: 'separator' },
-        { role: 'hide' },
-        { role: 'hideOthers' },
-        { role: 'unhide' },
+        { role: 'hide', label: t('menu.app.hide', { appName }) },
+        { role: 'hideOthers', label: t('menu.app.hideOthers') },
+        { role: 'unhide', label: t('menu.app.showAll') },
         { type: 'separator' },
-        { role: 'quit' },
+        { role: 'quit', label: t('menu.app.quit', { appName }) },
       ],
     });
   }
 
   template.push(
     {
-      label: 'Edit',
+      label: t('menu.edit.label'),
       submenu: [
-        { role: 'undo' },
-        { role: 'redo' },
+        { role: 'undo', label: t('menu.edit.undo') },
+        { role: 'redo', label: t('menu.edit.redo') },
         { type: 'separator' },
-        { role: 'cut' },
-        { role: 'copy' },
-        { role: 'paste' },
-        { role: 'selectAll' },
+        { role: 'cut', label: t('menu.edit.cut') },
+        { role: 'copy', label: t('menu.edit.copy') },
+        { role: 'paste', label: t('menu.edit.paste') },
+        { role: 'selectAll', label: t('menu.edit.selectAll') },
       ],
     },
     {
-      label: 'View',
+      label: t('menu.view.label'),
       submenu: [
-        { id: 'view:reload', label: 'Reload', accelerator: 'CmdOrCtrl+R', click: onReload },
-        { id: 'view:force-reload', label: 'Force Reload', accelerator: 'CmdOrCtrl+Shift+R', click: onForceReload },
-        { id: 'view:devtools', label: 'Toggle Developer Tools', accelerator: 'Alt+CmdOrCtrl+I', click: onToggleDevTools },
+        { id: 'view:reload', label: t('menu.view.reload'), accelerator: 'CmdOrCtrl+R', click: onReload },
+        { id: 'view:force-reload', label: t('menu.view.forceReload'), accelerator: 'CmdOrCtrl+Shift+R', click: onForceReload },
+        { id: 'view:devtools', label: t('menu.view.devTools'), accelerator: 'Alt+CmdOrCtrl+I', click: onToggleDevTools },
         { type: 'separator' },
-        { role: 'resetZoom' },
-        { role: 'zoomIn' },
-        { role: 'zoomOut' },
+        { role: 'resetZoom', label: t('menu.view.resetZoom') },
+        { role: 'zoomIn', label: t('menu.view.zoomIn') },
+        { role: 'zoomOut', label: t('menu.view.zoomOut') },
         { type: 'separator' },
-        { role: 'togglefullscreen' },
+        { role: 'togglefullscreen', label: t('menu.view.toggleFullScreen') },
       ],
     },
     serverMenu,
     {
-      label: 'Window',
+      label: t('menu.window.label'),
       submenu: platform === 'darwin'
-        ? [{ role: 'minimize' }, { role: 'zoom' }, { type: 'separator' }, { role: 'front' }]
-        : [{ role: 'minimize' }, { role: 'close' }],
+        ? [
+            { role: 'minimize', label: t('menu.window.minimize') },
+            { role: 'zoom', label: t('menu.window.zoom') },
+            { type: 'separator' },
+            { role: 'front', label: t('menu.window.front') },
+          ]
+        : [
+            { role: 'minimize', label: t('menu.window.minimize') },
+            { role: 'close', label: t('menu.window.close') },
+          ],
     },
     {
-      label: 'Help',
+      label: t('menu.help.label'),
       submenu: [
         {
           id: 'help:docs',
-          label: 'IM.codes Documentation',
+          label: t('menu.help.docs'),
           click: onOpenDocs,
         },
       ],

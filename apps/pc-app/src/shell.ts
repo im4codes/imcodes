@@ -1,10 +1,19 @@
 import path from 'node:path';
 import {
   BindCoordinator,
+  sameOriginNamedCookie,
   type BindCoordinatorDeps,
   type CookiesChangeEventLike,
   type LaunchAgentIssue,
 } from './bind.js';
+import {
+  PC_APP_LOCALE_COOKIE,
+  PcAppLocaleStore,
+  normalizePcAppLocale,
+  parseLocaleCookieValue,
+  tPcApp,
+  type PcAppLocale,
+} from './i18n.js';
 import { buildAppMenuTemplate, type MenuItemOptionsLike } from './menu.js';
 import {
   attachWindowSecurityGuards,
@@ -35,6 +44,7 @@ export interface ShellWindowLike extends TrustedWindowLike {
       clearStorageData?(options?: { origin?: string }): Promise<void>;
     };
     on(event: 'did-navigate', listener: () => void): unknown;
+    on(event: 'did-finish-load', listener: () => void): unknown;
     reload(): void;
     reloadIgnoringCache(): void;
     toggleDevTools(): void;
@@ -71,6 +81,7 @@ export interface PcAppShellDeps {
   promptAddServer?: () => Promise<ServerPromptInput | null>;
   detectLocalBoundOrigin?: () => string | { origin: string; label?: string } | null;
   welcomeLocale?: string;
+  onOpenSettings?: () => void;
   onBindFallback?: (trustedOrigin: string | null) => Promise<void> | void;
   bindDeps?: Partial<
     Omit<
@@ -90,6 +101,7 @@ export interface PcAppShellInstance {
   store: ServerStore;
   controller: TrustedOriginController;
   bind: BindCoordinator;
+  getLocale: () => PcAppLocale;
   getWindow: () => ShellWindowLike | null;
   ensureWindow: () => Promise<ShellWindowLike>;
   showServerPicker: () => Promise<void>;
@@ -106,12 +118,17 @@ export interface PcAppShellInstance {
  */
 export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
   const store = new ServerStore(deps.userDataDir);
+  const localeStore = new PcAppLocaleStore(deps.userDataDir);
+  let lastPersistedLocale: PcAppLocale | null = localeStore.load();
+  let activeLocale: PcAppLocale =
+    lastPersistedLocale ?? normalizePcAppLocale(deps.welcomeLocale ?? Intl.DateTimeFormat().resolvedOptions().locale);
   let mainWindow: ShellWindowLike | null = null;
   const controller = new TrustedOriginController(store, () => mainWindow);
   const bind = new BindCoordinator({
     keptBindingStorePath: path.join(deps.userDataDir, 'kept-bindings.json'),
     ...(deps.bindDeps ?? {}),
     platform: deps.platform,
+    locale: activeLocale,
     getCurrentTrustedOrigin: () => controller.currentTrustedOrigin(),
     onDidNavigateTrustedOrigin: (listener) => controller.onDidNavigateTrustedOrigin(listener),
     showMessageBox: async (options) => {
@@ -162,10 +179,51 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       buildWelcomeDataUrl({
         servers: store.list(),
         detectedServer: detectLocalBoundServer(),
-        locale: deps.welcomeLocale,
+        locale: activeLocale,
         ...extra,
       }),
     );
+  };
+
+  const applyLocale = async (nextLocale: PcAppLocale, persist = true) => {
+    if (persist && nextLocale !== lastPersistedLocale) {
+      localeStore.save(nextLocale);
+      lastPersistedLocale = nextLocale;
+    }
+    if (nextLocale === activeLocale) return;
+    activeLocale = nextLocale;
+    bind.setLocale(activeLocale);
+    rebuildMenu();
+    if (
+      mainWindow &&
+      !mainWindow.isDestroyed() &&
+      controller.getActiveOrigin() === null &&
+      mainWindow.webContents.getURL().startsWith('data:text/html')
+    ) {
+      await loadWelcomeScreen(mainWindow);
+    }
+  };
+
+  const syncLocaleFromOriginCookies = async (origin: string) => {
+    const win = mainWindow;
+    const cookiesApi = win && !win.isDestroyed() ? win.webContents.session.cookies : undefined;
+    if (!cookiesApi) return;
+    try {
+      const found = await cookiesApi.get({ url: origin, name: PC_APP_LOCALE_COOKIE });
+      const matching = found.find(
+        (c) =>
+          c.name === PC_APP_LOCALE_COOKIE &&
+          Boolean(c.value) &&
+          (!c.domain || sameOriginNamedCookie(c, origin, PC_APP_LOCALE_COOKIE)),
+      );
+      if (!matching?.value) return;
+      const parsed = parseLocaleCookieValue(matching.value);
+      if (parsed) {
+        await applyLocale(parsed, true);
+      }
+    } catch {
+      // Ignore transient session cookie read failures.
+    }
   };
 
   const loadWelcomeOrLastServer = async (win: ShellWindowLike) => {
@@ -185,7 +243,9 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
 
   const handleAddServer = async () => {
     const win = await ensureWindow();
-    const promptFn = deps.promptAddServer ?? (() => openAddServerPrompt(deps.createPromptWindow));
+    const promptFn =
+      deps.promptAddServer ??
+      (() => openAddServerPrompt(deps.createPromptWindow, { locale: activeLocale }));
     const input = await promptFn();
     if (!input) return;
     const saved = store.addServer(input.origin, input.label);
@@ -206,9 +266,12 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     if (win && !win.isDestroyed()) {
       const { response } = await deps.showMessageBox(win, {
         type: 'question',
-        title: 'Remove Server',
-        message: `Remove ${origin} from saved servers?`,
-        buttons: ['Cancel', 'Remove'],
+        title: tPcApp(activeLocale, 'dialog.removeServer.title'),
+        message: tPcApp(activeLocale, 'dialog.removeServer.message', { origin }),
+        buttons: [
+          tPcApp(activeLocale, 'common.cancel'),
+          tPcApp(activeLocale, 'common.remove'),
+        ],
         defaultId: 1,
         cancelId: 0,
       });
@@ -262,6 +325,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     const template = buildAppMenuTemplate({
       platform: deps.platform,
       appName: deps.appName,
+      locale: activeLocale,
       servers: store.list(),
       activeOrigin: controller.getActiveOrigin(),
       boundServer: bind.getBoundSummary(),
@@ -402,9 +466,30 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       rebuildMenu();
     });
 
+    win.webContents.on('did-finish-load', () => {
+      const origin = controller.currentTrustedOrigin();
+      if (origin) {
+        void syncLocaleFromOriginCookies(origin);
+      }
+    });
+
     if (win.webContents.session.cookies) {
       bind.attachCookies(win.webContents.session.cookies);
+      win.webContents.session.cookies.on('changed', (_event, cookie, _cause, removed) => {
+        if (removed) return;
+        const origin = controller.currentTrustedOrigin();
+        if (!origin) return;
+        if (!sameOriginNamedCookie(cookie, origin, PC_APP_LOCALE_COOKIE)) return;
+        const parsed = parseLocaleCookieValue(cookie.value);
+        if (parsed) {
+          void applyLocale(parsed, true);
+        }
+      });
     }
+
+    controller.onDidNavigateTrustedOrigin((origin) => {
+      void syncLocaleFromOriginCookies(origin);
+    });
 
     win.on('closed', () => {
       if (mainWindow === win) {
@@ -422,6 +507,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     store,
     controller,
     bind,
+    getLocale: () => activeLocale,
     getWindow: () => mainWindow,
     ensureWindow,
     showServerPicker,

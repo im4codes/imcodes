@@ -2,6 +2,7 @@ import { execFile, spawn, type SpawnOptions } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { normalizePcAppLocale, tPcApp, type PcAppLocale } from './i18n.js';
 import { normalizeServerOrigin } from './servers.js';
 
 /** Matches shared/cookie-names.ts COOKIE_SESSION without breaking pc-app's rootDir. */
@@ -96,6 +97,7 @@ export type TmuxProbe = (env: NodeJS.ProcessEnv) => Promise<boolean> | boolean;
 
 export interface BindCoordinatorDeps {
   platform: NodeJS.Platform;
+  locale?: PcAppLocale | string;
   getCurrentTrustedOrigin: () => string | null;
   onDidNavigateTrustedOrigin: (listener: (origin: string) => void) => () => void;
   showMessageBox: (options: BindMessageBoxOptions) => Promise<{ response: number }>;
@@ -191,10 +193,14 @@ export function resolveImcodesBinPath(options: {
 }
 
 /**
- * Verify a cookie event belongs strictly to `origin` and matches COOKIE_SESSION (`rcc_session`).
+ * Verify a cookie event belongs strictly to `origin` and matches `cookieName`.
  */
-export function sameOriginCookie(cookie: CookieLike, origin: string): boolean {
-  if (cookie.name !== COOKIE_SESSION) return false;
+export function sameOriginNamedCookie(
+  cookie: CookieLike,
+  origin: string,
+  cookieName: string,
+): boolean {
+  if (cookie.name !== cookieName) return false;
   let parsed: URL;
   try {
     parsed = new URL(origin);
@@ -222,6 +228,13 @@ export function sameOriginCookie(cookie: CookieLike, origin: string): boolean {
     parsed.pathname === cookiePath ||
     parsed.pathname.startsWith(cookiePath.endsWith('/') ? cookiePath : `${cookiePath}/`)
   );
+}
+
+/**
+ * Verify a cookie event belongs strictly to `origin` and matches COOKIE_SESSION (`rcc_session`).
+ */
+export function sameOriginCookie(cookie: CookieLike, origin: string): boolean {
+  return sameOriginNamedCookie(cookie, origin, COOKIE_SESSION);
 }
 
 export function readServerJsonOrNull(
@@ -443,9 +456,11 @@ export function parseLaunchAgentPlistPaths(xml: string): {
 export function inspectMacosLaunchAgentPlist(options: {
   platform: NodeJS.Platform;
   plistPath: string;
+  locale?: PcAppLocale | string;
   existsSync?: (filePath: string) => boolean;
   readFileSync?: (filePath: string, encoding: 'utf8') => string;
 }): LaunchAgentIssue {
+  const locale = normalizePcAppLocale(options.locale);
   if (options.platform !== 'darwin') {
     return {
       status: 'skipped_non_darwin',
@@ -471,9 +486,9 @@ export function inspectMacosLaunchAgentPlist(options: {
       status: 'invalid_plist',
       missingPrograms: [],
       missingBundledPaths: [],
-      warningTitle: 'Daemon LaunchAgent Unreadable',
-      warningMessage: 'Existing macOS LaunchAgent configuration could not be read.',
-      warningDetail: `Inspect ${options.plistPath} or choose Rebind Now from the Server menu to regenerate it.`,
+      warningTitle: tPcApp(locale, 'launchAgent.unreadable.title'),
+      warningMessage: tPcApp(locale, 'launchAgent.unreadable.message'),
+      warningDetail: tPcApp(locale, 'launchAgent.unreadable.detail', { plistPath: options.plistPath }),
     };
   }
 
@@ -508,28 +523,31 @@ export function inspectMacosLaunchAgentPlist(options: {
   let warningMessage: string;
   const detailParts: string[] = [];
   if (missingPrograms.length > 0 && missingBundledPaths.length > 0) {
-    warningMessage =
-      'Background daemon cannot start and cannot find bundled tmux because paths in the LaunchAgent no longer exist.';
-    detailParts.push(`Missing daemon program path(s):\n  ${missingPrograms.join('\n  ')}`);
-    detailParts.push(`Missing bundled tmux PATH entry:\n  ${missingBundledPaths.join('\n  ')}`);
+    warningMessage = tPcApp(locale, 'launchAgent.missing.bothMessage');
+    detailParts.push(
+      tPcApp(locale, 'launchAgent.missing.programsDetail', { paths: missingPrograms.join('\n  ') }),
+    );
+    detailParts.push(
+      tPcApp(locale, 'launchAgent.missing.tmuxDetail', { paths: missingBundledPaths.join('\n  ') }),
+    );
   } else if (missingPrograms.length > 0) {
-    warningMessage =
-      'Background daemon cannot start because the ProgramArguments target in LaunchAgent no longer exists.';
-    detailParts.push(`Missing daemon program path(s):\n  ${missingPrograms.join('\n  ')}`);
+    warningMessage = tPcApp(locale, 'launchAgent.missing.progMessage');
+    detailParts.push(
+      tPcApp(locale, 'launchAgent.missing.programsDetail', { paths: missingPrograms.join('\n  ') }),
+    );
   } else {
-    warningMessage =
-      'Background daemon cannot find bundled tmux because the bundled PATH entry in LaunchAgent no longer exists.';
-    detailParts.push(`Missing bundled tmux PATH entry:\n  ${missingBundledPaths.join('\n  ')}`);
+    warningMessage = tPcApp(locale, 'launchAgent.missing.tmuxMessage');
+    detailParts.push(
+      tPcApp(locale, 'launchAgent.missing.tmuxDetail', { paths: missingBundledPaths.join('\n  ') }),
+    );
   }
-  detailParts.push(
-    'This typically happens after moving or uninstalling IM.codes.app. Choose Rebind Now to update the LaunchAgent safely.',
-  );
+  detailParts.push(tPcApp(locale, 'launchAgent.missing.footerDetail'));
 
   return {
     status: 'missing_paths',
     missingPrograms,
     missingBundledPaths,
-    warningTitle: 'Daemon Startup Configuration Needs Rebind',
+    warningTitle: tPcApp(locale, 'launchAgent.missing.title'),
     warningMessage,
     warningDetail: detailParts.join('\n\n'),
   };
@@ -552,8 +570,10 @@ export class BindCoordinator {
   private readonly cliTimeoutMs: number;
   private readonly keptBindingStorePath: string | null;
   private keptBindings: Record<string, string>;
+  private locale: PcAppLocale;
 
   constructor(private readonly deps: BindCoordinatorDeps) {
+    this.locale = normalizePcAppLocale(deps.locale);
     this.baseEnv = deps.env ?? process.env;
     this.fetchImpl = deps.fetch ?? globalThis.fetch;
     this.checkExists = deps.existsSync ?? existsSync;
@@ -632,6 +652,10 @@ export class BindCoordinator {
     this.persistKeptBindings();
   }
 
+  setLocale(locale: PcAppLocale | string): void {
+    this.locale = normalizePcAppLocale(locale);
+  }
+
   getBoundSummary(): BoundServerSummary | null {
     const existing = readServerJsonOrNull(this.imcodesHome, {
       existsSync: this.checkExists,
@@ -699,9 +723,9 @@ export class BindCoordinator {
     if (!origin) {
       await this.deps.showMessageBox({
         type: 'info',
-        title: 'Bind This Machine',
-        message: 'Select a saved server before binding this machine.',
-        buttons: ['OK'],
+        title: tPcApp(this.locale, 'bind.manual.noOrigin.title'),
+        message: tPcApp(this.locale, 'bind.manual.noOrigin.message'),
+        buttons: [tPcApp(this.locale, 'common.ok')],
         defaultId: 0,
       });
       return { status: 'untrusted' };
@@ -726,9 +750,9 @@ export class BindCoordinator {
         if (opts.manual) {
           await this.deps.showMessageBox({
             type: 'warning',
-            title: 'Bind This Machine',
-            message: 'Browser session cookies are unavailable in this window.',
-            buttons: ['OK'],
+            title: tPcApp(this.locale, 'bind.manual.noCookies.title'),
+            message: tPcApp(this.locale, 'bind.manual.noCookies.message'),
+            buttons: [tPcApp(this.locale, 'common.ok')],
             defaultId: 0,
           });
         }
@@ -741,9 +765,9 @@ export class BindCoordinator {
         if (opts.manual) {
           await this.deps.showMessageBox({
             type: 'info',
-            title: 'Sign In Required',
-            message: `Sign in to ${origin} first to bind this machine.`,
-            buttons: ['OK'],
+            title: tPcApp(this.locale, 'bind.manual.signIn.title'),
+            message: tPcApp(this.locale, 'bind.manual.signIn.message', { origin }),
+            buttons: [tPcApp(this.locale, 'common.ok')],
             defaultId: 0,
           });
         }
@@ -800,14 +824,17 @@ export class BindCoordinator {
   private async askReplaceBinding(existing: ServerCredentials, targetOrigin: string): Promise<boolean> {
     const { response } = await this.deps.showMessageBox({
       type: 'question',
-      title: 'Replace Existing Server Binding?',
-      message: 'This machine is already bound to an IM.codes server.',
-      detail: [
-        `Currently bound to:\n  ${existing.serverName} · ${existing.workerUrl}`,
-        `Signed in to:\n  ${targetOrigin}`,
-        'Keep existing does nothing. Choose Replace to bind this machine to the current server.',
-      ].join('\n\n'),
-      buttons: ['Keep Existing', 'Replace'],
+      title: tPcApp(this.locale, 'bind.replace.title'),
+      message: tPcApp(this.locale, 'bind.replace.message'),
+      detail: tPcApp(this.locale, 'bind.replace.detail', {
+        serverName: existing.serverName,
+        workerUrl: existing.workerUrl,
+        targetOrigin,
+      }),
+      buttons: [
+        tPcApp(this.locale, 'bind.replace.keep'),
+        tPcApp(this.locale, 'bind.replace.replace'),
+      ],
       defaultId: 0,
       cancelId: 0,
     });
@@ -852,8 +879,8 @@ export class BindCoordinator {
       const serverName = updated?.serverName ?? host;
       this.deps.onStateChanged?.();
       this.deps.showNotification({
-        title: 'IM.codes Machine Bound',
-        body: `Bound to ${serverName}. Background service installed and will auto-start on login.`,
+        title: tPcApp(this.locale, 'bind.success.title'),
+        body: tPcApp(this.locale, 'bind.success.body', { serverName }),
       });
       return;
     }
@@ -963,20 +990,20 @@ export class BindCoordinator {
 
   private async presentBindFailure(origin: string, err: BindError): Promise<void> {
     const manualHint = err.manualCommand
-      ? `Manual command:\n  ${err.manualCommand}`
-      : `Retry via Server -> Bind This Machine or run:\n  imcodes bind ${origin}/bind/<api-key> ${this.getHostname()}`;
+      ? tPcApp(this.locale, 'bind.failure.manualCommand', { command: err.manualCommand })
+      : tPcApp(this.locale, 'bind.failure.manualFallback', { origin, host: this.getHostname() });
 
     if (err.kind === 'mint_key_unknown') {
       await this.deps.showMessageBox({
         type: 'warning',
-        title: 'Machine Bind Status Uncertain',
-        message: 'Could not confirm whether a new API key was created on the server.',
+        title: tPcApp(this.locale, 'bind.failure.uncertainTitle'),
+        message: tPcApp(this.locale, 'bind.failure.mintUnknownMessage'),
         detail: [
           err.message,
-          `Please check your API keys in the ${origin} web dashboard before retrying.`,
+          tPcApp(this.locale, 'bind.failure.mintUnknownCheck', { origin }),
           manualHint,
         ].join('\n\n'),
-        buttons: ['OK'],
+        buttons: [tPcApp(this.locale, 'common.ok')],
         defaultId: 0,
       });
       return;
@@ -985,14 +1012,14 @@ export class BindCoordinator {
     if (err.kind === 'cli_failed_uncertain') {
       await this.deps.showMessageBox({
         type: 'warning',
-        title: 'Machine Bind Status Uncertain',
-        message: 'The bind command did not finish cleanly; the minted API key was kept for safety.',
+        title: tPcApp(this.locale, 'bind.failure.uncertainTitle'),
+        message: tPcApp(this.locale, 'bind.failure.cliUncertainMessage'),
         detail: [
           err.stderr || err.message,
-          `Please check ${origin} to verify whether this machine appears online or revoke unused keys.`,
+          tPcApp(this.locale, 'bind.failure.cliUncertainCheck', { origin }),
           manualHint,
         ].join('\n\n'),
-        buttons: ['OK'],
+        buttons: [tPcApp(this.locale, 'common.ok')],
         defaultId: 0,
       });
       return;
@@ -1000,13 +1027,13 @@ export class BindCoordinator {
 
     await this.deps.showMessageBox({
       type: 'error',
-      title: 'Machine Bind Failed',
+      title: tPcApp(this.locale, 'bind.failure.failedTitle'),
       message:
         err.kind === 'mint_key_rejected'
-          ? `Server refused to create a bind key (${err.message}).`
-          : 'Failed to bind this machine via imcodes CLI.',
+          ? tPcApp(this.locale, 'bind.failure.mintRejectedMessage', { error: err.message })
+          : tPcApp(this.locale, 'bind.failure.cliFailedMessage'),
       detail: [err.stderr || err.message, manualHint].join('\n\n'),
-      buttons: ['OK'],
+      buttons: [tPcApp(this.locale, 'common.ok')],
       defaultId: 0,
     });
   }
@@ -1015,6 +1042,7 @@ export class BindCoordinator {
     const check = inspectMacosLaunchAgentPlist({
       platform: this.deps.platform,
       plistPath: this.plistPath,
+      locale: this.locale,
       existsSync: this.checkExists,
       readFileSync: this.readFile,
     });
@@ -1025,10 +1053,13 @@ export class BindCoordinator {
 
     const { response } = await this.deps.showMessageBox({
       type: 'warning',
-      title: check.warningTitle ?? 'Daemon Startup Check',
-      message: check.warningMessage ?? 'LaunchAgent configuration needs attention.',
+      title: check.warningTitle ?? tPcApp(this.locale, 'launchAgent.prompt.fallbackTitle'),
+      message: check.warningMessage ?? tPcApp(this.locale, 'launchAgent.prompt.fallbackMessage'),
       detail: check.warningDetail,
-      buttons: ['Later', 'Rebind Now'],
+      buttons: [
+        tPcApp(this.locale, 'launchAgent.prompt.later'),
+        tPcApp(this.locale, 'launchAgent.prompt.rebindNow'),
+      ],
       defaultId: 1,
       cancelId: 0,
     });

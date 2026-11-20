@@ -1,9 +1,11 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { MenuItemOptionsLike } from '../src/menu.js';
+import type { CookieLike, CookiesChangeEventLike } from '../src/bind.js';
+import { PC_APP_LOCALES, tPcApp } from '../src/i18n.js';
+import { buildAppMenuTemplate, type MenuItemOptionsLike } from '../src/menu.js';
 import { MAIN_WINDOW_WEB_PREFERENCES } from '../src/security.js';
 import { buildWelcomeDataUrl, openAddServerPrompt } from '../src/server-prompt.js';
 import { createPcAppShell, type ShellWindowLike } from '../src/shell.js';
@@ -11,6 +13,7 @@ import { createPcAppShell, type ShellWindowLike } from '../src/shell.js';
 function createFakeShellWindow(opts: {
   webPreferences: typeof MAIN_WINDOW_WEB_PREFERENCES;
   loadSpy?: (url: string) => Promise<void> | void;
+  cookies?: CookiesChangeEventLike;
 }): ShellWindowLike & {
   emitter: EventEmitter;
   webContentsEmitter: EventEmitter;
@@ -25,6 +28,7 @@ function createFakeShellWindow(opts: {
     setPermissionRequestHandler: vi.fn(),
     setPermissionCheckHandler: vi.fn(),
     clearStorageData: vi.fn(async () => {}),
+    ...(opts.cookies ? { cookies: opts.cookies } : {}),
   });
 
   const webContents = Object.assign(webContentsEmitter, {
@@ -421,6 +425,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       platform: 'darwin',
       appName: 'IM.codes',
       userDataDir: tempDir,
+      welcomeLocale: 'en',
       createMainWindow: (opts) => {
         createdWin = createFakeShellWindow({ webPreferences: opts.webPreferences });
         return createdWin;
@@ -481,6 +486,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       platform: 'win32',
       appName: 'IM.codes',
       userDataDir: tempDir,
+      welcomeLocale: 'en',
       createMainWindow: (opts) => createFakeShellWindow({ webPreferences: opts.webPreferences }),
       createPromptWindow: () => {
         throw new Error('unused');
@@ -495,5 +501,215 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
 
     await shell.ensureWindow();
     expect(findMenuItem(latestMenu, 'app:settings')).toBeUndefined();
+  });
+
+  it('builds localized native menus across all 7 locales while preserving item IDs and accelerators', () => {
+    const enMenu = buildAppMenuTemplate({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      locale: 'en',
+      servers: [{ origin: 'https://app.im.codes', label: 'Prod', addedAt: 1 }],
+      activeOrigin: 'https://app.im.codes',
+      onSelectServer: () => {},
+      onAddServer: () => {},
+      onSwitchServer: () => {},
+      onRemoveServer: () => {},
+      onOpenSettings: () => {},
+      onReload: () => {},
+      onForceReload: () => {},
+      onToggleDevTools: () => {},
+      onClearSession: () => {},
+      onBindFallback: () => {},
+      onOpenDocs: () => {},
+    });
+
+    const collectIdsAndAccelerators = (items: MenuItemOptionsLike[]): Array<[string | undefined, string | undefined]> => {
+      const out: Array<[string | undefined, string | undefined]> = [];
+      for (const item of items) {
+        if (item.id && !item.id.startsWith('server:http') && !item.id.startsWith('remove:http')) {
+          out.push([item.id, item.accelerator]);
+        }
+        if (item.submenu) {
+          out.push(...collectIdsAndAccelerators(item.submenu));
+        }
+      }
+      return out;
+    };
+    const expectedIds = collectIdsAndAccelerators(enMenu);
+
+    for (const locale of PC_APP_LOCALES) {
+      const menu = buildAppMenuTemplate({
+        platform: 'darwin',
+        appName: 'IM.codes',
+        locale,
+        servers: [{ origin: 'https://app.im.codes', label: 'Prod', addedAt: 1 }],
+        activeOrigin: 'https://app.im.codes',
+        onSelectServer: () => {},
+        onAddServer: () => {},
+        onSwitchServer: () => {},
+        onRemoveServer: () => {},
+        onOpenSettings: () => {},
+        onReload: () => {},
+        onForceReload: () => {},
+        onToggleDevTools: () => {},
+        onClearSession: () => {},
+        onBindFallback: () => {},
+        onOpenDocs: () => {},
+      });
+      expect(collectIdsAndAccelerators(menu)).toEqual(expectedIds);
+      expect(findMenuItem(menu, 'app:settings')?.label).toBe(tPcApp(locale, 'menu.app.settings'));
+      expect(findMenuItem(menu, 'app:settings')?.accelerator).toBe('CmdOrCtrl+,');
+      expect(findMenuItem(menu, 'server:switch')?.label).toBe(tPcApp(locale, 'menu.server.switch'));
+      expect(findMenuItem(menu, 'server:add')?.label).toBe(tPcApp(locale, 'menu.server.add'));
+      expect(findMenuItem(menu, 'help:docs')?.label).toBe(tPcApp(locale, 'menu.help.docs'));
+      expect(menu.find((m) => m.label === tPcApp(locale, 'menu.edit.label'))).toBeDefined();
+      expect(menu.find((m) => m.label === tPcApp(locale, 'menu.view.label'))).toBeDefined();
+      expect(menu.find((m) => m.label === tPcApp(locale, 'menu.server.label'))).toBeDefined();
+      expect(menu.find((m) => m.label === tPcApp(locale, 'menu.window.label'))).toBeDefined();
+      expect(menu.find((m) => m.label === tPcApp(locale, 'menu.help.label'))).toBeDefined();
+    }
+
+    const zhMenu = buildAppMenuTemplate({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      locale: 'zh-CN',
+      servers: [],
+      activeOrigin: null,
+      onSelectServer: () => {},
+      onAddServer: () => {},
+      onSwitchServer: () => {},
+      onRemoveServer: () => {},
+      onOpenSettings: () => {},
+      onReload: () => {},
+      onForceReload: () => {},
+      onToggleDevTools: () => {},
+      onClearSession: () => {},
+      onBindFallback: () => {},
+      onOpenDocs: () => {},
+    });
+    expect(findMenuItem(zhMenu, 'app:settings')?.label).toBe('设置…');
+    expect(findMenuItem(zhMenu, 'server:none')?.label).toBe('未保存服务器');
+    expect(findMenuItem(zhMenu, 'server:switch')?.label).toBe('切换服务器…');
+  });
+
+  it('syncs active locale in real time from active-origin imcodes_lang cookie, ignores untrusted origins and malformed values, and persists across restarts', async () => {
+    const cookieEmitter = new EventEmitter();
+    const initialCookies: CookieLike[] = [];
+    const cookies: CookiesChangeEventLike = {
+      on: (event, listener) => cookieEmitter.on(event, listener),
+      get: async ({ name }) => initialCookies.filter((c) => c.name === name),
+    };
+
+    const menus: MenuItemOptionsLike[][] = [];
+    const dialogPrompts: Array<{ title: string; message: string; buttons: string[] }> = [];
+    let createdWin!: ReturnType<typeof createFakeShellWindow>;
+
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      welcomeLocale: 'en',
+      createMainWindow: (opts) => {
+        createdWin = createFakeShellWindow({ webPreferences: opts.webPreferences, cookies });
+        return createdWin;
+      },
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: (template) => {
+        menus.push(template);
+      },
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async (_win, opts) => {
+        dialogPrompts.push({ title: opts.title, message: opts.message, buttons: opts.buttons });
+        return { response: 0 };
+      },
+    });
+
+    await shell.addAndSelectServer('https://prod.im.codes', 'Prod');
+    expect(shell.getLocale()).toBe('en');
+    expect(findMenuItem(menus.at(-1)!, 'app:settings')?.label).toBe('Settings…');
+
+    // Untrusted/inactive origin imcodes_lang cookie MUST be ignored (§4.7)
+    cookieEmitter.emit(
+      'changed',
+      {},
+      { name: 'imcodes_lang', value: 'zh-CN', domain: 'evil.example', path: '/' },
+      'explicit',
+      false,
+    );
+    expect(shell.getLocale()).toBe('en');
+
+    // Malformed URI cookie value on trusted origin MUST NOT throw and keeps current locale
+    cookieEmitter.emit(
+      'changed',
+      {},
+      { name: 'imcodes_lang', value: '%ZZ', domain: 'prod.im.codes', path: '/' },
+      'explicit',
+      false,
+    );
+    expect(shell.getLocale()).toBe('en');
+
+    // Trusted active origin imcodes_lang cookie updates menu + dialogs immediately and persists locale.json
+    cookieEmitter.emit(
+      'changed',
+      {},
+      { name: 'imcodes_lang', value: 'zh-CN', domain: 'prod.im.codes', path: '/' },
+      'explicit',
+      false,
+    );
+    await vi.waitFor(() => {
+      expect(shell.getLocale()).toBe('zh-CN');
+      expect(findMenuItem(menus.at(-1)!, 'app:settings')?.label).toBe('设置…');
+      expect(findMenuItem(menus.at(-1)!, 'server:switch')?.label).toBe('切换服务器…');
+    });
+
+    // Triggering Remove Server dialog uses the synced locale
+    findMenuItem(menus.at(-1)!, 'remove:https://prod.im.codes')?.click?.();
+    await vi.waitFor(() => {
+      expect(dialogPrompts.at(-1)).toEqual({
+        title: '移除服务器',
+        message: '确定从已保存服务器中移除 https://prod.im.codes 吗？',
+        buttons: ['取消', '移除'],
+      });
+    });
+
+    // Persisted locale survives shell restart even before any server loads or when OS welcomeLocale is 'en'
+    const persistedJson = JSON.parse(readFileSync(path.join(tempDir, 'locale.json'), 'utf8'));
+    expect(persistedJson).toEqual({ version: 1, locale: 'zh-CN' });
+
+    const restartedMenus: MenuItemOptionsLike[][] = [];
+    let restartedWin!: ReturnType<typeof createFakeShellWindow>;
+    const restarted = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      welcomeLocale: 'en',
+      createMainWindow: (opts) => {
+        restartedWin = createFakeShellWindow({ webPreferences: opts.webPreferences, cookies });
+        return restartedWin;
+      },
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: (template) => {
+        restartedMenus.push(template);
+      },
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 0 }),
+    });
+    await restarted.ensureWindow();
+    expect(restarted.getLocale()).toBe('zh-CN');
+    expect(findMenuItem(restartedMenus.at(-1)!, 'app:settings')?.label).toBe('设置…');
+
+    // did-finish-load reads imcodes_lang cookie for the active trusted origin
+    initialCookies.push({ name: 'imcodes_lang', value: 'ja', domain: 'prod.im.codes', path: '/' });
+    restartedWin.webContentsEmitter.emit('did-finish-load');
+    await vi.waitFor(() => {
+      expect(restarted.getLocale()).toBe('ja');
+      expect(findMenuItem(restartedMenus.at(-1)!, 'server:switch')?.label).toBe('サーバーを切り替え…');
+    });
   });
 });
