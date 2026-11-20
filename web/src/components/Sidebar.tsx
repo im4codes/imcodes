@@ -7,10 +7,30 @@ import { VoiceLanguageSwitcher } from './VoiceLanguageSwitcher.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
 
 const LS_COLLAPSED = 'sidebar_collapsed';
-const LS_WIDTH = 'sidebar_width_';
+const LS_WIDTH = 'sidebar_width';
+const LEGACY_LS_WIDTH_PREFIX = 'sidebar_width_';
 export const MIN_WIDTH = 180;
 export const MAX_WIDTH = 560;
 export const DEFAULT_WIDTH = 380;
+
+function parseStoredWidth(raw: string | null): number | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number.parseInt(trimmed, 10);
+  return n >= MIN_WIDTH && n <= MAX_WIDTH ? n : null;
+}
+
+function readGlobalOrLegacyWidth(serverId: string | null): number | null {
+  try {
+    const globalStored = parseStoredWidth(localStorage.getItem(LS_WIDTH));
+    if (globalStored !== null) return globalStored;
+    if (serverId) {
+      return parseStoredWidth(localStorage.getItem(LEGACY_LS_WIDTH_PREFIX + serverId));
+    }
+  } catch { /* ignore */ }
+  return null;
+}
 
 interface Props {
   collapsed: boolean;
@@ -63,33 +83,24 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
     } catch { /* ignore bad data */ }
   }, [onDropPanel]);
 
-  // Persist and restore sidebar width per server
-  const [width, setWidth] = useState<number>(() => {
-    if (!serverId) return DEFAULT_WIDTH;
-    try {
-      const stored = localStorage.getItem(LS_WIDTH + serverId);
-      if (stored) {
-        const n = parseInt(stored, 10);
-        if (n >= MIN_WIDTH && n <= MAX_WIDTH) return n;
-      }
-    } catch { /* ignore */ }
-    return DEFAULT_WIDTH;
-  });
+  // Persist sidebar width globally across servers, falling back once to legacy per-server width if unset
+  const [width, setWidth] = useState<number>(() => readGlobalOrLegacyWidth(serverId) ?? DEFAULT_WIDTH);
+  const hasExplicitWidthRef = useRef<boolean>(readGlobalOrLegacyWidth(serverId) !== null);
 
-  // Update width when serverId changes
+  // If mounted with serverId=null before initial server resolved and no global width exists yet, pick up legacy fallback once
   useEffect(() => {
-    if (!serverId) return;
+    if (hasExplicitWidthRef.current || !serverId) return;
     try {
-      const stored = localStorage.getItem(LS_WIDTH + serverId);
-      if (stored) {
-        const n = parseInt(stored, 10);
-        if (n >= MIN_WIDTH && n <= MAX_WIDTH) {
-          setWidth(n);
-          return;
-        }
+      if (parseStoredWidth(localStorage.getItem(LS_WIDTH)) !== null) {
+        hasExplicitWidthRef.current = true;
+        return;
+      }
+      const legacy = parseStoredWidth(localStorage.getItem(LEGACY_LS_WIDTH_PREFIX + serverId));
+      if (legacy !== null) {
+        hasExplicitWidthRef.current = true;
+        setWidth(legacy);
       }
     } catch { /* ignore */ }
-    setWidth(DEFAULT_WIDTH);
   }, [serverId]);
 
   const isDraggingRef = useRef(false);
@@ -114,17 +125,16 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
       isDraggingRef.current = false;
       const delta = ev.clientX - startXRef.current;
       const finalWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidthRef.current + delta));
+      hasExplicitWidthRef.current = true;
       setWidth(finalWidth);
-      if (serverId) {
-        try { localStorage.setItem(LS_WIDTH + serverId, String(finalWidth)); } catch { /* ignore */ }
-      }
+      try { localStorage.setItem(LS_WIDTH, String(finalWidth)); } catch { /* ignore */ }
       document.removeEventListener('mousemove', onMouseMove);
       document.removeEventListener('mouseup', onMouseUp);
     };
 
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('mouseup', onMouseUp);
-  }, [width, serverId]);
+  }, [width]);
 
   // Touch support for tablet/iPad resize
   const handleResizeTouchStart = useCallback((e: TouchEvent) => {
@@ -146,17 +156,16 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
       const touch = ev.changedTouches[0];
       const delta = touch.clientX - startXRef.current;
       const finalWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidthRef.current + delta));
+      hasExplicitWidthRef.current = true;
       setWidth(finalWidth);
-      if (serverId) {
-        try { localStorage.setItem(LS_WIDTH + serverId, String(finalWidth)); } catch { /* ignore */ }
-      }
+      try { localStorage.setItem(LS_WIDTH, String(finalWidth)); } catch { /* ignore */ }
       document.removeEventListener('touchmove', onTouchMove);
       document.removeEventListener('touchend', onTouchEnd);
     };
 
     document.addEventListener('touchmove', onTouchMove, { passive: true });
     document.addEventListener('touchend', onTouchEnd);
-  }, [width, serverId]);
+  }, [width]);
 
   return (
     <div

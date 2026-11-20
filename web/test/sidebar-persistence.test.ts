@@ -82,32 +82,37 @@ describe('desktop sidebar width default and persistence', () => {
     expect(panel.style.width).toBe('380px');
   });
 
-  it('restores valid persisted per-server widths within [180, 560] and falls back to 380px for invalid values', () => {
-    localStorage.setItem('sidebar_width_srv-valid', '280');
-    localStorage.setItem('sidebar_width_srv-wide', '540');
-    localStorage.setItem('sidebar_width_srv-too-narrow', '120');
-    localStorage.setItem('sidebar_width_srv-too-wide', '620');
-    localStorage.setItem('sidebar_width_srv-nan', 'abc');
+  it('falls back to legacy per-server width when global sidebar_width is absent and ignores invalid/out-of-range values', () => {
+    // Global key takes precedence over legacy per-server keys
+    localStorage.setItem('sidebar_width', '430');
+    localStorage.setItem('sidebar_width_srv-1', '280');
+    const first = render(h(Sidebar, { collapsed: false, serverId: 'srv-1' }));
+    expect((first.container.querySelector('.sidebar-panel') as HTMLElement).style.width).toBe('430px');
+    first.rerender(h(Sidebar, { collapsed: false, serverId: 'srv-2' }));
+    expect((first.container.querySelector('.sidebar-panel') as HTMLElement).style.width).toBe('430px');
+    first.unmount();
 
-    const { container, rerender } = render(h(Sidebar, { collapsed: false, serverId: 'srv-valid' }));
-    const panel = container.querySelector('.sidebar-panel') as HTMLElement;
-    expect(panel.style.width).toBe('280px');
+    // Without global key, valid legacy key is read cleanly
+    localStorage.clear();
+    localStorage.setItem('sidebar_width_srv-legacy', '280');
+    const legacyRender = render(h(Sidebar, { collapsed: false, serverId: 'srv-legacy' }));
+    expect((legacyRender.container.querySelector('.sidebar-panel') as HTMLElement).style.width).toBe('280px');
+    legacyRender.rerender(h(Sidebar, { collapsed: false, serverId: 'srv-other' }));
+    expect((legacyRender.container.querySelector('.sidebar-panel') as HTMLElement).style.width).toBe('280px');
+    legacyRender.unmount();
 
-    rerender(h(Sidebar, { collapsed: false, serverId: 'srv-wide' }));
-    expect(panel.style.width).toBe('540px');
-
-    rerender(h(Sidebar, { collapsed: false, serverId: 'srv-too-narrow' }));
-    expect(panel.style.width).toBe('380px');
-
-    rerender(h(Sidebar, { collapsed: false, serverId: 'srv-too-wide' }));
-    expect(panel.style.width).toBe('380px');
-
-    rerender(h(Sidebar, { collapsed: false, serverId: 'srv-nan' }));
-    expect(panel.style.width).toBe('380px');
+    // Invalid or out-of-range values fall back to 380px default
+    for (const invalid of ['120', '620', 'abc', '250px']) {
+      localStorage.clear();
+      localStorage.setItem('sidebar_width', invalid);
+      const r = render(h(Sidebar, { collapsed: false, serverId: 'srv-bad' }));
+      expect((r.container.querySelector('.sidebar-panel') as HTMLElement).style.width).toBe('380px');
+      r.unmount();
+    }
   });
 
-  it('clamps mouse drag resizing to [180, 560] and keeps collapsed width at 0px', () => {
-    const { container, rerender } = render(h(Sidebar, { collapsed: false, serverId: 'srv-drag' }));
+  it('persists width globally under sidebar_width across server switches and null serverId, clamping to [180, 560] and keeping collapsed at 0px', () => {
+    const { container, rerender } = render(h(Sidebar, { collapsed: false, serverId: 'srv-1' }));
     const panel = container.querySelector('.sidebar-panel') as HTMLElement;
     const handle = container.querySelector('.sidebar-resize-handle') as HTMLElement;
 
@@ -116,10 +121,25 @@ describe('desktop sidebar width default and persistence', () => {
     fireEvent.mouseDown(handle, { clientX: 380 });
     fireEvent.mouseMove(document, { clientX: 600 });
     fireEvent.mouseUp(document, { clientX: 600 });
-    expect(localStorage.getItem('sidebar_width_srv-drag')).toBe('560');
+    expect(localStorage.getItem('sidebar_width')).toBe('560');
     expect(panel.style.width).toBe('560px');
 
-    rerender(h(Sidebar, { collapsed: true, serverId: 'srv-drag' }));
+    // Switching serverId to another server or null keeps the exact resized global width
+    rerender(h(Sidebar, { collapsed: false, serverId: 'srv-2' }));
+    expect(panel.style.width).toBe('560px');
+    rerender(h(Sidebar, { collapsed: false, serverId: null }));
+    expect(panel.style.width).toBe('560px');
+
+    // Dragging while serverId === null still persists globally
+    fireEvent.mouseDown(handle, { clientX: 560 });
+    fireEvent.mouseMove(document, { clientX: 460 });
+    fireEvent.mouseUp(document, { clientX: 460 });
+    expect(localStorage.getItem('sidebar_width')).toBe('460');
+    expect(panel.style.width).toBe('460px');
+    rerender(h(Sidebar, { collapsed: false, serverId: 'srv-3' }));
+    expect(panel.style.width).toBe('460px');
+
+    rerender(h(Sidebar, { collapsed: true, serverId: 'srv-3' }));
     expect(panel.style.width).toBe('0px');
   });
 });
