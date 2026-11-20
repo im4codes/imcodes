@@ -7,6 +7,7 @@ import {
   GLOBAL_TASK_NOTIFY_CHANNEL,
   GLOBAL_TASK_PG_NOTIFY_MAX_BYTES,
   GLOBAL_TASK_SNAPSHOT_PATH,
+  GLOBAL_TASK_TERMINAL_WINDOW_MS,
   GLOBAL_TASK_TICKET_PATH,
   GLOBAL_TASK_WS_PATH,
   type GlobalTaskServerFrame,
@@ -149,9 +150,11 @@ class InMemoryGlobalTaskDb {
 
         if (norm.includes('from global_task_pair_summaries') && norm.includes('is_terminal = true')) {
           const limit = Number(params.at(-1) ?? 50);
-          const serverIds = new Set(params.slice(0, -1).map(String));
+          const hasCutoff = norm.includes('updated_at >=');
+          const cutoff = hasCutoff ? Number(params.at(-2) ?? 0) : 0;
+          const serverIds = new Set(params.slice(0, hasCutoff ? -2 : -1).map(String));
           return [...this.summaries.values()]
-            .filter((r) => serverIds.has(r.server_id) && r.is_terminal)
+            .filter((r) => serverIds.has(r.server_id) && r.is_terminal && (!hasCutoff || r.updated_at >= cutoff))
             .sort((a, b) => b.updated_at - a.updated_at)
             .slice(0, limit) as unknown as T[];
         }
@@ -470,7 +473,7 @@ describe('global-task-mode server engine', () => {
     expect(partial?.status).toBe('in_audit');
     expect(partial?.round).toBe(2);
 
-    // Same taskId on srv-b stays completely isolated
+    // Same taskId on srv-b stays completely isolated (recent terminal task within 2d window)
     await upsertGlobalTaskSummary(db, {
       serverId: 'srv-b',
       taskId: 'tsk_same',
@@ -480,7 +483,7 @@ describe('global-task-mode server engine', () => {
       status: 'done',
       flags: [],
       checklist: { total: 2, implemented: 2, audited: 2 },
-      updatedAt: 4000,
+      updatedAt: Date.now() - 60_000,
     });
 
     const rowA = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_same');
@@ -929,6 +932,162 @@ describe('global-task-mode server engine', () => {
     const standalone = new GlobalTaskHub();
     expect(standalone.isPgListening()).toBe(false);
     await standalone.stop();
+  });
+
+  it('enforces 2-day cutoff for terminal tasks while preserving older active tasks and closing active rows', async () => {
+    const subscriberFrames: GlobalTaskServerFrame[] = [];
+    const subscriberWs = {
+      readyState: WebSocket.OPEN,
+      send: vi.fn((data: string) => { subscriberFrames.push(JSON.parse(data)); }),
+      on: vi.fn(),
+      once: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+    const threeDaysAgo = now - 3 * 24 * 60 * 60 * 1000;
+    const fiveDaysAgo = now - 5 * 24 * 60 * 60 * 1000;
+
+    // Seed an existing stale terminal row directly in DB (simulates pre-existing >2d DB record)
+    memDb.summaries.set('srv-a\u0000tsk_db_stale_done', {
+      server_id: 'srv-a',
+      task_id: 'tsk_db_stale_done',
+      project_name: 'imcodes',
+      brain_session: 'deck_proj_brain',
+      brain_label: 'Alpha Brain',
+      title: 'Stale DB Done',
+      status: 'done',
+      flags_json: '[]',
+      round: 1,
+      checklist_total: 1,
+      checklist_implemented: 1,
+      checklist_audited: 1,
+      executor_label: null,
+      auditor_label: null,
+      auditor: null,
+      live_summary: null,
+      is_terminal: true,
+      needs_attention: false,
+      created_at: threeDaysAgo - 10_000,
+      updated_at: threeDaysAgo,
+    });
+
+    // Seed an active task updated 5 days ago
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_active_5d',
+      projectName: 'imcodes',
+      brainSession: 'deck_proj_brain',
+      title: 'Long Active Task',
+      status: 'working',
+      updatedAt: fiveDaysAgo,
+    });
+
+    // Seed another active task that will transition to terminal with a >2d timestamp
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_active_to_old_done',
+      projectName: 'imcodes',
+      brainSession: 'deck_proj_brain',
+      title: 'Closing Active Task',
+      status: 'working',
+      updatedAt: fiveDaysAgo,
+    });
+
+    await globalTaskHub.handleConnection(subscriberWs, 'user-a', db);
+    subscriberFrames.length = 0;
+
+    const bridge = WsBridge.get('srv-a') as unknown as {
+      db: Database | null;
+      ingestGlobalTaskFleetSnapshot(db: Database, msg: Record<string, unknown>): Promise<void>;
+      ingestGlobalTaskFrame(db: Database, msg: Record<string, unknown>): Promise<void>;
+    };
+    bridge.db = db;
+
+    // 1. fleet_snapshot & console SNAPSHOT skip >2d terminal tasks while keeping 1d terminal tasks and closing active rows
+    await bridge.ingestGlobalTaskFleetSnapshot(db, {
+      type: GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
+      pairs: [
+        {
+          taskId: 'tsk_recent_done_1d',
+          brain: 'deck_proj_brain',
+          projectName: 'imcodes',
+          title: 'Recent Done 1d',
+          status: 'done',
+          flags: [],
+          round: 1,
+          checklist: { total: 2, implemented: 2, audited: 2 },
+          createdAt: oneDayAgo - 10_000,
+          updatedAt: oneDayAgo,
+        },
+        {
+          taskId: 'tsk_stale_fleet_done_3d',
+          brain: 'deck_proj_brain',
+          projectName: 'imcodes',
+          title: 'Stale Fleet Done 3d',
+          status: 'done',
+          flags: [],
+          round: 1,
+          checklist: { total: 2, implemented: 2, audited: 2 },
+          createdAt: threeDaysAgo - 10_000,
+          updatedAt: threeDaysAgo,
+        },
+      ],
+    });
+
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: 'supervision.task_console.snapshot',
+      scope: { projectName: 'imcodes', coordinatorSessionName: 'deck_proj_brain' },
+      tasks: [
+        {
+          taskId: 'tsk_stale_console_cancel_3d',
+          title: 'Stale Console Cancelled 3d',
+          pair: {
+            status: 'cancelled',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            brain: 'deck_proj_brain',
+            createdAt: threeDaysAgo - 10_000,
+            updatedAt: threeDaysAgo,
+          },
+        },
+        {
+          taskId: 'tsk_active_to_old_done',
+          title: 'Closing Active Task',
+          pair: {
+            status: 'done',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 1, audited: 1 },
+            brain: 'deck_proj_brain',
+            createdAt: fiveDaysAgo,
+            updatedAt: threeDaysAgo,
+          },
+        },
+      ],
+    });
+
+    // Stale terminal tasks must NOT be persisted or broadcast
+    expect(await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_stale_fleet_done_3d')).toBeNull();
+    expect(await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_stale_console_cancel_3d')).toBeNull();
+    expect(subscriberFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.UPSERT && f.task.taskId === 'tsk_stale_fleet_done_3d')).toBe(false);
+    expect(subscriberFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.UPSERT && f.task.taskId === 'tsk_stale_console_cancel_3d')).toBe(false);
+
+    // Recent terminal task (1d) WAS persisted & broadcast
+    expect(subscriberFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.UPSERT && f.task.taskId === 'tsk_recent_done_1d')).toBe(true);
+
+    // Existing active task updated to terminal with >2d updatedAt WAS updated to terminal & broadcast so clients drop the active ghost
+    const closedRow = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_active_to_old_done');
+    expect(closedRow?.isTerminal).toBe(true);
+    expect(closedRow?.status).toBe('done');
+    expect(subscriberFrames.some((f) => f.type === GLOBAL_TASK_MODE_MSG.UPSERT && f.task.taskId === 'tsk_active_to_old_done' && f.task.isTerminal)).toBe(true);
+
+    // Snapshot returns 5d-old active task and 1d-old terminal task, and excludes all >2d terminal tasks
+    const snap = await listGlobalTaskSnapshotForUser(db, 'user-a');
+    expect(snap.tasks.map((t) => t.taskId).sort()).toEqual(['tsk_active_5d', 'tsk_recent_done_1d']);
+    expect(GLOBAL_TASK_TERMINAL_WINDOW_MS).toBe(2 * 24 * 60 * 60 * 1000);
   });
 
   it('closes real-time permission boundary when team_members or server is revoked mid-connection and via invalidation hooks', async () => {

@@ -69,7 +69,8 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
     store.close();
   });
 
-  it('includes all active pairs and up to 50 recent 24h terminal pairs with checklist counts and labels', () => {
+  it('includes all active pairs (even >2d old) and recent <=2d terminal pairs up to 50 with checklist counts and labels', () => {
+    expect(GLOBAL_TASK_TERMINAL_WINDOW_MS).toBe(2 * 24 * 60 * 60 * 1000);
     const now = 1_000_000_000;
     store.savePair('proj', makePairState({
       taskId: 'tsk_active',
@@ -77,19 +78,34 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
       updatedAt: now - 5_000,
     }));
     store.savePair('proj', makePairState({
+      taskId: 'tsk_old_active',
+      status: 'paused',
+      updatedAt: now - GLOBAL_TASK_TERMINAL_WINDOW_MS * 3,
+    }));
+    store.savePair('proj', makePairState({
       taskId: 'tsk_recent_done',
       status: 'done',
       updatedAt: now - 60_000,
     }));
     store.savePair('proj', makePairState({
+      taskId: 'tsk_boundary_done',
+      status: 'cancelled',
+      updatedAt: now - GLOBAL_TASK_TERMINAL_WINDOW_MS,
+    }));
+    store.savePair('proj', makePairState({
       taskId: 'tsk_old_done',
       status: 'done',
-      updatedAt: now - GLOBAL_TASK_TERMINAL_WINDOW_MS - 1_000,
+      updatedAt: now - GLOBAL_TASK_TERMINAL_WINDOW_MS - 1,
     }));
 
     const frame = buildGlobalTaskFleetSnapshotPayload(now);
     expect(frame.type).toBe(GLOBAL_TASK_FLEET_SNAPSHOT_MSG);
-    expect(frame.pairs.map((p) => p.taskId)).toEqual(['tsk_active', 'tsk_recent_done']);
+    expect(frame.pairs.map((p) => p.taskId)).toEqual([
+      'tsk_active',
+      'tsk_old_active',
+      'tsk_recent_done',
+      'tsk_boundary_done',
+    ]);
 
     const active = frame.pairs[0]!;
     expect(active.checklist).toEqual({ total: 3, implemented: 2, audited: 1 });

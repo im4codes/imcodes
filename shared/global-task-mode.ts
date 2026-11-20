@@ -7,7 +7,7 @@ export const GLOBAL_TASK_NOTIFY_CHANNEL = 'global_task_pair_updates' as const;
 export const GLOBAL_TASK_WS_TICKET_TYPE = 'global-tasks-ws-ticket' as const;
 export const GLOBAL_TASK_PG_NOTIFY_MAX_BYTES = 4000 as const;
 export const GLOBAL_TASK_RECENT_FINISHED_LIMIT = 50 as const;
-export const GLOBAL_TASK_TERMINAL_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const GLOBAL_TASK_TERMINAL_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
 
 export const GLOBAL_TASK_MODE_MSG = {
   SET_FILTER: 'global_tasks.set_filter',
@@ -123,6 +123,21 @@ const utf8Encoder = new TextEncoder();
 
 export function isGlobalTaskTerminalStatus(status: string): boolean {
   return TERMINAL_STATUSES.has(status);
+}
+
+/**
+ * Returns true for active (non-terminal) tasks regardless of age, and for
+ * terminal tasks updated within the global sync window (<= 2 days).
+ */
+export function isGlobalTaskWithinSyncWindow(
+  task: { isTerminal?: boolean; status?: string; updatedAt?: number },
+  now: number = Date.now(),
+): boolean {
+  const terminal = task.isTerminal === true
+    || (typeof task.status === 'string' && isGlobalTaskTerminalStatus(task.status));
+  if (!terminal) return true;
+  const updatedAt = typeof task.updatedAt === 'number' && Number.isFinite(task.updatedAt) ? task.updatedAt : 0;
+  return updatedAt >= now - GLOBAL_TASK_TERMINAL_WINDOW_MS;
 }
 
 export function isGlobalTaskAttentionNeeded(status: string, flags: readonly string[]): boolean {

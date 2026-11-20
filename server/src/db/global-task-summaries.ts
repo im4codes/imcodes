@@ -1,8 +1,10 @@
 import {
   GLOBAL_TASK_NOTIFY_CHANNEL,
   GLOBAL_TASK_RECENT_FINISHED_LIMIT,
+  GLOBAL_TASK_TERMINAL_WINDOW_MS,
   isGlobalTaskAttentionNeeded,
   isGlobalTaskTerminalStatus,
+  isGlobalTaskWithinSyncWindow,
   normalizeGlobalChecklist,
   type GlobalTaskBrainSummary,
   type GlobalTaskChecklistProgress,
@@ -214,6 +216,14 @@ export async function upsertGlobalTaskSummaryWithChange(
     ? Math.floor(input.updatedAt as number)
     : (prev && prev.status === status && prev.updatedAt > 0 ? prev.updatedAt : now);
 
+  if (
+    isTerminal
+    && (!prev || prev.isTerminal)
+    && !isGlobalTaskWithinSyncWindow({ isTerminal: true, status, updatedAt }, now)
+  ) {
+    return { row: null, changed: false };
+  }
+
   await db.execute(
     `INSERT INTO global_task_pair_summaries (
       server_id, task_id, project_name, brain_session, brain_label, title,
@@ -413,9 +423,10 @@ export async function listGlobalTaskSnapshotForUser(
     `SELECT * FROM global_task_pair_summaries
       WHERE server_id IN (${serverPlaceholders})
         AND is_terminal = TRUE
+        AND updated_at >= $${activeServerIds.length + 1}
       ORDER BY updated_at DESC
-      LIMIT $${activeServerIds.length + 1}`,
-    [...activeServerIds, GLOBAL_TASK_RECENT_FINISHED_LIMIT],
+      LIMIT $${activeServerIds.length + 2}`,
+    [...activeServerIds, ts - GLOBAL_TASK_TERMINAL_WINDOW_MS, GLOBAL_TASK_RECENT_FINISHED_LIMIT],
   );
 
   const tasks: GlobalTaskSummaryRow[] = [];

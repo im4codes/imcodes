@@ -3,6 +3,7 @@ import {
   GLOBAL_TASK_SNAPSHOT_PATH,
   GLOBAL_TASK_TICKET_PATH,
   GLOBAL_TASK_WS_PATH,
+  isGlobalTaskWithinSyncWindow,
   type GlobalTaskBrainSummary,
   type GlobalTaskBrainTextEvent,
   type GlobalTaskServerFrame,
@@ -802,10 +803,10 @@ export class GlobalTaskModeStore {
       const task = frame.task;
       if (!task || this.state.mutedServerIds.includes(task.serverId)) return;
       const key = taskKey(task.serverId, task.taskId);
-      const nextTasks = sortGlobalTaskCards([
-        ...this.state.tasks.filter((item) => taskKey(item.serverId, item.taskId) !== key),
-        task,
-      ]);
+      const remaining = this.state.tasks.filter((item) => taskKey(item.serverId, item.taskId) !== key);
+      const nextTasks = isGlobalTaskWithinSyncWindow(task)
+        ? sortGlobalTaskCards([...remaining, task])
+        : sortGlobalTaskCards(remaining);
       this.setState({ tasks: nextTasks, lastSyncedAt: Date.now() });
       return;
     }
@@ -846,9 +847,12 @@ export class GlobalTaskModeStore {
   }
 
   private applySnapshot(snapshot: GlobalTaskSnapshotResponse): void {
+    const now = Date.now();
     const mutedSet = new Set(this.state.mutedServerIds);
     const allowedServerIds = new Set((snapshot.servers ?? []).map((s) => s.id));
-    const tasks = sortGlobalTaskCards((snapshot.tasks ?? []).filter((t) => !mutedSet.has(t.serverId)));
+    const tasks = sortGlobalTaskCards(
+      (snapshot.tasks ?? []).filter((t) => !mutedSet.has(t.serverId) && isGlobalTaskWithinSyncWindow(t, now)),
+    );
     const brains = (snapshot.brains ?? []).filter((b) => !mutedSet.has(b.serverId));
     const servers = snapshot.servers ?? [];
     const nextLatestBrainTexts: Record<string, GlobalTaskBrainTextEvent> = {};

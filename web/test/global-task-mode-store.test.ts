@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   GLOBAL_TASK_MODE_MSG,
+  GLOBAL_TASK_TERMINAL_WINDOW_MS,
   GLOBAL_TASK_TICKET_PATH,
   GLOBAL_TASK_WS_PATH,
   type GlobalTaskBrainSummary,
@@ -617,5 +618,69 @@ describe('global-task-mode-store', () => {
     expect(restored.hasExplicitMutedServerFilter()).toBe(true);
     expect(restored.applyDefaultMutedServerIds(['srv-unpin'])).toBe(false);
     expect(restored.getState().mutedServerIds).toEqual([]);
+  });
+
+  it('filters out terminal tasks older than 2 days on SNAPSHOT and UPSERT while preserving older active tasks', async () => {
+    const now = 1_700_000_000_000;
+    vi.setSystemTime(now);
+
+    const store = new GlobalTaskModeStore();
+    await store.start();
+    const ws = MockWebSocket.instances[0]!;
+    ws.simulateOpen();
+
+    ws.simulateMessage({
+      type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+      servers: [{ id: 'srv-1', name: 'Node 1', online: true }],
+      brains: [],
+      tasks: [
+        makeTask({ taskId: 'active_5d', status: 'working', isTerminal: false, updatedAt: now - 5 * 24 * 60 * 60 * 1000 }),
+        makeTask({ taskId: 'done_boundary', status: 'done', isTerminal: true, updatedAt: now - GLOBAL_TASK_TERMINAL_WINDOW_MS }),
+        makeTask({ taskId: 'done_1d', status: 'done', isTerminal: true, updatedAt: now - 24 * 60 * 60 * 1000 }),
+        makeTask({ taskId: 'done_stale', status: 'done', isTerminal: true, updatedAt: now - GLOBAL_TASK_TERMINAL_WINDOW_MS - 1 }),
+        makeTask({ taskId: 'cancelled_stale', status: 'cancelled', isTerminal: true, updatedAt: now - 3 * 24 * 60 * 60 * 1000 }),
+      ],
+      ts: now,
+    });
+
+    expect(store.getState().tasks.map((t) => t.taskId)).toEqual(['active_5d', 'done_1d', 'done_boundary']);
+
+    // Stale terminal UPSERT for an unseen task is ignored
+    ws.simulateMessage({
+      type: GLOBAL_TASK_MODE_MSG.UPSERT,
+      task: makeTask({
+        taskId: 'unseen_stale_done',
+        status: 'done',
+        isTerminal: true,
+        updatedAt: now - GLOBAL_TASK_TERMINAL_WINDOW_MS - 1,
+      }),
+    });
+    expect(store.getState().tasks.map((t) => t.taskId)).toEqual(['active_5d', 'done_1d', 'done_boundary']);
+
+    // Stale terminal UPSERT closing an active task removes it from state instead of leaving an active ghost
+    ws.simulateMessage({
+      type: GLOBAL_TASK_MODE_MSG.UPSERT,
+      task: makeTask({
+        taskId: 'active_5d',
+        status: 'done',
+        isTerminal: true,
+        updatedAt: now - GLOBAL_TASK_TERMINAL_WINDOW_MS - 1_000,
+      }),
+    });
+    expect(store.getState().tasks.map((t) => t.taskId)).toEqual(['done_1d', 'done_boundary']);
+
+    // Recent terminal UPSERT is retained
+    ws.simulateMessage({
+      type: GLOBAL_TASK_MODE_MSG.UPSERT,
+      task: makeTask({
+        taskId: 'done_fresh',
+        status: 'cancelled',
+        isTerminal: true,
+        updatedAt: now - 1_000,
+      }),
+    });
+    expect(store.getState().tasks.map((t) => t.taskId)).toEqual(['done_fresh', 'done_1d', 'done_boundary']);
+
+    store.stop();
   });
 });

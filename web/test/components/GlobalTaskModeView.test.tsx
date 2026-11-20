@@ -352,8 +352,8 @@ describe('GlobalTaskModeView', () => {
             flags: [],
             round: 1,
             checklist: { total: 3, implemented: 3, audited: 3 },
-            createdAt: 50,
-            updatedAt: 200,
+            createdAt: Date.now() - 120_000,
+            updatedAt: Date.now() - 60_000,
             isTerminal: true,
             needsAttention: false,
           },
@@ -1180,7 +1180,7 @@ describe('GlobalTaskModeView', () => {
           { serverId: 'srv-1', serverName: 'Node-1', serverOnline: true, projectName: 'p', brainSession: 'b1', brainLabel: 'B1', taskId: 't-att', title: 'Needs Decision', status: 'awaiting_brain_decision', flags: [], round: 1, checklist: { total: 1, implemented: 0, audited: 0 }, createdAt: 1, updatedAt: 100, isTerminal: false, needsAttention: true },
           { serverId: 'srv-1', serverName: 'Node-1', serverOnline: true, projectName: 'p', brainSession: 'b1', brainLabel: 'B1', taskId: 't-work', title: 'Active Work', status: 'working', flags: [], round: 1, checklist: { total: 1, implemented: 0, audited: 0 }, createdAt: 2, updatedAt: 200, isTerminal: false, needsAttention: false },
           { serverId: 'srv-1', serverName: 'Node-1', serverOnline: true, projectName: 'p', brainSession: 'b1', brainLabel: 'B1', taskId: 't-audit', title: 'In Audit', status: 'in_audit', flags: [], round: 1, checklist: { total: 1, implemented: 1, audited: 0 }, createdAt: 3, updatedAt: 300, isTerminal: false, needsAttention: false },
-          { serverId: 'srv-1', serverName: 'Node-1', serverOnline: true, projectName: 'p', brainSession: 'b1', brainLabel: 'B1', taskId: 't-done', title: 'Finished', status: 'done', flags: [], round: 1, checklist: { total: 1, implemented: 1, audited: 1 }, createdAt: 4, updatedAt: 400, isTerminal: true, needsAttention: false },
+          { serverId: 'srv-1', serverName: 'Node-1', serverOnline: true, projectName: 'p', brainSession: 'b1', brainLabel: 'B1', taskId: 't-done', title: 'Finished', status: 'done', flags: [], round: 1, checklist: { total: 1, implemented: 1, audited: 1 }, createdAt: Date.now() - 120_000, updatedAt: Date.now() - 60_000, isTerminal: true, needsAttention: false },
         ],
       });
     });
