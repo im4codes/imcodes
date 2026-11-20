@@ -692,4 +692,86 @@ describe('ChatView system TTS integration', () => {
     });
     expect(screen.queryByTestId('chat-tts-settings-native-section')).toBeNull();
   });
+
+  it('portals TtsQuickSettingsPopover to document.body and clamps inside viewport in narrow split panes and mobile viewports', async () => {
+    const { TtsQuickSettingsPopover } = await import('../../src/components/TtsQuickSettingsPopover.js');
+    const origInnerWidth = window.innerWidth;
+    const origInnerHeight = window.innerHeight;
+
+    try {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
+
+      const onClose = vi.fn();
+      const anchor = document.createElement('div');
+      anchor.getBoundingClientRect = () => ({
+        x: 280, y: 12, left: 280, top: 12, right: 320, bottom: 38, width: 40, height: 26,
+        toJSON: () => ({}),
+      }) as DOMRect;
+      const overflowWrap = document.createElement('div');
+      overflowWrap.style.overflow = 'hidden';
+      overflowWrap.appendChild(anchor);
+      document.body.appendChild(overflowWrap);
+
+      let unmount!: () => void;
+      await act(async () => {
+        ({ unmount } = render(
+          <div>
+            <div data-testid="outside-portal-area">outside</div>
+            <TtsQuickSettingsPopover anchorRef={{ current: anchor }} onClose={onClose} />
+          </div>,
+        ));
+      });
+
+      const popover = screen.getByTestId('chat-tts-settings-popover');
+      // Escaped overflow-hidden container directly into document.body
+      expect(popover.parentElement).toBe(document.body);
+      expect(overflowWrap.contains(popover)).toBe(false);
+
+      const left = Number.parseFloat(popover.style.left);
+      const top = Number.parseFloat(popover.style.top);
+      expect(left).toBeGreaterThanOrEqual(8);
+      expect(left + 272).toBeLessThanOrEqual(1280 - 8);
+      expect(top).toBeGreaterThanOrEqual(8);
+
+      // Clicking inside portaled popover does not close it
+      await act(async () => {
+        fireEvent.mouseDown(screen.getByTestId('chat-tts-settings-autoread-toggle'));
+        screen.getByTestId('chat-tts-settings-popover').dispatchEvent(new Event('pointerdown', { bubbles: true }));
+      });
+      expect(onClose).not.toHaveBeenCalled();
+
+      // Clicking outside closes it
+      await waitFor(() => {
+        screen.getByTestId('outside-portal-area').dispatchEvent(new Event('pointerdown', { bubbles: true }));
+        expect(onClose).toHaveBeenCalledTimes(1);
+      });
+      unmount();
+
+      // Near left edge of narrow viewport: falls back rightwards and clamps >= 8px
+      anchor.getBoundingClientRect = () => ({
+        x: 20, y: 12, left: 20, top: 12, right: 64, bottom: 38, width: 44, height: 26,
+        toJSON: () => ({}),
+      }) as DOMRect;
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 700 });
+      const leftEdge = render(<TtsQuickSettingsPopover anchorRef={{ current: anchor }} onClose={vi.fn()} />);
+      const leftEdgePopover = screen.getByTestId('chat-tts-settings-popover');
+      expect(Number.parseFloat(leftEdgePopover.style.left)).toBe(20);
+      expect(leftEdgePopover.className).toContain('is-align-left');
+      leftEdge.unmount();
+
+      // Mobile viewport clamps cleanly to [8, vw - 8]
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 375 });
+      const mobile = render(<TtsQuickSettingsPopover anchorRef={{ current: anchor }} onClose={vi.fn()} />);
+      const mobilePopover = screen.getByTestId('chat-tts-settings-popover');
+      expect(Number.parseFloat(mobilePopover.style.left)).toBe(8);
+      expect(Number.parseFloat(mobilePopover.style.width)).toBe(359);
+      mobile.unmount();
+
+      overflowWrap.remove();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: origInnerWidth });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: origInnerHeight });
+    }
+  });
 });

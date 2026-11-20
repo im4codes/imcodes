@@ -1,4 +1,5 @@
-import { useEffect, useLayoutEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import type { RefObject } from 'preact';
 import { useTranslation } from 'react-i18next';
 import {
@@ -32,14 +33,79 @@ interface Props {
   onClose: () => void;
 }
 
+interface PopoverPosition {
+  top: number;
+  left: number;
+  width?: number;
+  maxHeight: number;
+  alignLeft: boolean;
+}
+
+const VIEWPORT_MARGIN = 8;
+const MOBILE_BREAKPOINT = 640;
+const DESKTOP_POPOVER_WIDTH = 272;
+const ESTIMATED_POPOVER_HEIGHT = 280;
+
+function computePopoverPosition(
+  anchorRect: DOMRect,
+  popoverRect: DOMRect | null,
+  vw: number,
+  vh: number,
+): PopoverPosition | null {
+  if ((anchorRect.width <= 0 && anchorRect.height <= 0) || vw <= 0 || vh <= 0) {
+    return null;
+  }
+
+  const isMobile = vw <= MOBILE_BREAKPOINT;
+  const gap = isMobile ? 4 : 6;
+  const maxAvailableWidth = Math.max(0, vw - VIEWPORT_MARGIN * 2);
+  const popWidth = isMobile
+    ? maxAvailableWidth
+    : Math.min(popoverRect && popoverRect.width > 0 ? popoverRect.width : DESKTOP_POPOVER_WIDTH, maxAvailableWidth);
+  const popHeight = popoverRect && popoverRect.height > 0 ? popoverRect.height : ESTIMATED_POPOVER_HEIGHT;
+
+  let left: number;
+  let alignLeft = false;
+  if (isMobile) {
+    left = vw > VIEWPORT_MARGIN * 2 ? VIEWPORT_MARGIN : 0;
+  } else {
+    const canAlignRight = anchorRect.right - popWidth >= VIEWPORT_MARGIN;
+    alignLeft = !canAlignRight;
+    const preferredLeft = canAlignRight ? anchorRect.right - popWidth : anchorRect.left;
+    const maxLeft = Math.max(VIEWPORT_MARGIN, vw - popWidth - VIEWPORT_MARGIN);
+    left = Math.min(Math.max(preferredLeft, VIEWPORT_MARGIN), maxLeft);
+  }
+
+  const belowTop = anchorRect.bottom + gap;
+  const spaceBelow = vh - belowTop - VIEWPORT_MARGIN;
+  const spaceAbove = anchorRect.top - gap - VIEWPORT_MARGIN;
+  const placeBelow = spaceBelow >= popHeight || spaceBelow >= spaceAbove;
+  const rawMaxHeight = placeBelow ? spaceBelow : spaceAbove;
+  const maxAllowedHeight = Math.max(1, vh - VIEWPORT_MARGIN * 2);
+  const maxHeight = rawMaxHeight > 0 ? Math.min(maxAllowedHeight, Math.floor(rawMaxHeight)) : maxAllowedHeight;
+  const effectiveHeight = Math.min(popHeight, maxHeight);
+  const rawTop = placeBelow ? belowTop : anchorRect.top - gap - effectiveHeight;
+  const maxTop = Math.max(VIEWPORT_MARGIN, vh - effectiveHeight - VIEWPORT_MARGIN);
+  const top = Math.min(Math.max(rawTop, VIEWPORT_MARGIN), maxTop);
+
+  return {
+    top,
+    left,
+    ...(isMobile && maxAvailableWidth > 0 ? { width: maxAvailableWidth } : {}),
+    maxHeight,
+    alignLeft,
+  };
+}
+
 export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
   const { t } = useTranslation();
+  const popoverRef = useRef<HTMLDivElement>(null);
   const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => getTtsAutoReadEnabled());
   const [ttsRate, setTtsRate] = useState<number>(() => getTtsSpeechRate());
   const [ttsMode, setLocalTtsMode] = useState<TtsEngineMode>(() => getTtsMode());
   const [serverConfigured, setServerConfigured] = useState<boolean>(() => isServerTtsConfigured(getCachedServerTtsConfig()));
   const [nativeVoiceQuality, setNativeVoiceQuality] = useState<NativeTtsVoiceQualityInfo | null>(null);
-  const [alignLeft, setAlignLeft] = useState(false);
+  const [position, setPosition] = useState<PopoverPosition | null>(null);
 
   const isIosNative = isIosNativePlatform();
   const canOpenSettings = canOpenNativeTtsSettings();
@@ -65,19 +131,39 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
     };
   }, [isIosNative, locale]);
 
-  useLayoutEffect(() => {
+  const updatePosition = useCallback(() => {
     const anchor = anchorRef.current;
     if (!anchor || typeof window === 'undefined') return;
-    const rect = anchor.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    // Desktop popover is right-aligned to the trigger; flip to left-aligned if right-alignment would clip the left edge.
-    setAlignLeft(rect.right < 280);
+    const vw = window.innerWidth || document.documentElement?.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement?.clientHeight || 0;
+    const next = computePopoverPosition(
+      anchor.getBoundingClientRect(),
+      popoverRef.current?.getBoundingClientRect() ?? null,
+      vw,
+      vh,
+    );
+    setPosition(next);
   }, [anchorRef]);
+
+  useLayoutEffect(() => {
+    updatePosition();
+  }, [updatePosition, serverConfigured, ttsMode, nativeVoiceQuality, canOpenSettings]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleReposition = () => updatePosition();
+    window.addEventListener('resize', handleReposition);
+    window.addEventListener('scroll', handleReposition, true);
+    return () => {
+      window.removeEventListener('resize', handleReposition);
+      window.removeEventListener('scroll', handleReposition, true);
+    };
+  }, [updatePosition]);
 
   useEffect(() => {
     const handleOutsidePress = (e: Event) => {
       const target = e.target as Node | null;
-      if (target && anchorRef.current?.contains(target)) return;
+      if (target && (anchorRef.current?.contains(target) || popoverRef.current?.contains(target))) return;
       onClose();
     };
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -102,12 +188,24 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
   const showIosHint = isIosNative && !!nativeVoiceQuality && !isHighQualityNativeTtsVoice(nativeVoiceQuality);
   const showNativeSection = Boolean(currentVoiceName || showIosHint || canOpenSettings);
 
-  return (
+  const popoverStyle = position
+    ? {
+        top: `${position.top}px`,
+        left: `${position.left}px`,
+        right: 'auto',
+        ...(position.width !== undefined ? { width: `${position.width}px` } : {}),
+        maxHeight: `${position.maxHeight}px`,
+      }
+    : undefined;
+
+  const popoverEl = (
     <div
-      class={`chat-tts-settings-popover${alignLeft ? ' is-align-left' : ''}`}
+      ref={popoverRef}
+      class={`chat-tts-settings-popover${position?.alignLeft ? ' is-align-left' : ''}`}
       data-testid="chat-tts-settings-popover"
       role="dialog"
       aria-label={t('chat.tts_settings')}
+      style={popoverStyle}
     >
       <div class="chat-tts-settings-row">
         <span class="chat-tts-settings-label">{t('settings.tts_auto_read')}</span>
@@ -216,4 +314,6 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
       )}
     </div>
   );
+
+  return typeof document !== 'undefined' && document.body ? createPortal(popoverEl, document.body) : popoverEl;
 }
