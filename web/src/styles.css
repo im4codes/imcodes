@@ -22549,7 +22549,8 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 :is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop,
 :is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card,
 :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card,
-:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-edge-indicator {
+:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-edge-indicator,
+:is(html.native-ios-mac, html.native-mac-desktop) .chat-tts-settings-popover {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }
