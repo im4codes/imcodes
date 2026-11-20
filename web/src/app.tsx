@@ -78,6 +78,8 @@ import {
   supervisionTaskConsolePreferenceBounds,
 } from './components/SupervisionTaskConsole.js';
 import { CloudDocsGlyphIcon, CloudDocsPanel } from './components/CloudDocsPanel.js';
+import { GlobalTaskModeView, TaskModeGlyphIcon } from './components/GlobalTaskModeView.js';
+import { clearGlobalTaskModeSessionState, globalTaskModeStore } from './global-task-mode-store.js';
 import type { CloudDocsMainChatContext } from './components/CloudDocsMainChatFloat.js';
 import {
   executeCloudDocQuote,
@@ -1150,6 +1152,8 @@ function InternalMainApp() {
     clearRepoPageCache();
     clearSharedChangesCache();
     clearSessionRepoContexts();
+    setShowTaskMode(false);
+    clearGlobalTaskModeSessionState();
     if (preserveSharedRoute) {
       initialHashStateRef.current = sharedRoute;
       initialSharedTabRestoreRef.current = sharedRestoreMarker;
@@ -1253,6 +1257,27 @@ function InternalMainApp() {
   }, [showMobileServerMenu]);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [showCloudDocs, setShowCloudDocs] = useState(false);
+  const [showTaskMode, setShowTaskMode] = useState(false);
+  const [taskModeEntrySummary, setTaskModeEntrySummary] = useState(() => {
+    const active = globalTaskModeStore.getState().tasks.filter((t) => !t.isTerminal);
+    return {
+      attentionCount: active.filter((t) => t.needsAttention).length,
+      activeCount: active.length,
+    };
+  });
+  useEffect(() => {
+    return globalTaskModeStore.subscribe((next) => {
+      const active = next.tasks.filter((t) => !t.isTerminal);
+      setTaskModeEntrySummary({
+        attentionCount: active.filter((t) => t.needsAttention).length,
+        activeCount: active.length,
+      });
+    });
+  }, []);
+  const hasTaskModeAttention = taskModeEntrySummary.attentionCount > 0;
+  const taskModeBadgeCount = taskModeEntrySummary.attentionCount > 0
+    ? taskModeEntrySummary.attentionCount
+    : taskModeEntrySummary.activeCount;
   const showCloudDocsRef = useRef(showCloudDocs);
   showCloudDocsRef.current = showCloudDocs;
   const [cloudDocsRequest, setCloudDocsRequest] = useState<{ docId: string; seq: number } | null>(null);
@@ -6757,6 +6782,8 @@ function InternalMainApp() {
     clearRepoPageCache();
     clearSharedChangesCache();
     clearSessionRepoContexts();
+    setShowTaskMode(false);
+    clearGlobalTaskModeSessionState();
     setManualDashboard(false);
     setAutoEnteringRecent(false);
   }, [auth?.baseUrl, nativeServerUrl, setActiveSession]);
@@ -7353,6 +7380,18 @@ function InternalMainApp() {
     return () => { window.removeEventListener('deck:navigate', handler); window.removeEventListener('deck:view-discussion', discussionHandler); };
   }, [handleSelectServer, navigateToSession, runVersionSensitiveAction, trans]);
 
+  const handleJumpToGlobalTaskSession = useCallback((targetServerId: string, targetSessionName: string) => {
+    setShowTaskMode(false);
+    setManualDashboard(false);
+    if (!targetServerId || !targetSessionName) return;
+    if (targetServerId !== selectedServerIdRef.current) {
+      localStorage.setItem('rcc_push_target', targetSessionName);
+      void handleSelectServer(targetServerId);
+      return;
+    }
+    navigateToSession(targetSessionName);
+  }, [handleSelectServer, navigateToSession]);
+
   const handlePairSplit = useCallback((detail: {
     taskId: string;
     title?: string;
@@ -7905,6 +7944,7 @@ function InternalMainApp() {
     || showSharedContextManagement
     || showControlledNodes
     || showCloudDocs
+    || showTaskMode
     || showSharedContextDiagnostics
     || showDiscussionsPage
     || showDiscussionDialog
@@ -9119,6 +9159,22 @@ function InternalMainApp() {
               >
                 <CloudDocsGlyphIcon size={17} />
               </button>
+              <button
+                type="button"
+                class={`btn global-task-mode-entry-btn desktop-task-mode-btn${hasTaskModeAttention ? ' is-attention' : ''}`}
+                data-testid="desktop-task-mode-btn"
+                onClick={() => setShowTaskMode((prev) => !prev)}
+                title={trans('taskMode.title', 'Task Mode')}
+                aria-label={trans('taskMode.title', 'Task Mode')}
+                aria-pressed={showTaskMode}
+              >
+                <TaskModeGlyphIcon size={16} />
+                {taskModeBadgeCount > 0 && (
+                  <span class="global-task-mode-badge" data-testid="desktop-task-mode-badge">
+                    {taskModeBadgeCount}
+                  </span>
+                )}
+              </button>
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
                 class="btn"
@@ -9497,6 +9553,22 @@ function InternalMainApp() {
                   🌐
                 </button>
                 <button
+                  type="button"
+                  class={`view-toggle global-task-mode-entry-btn mobile-task-mode-btn${hasTaskModeAttention ? ' is-attention' : ''}`}
+                  data-testid="mobile-task-mode-btn"
+                  title={trans('taskMode.title', 'Task Mode')}
+                  aria-label={trans('taskMode.title', 'Task Mode')}
+                  onClick={() => setShowTaskMode((prev) => !prev)}
+                  aria-pressed={showTaskMode}
+                >
+                  <TaskModeGlyphIcon size={16} />
+                  {taskModeBadgeCount > 0 && (
+                    <span class="global-task-mode-badge" data-testid="mobile-task-mode-badge">
+                      {taskModeBadgeCount}
+                    </span>
+                  )}
+                </button>
+                <button
                   class="view-toggle"
                   data-testid="mobile-cloud-docs-btn"
                   title={trans('cloud_docs.title', 'Cloud Docs')}
@@ -9650,8 +9722,8 @@ function InternalMainApp() {
                 subSessions={subSessionsSlim}
                 ws={wsRef.current}
                 connected={connected}
-                isActive={s.name === activeSession}
-                keyboardActive={s.name === activeSession && openSubIds.size === 0}
+                isActive={!showTaskMode && s.name === activeSession}
+                keyboardActive={!showTaskMode && s.name === activeSession && openSubIds.size === 0}
                 viewMode={(viewModes[s.name] ?? defaultViewMode) as ViewMode}
                 quickData={quickData}
                 detectedModel={detectedModels.get(s.name)}
@@ -10589,6 +10661,18 @@ function InternalMainApp() {
         </div>
       )}
 
+      {showTaskMode && (
+        <div
+          class="global-task-mode-overlay"
+          data-testid="global-task-mode-overlay"
+        >
+          <GlobalTaskModeView
+            onExit={() => setShowTaskMode(false)}
+            onJumpToSession={handleJumpToGlobalTaskSession}
+          />
+        </div>
+      )}
+
       {showNewUserGuidePrompt && (
         <div class="ask-dialog-overlay" onClick={() => { setShowNewUserGuidePrompt(false); setGuidePromptSnoozed(true); }}>
           <div class="ask-dialog onboarding-choice-dialog" onClick={(e) => e.stopPropagation()}>
@@ -10681,7 +10765,7 @@ function InternalMainApp() {
 
       {/* Sub-session windows (floating) — only show if not pinned */}
       {retainedWindowSubs.slice(0, mountedWindowCount).map((sub) => {
-        const windowVisible = visibleOpenWindowIds.has(sub.id) && !mobileRemoteSurfaceActive;
+        const windowVisible = visibleOpenWindowIds.has(sub.id) && !mobileRemoteSurfaceActive && !showTaskMode;
         const activePair = activeSplitPairRef.current?.taskId === activeSplitPairTaskId ? activeSplitPairRef.current : null;
         const pairRole = activePair?.executorSubId === sub.id ? 'executor' : activePair?.auditorSubId === sub.id ? 'auditor' : null;
         return (

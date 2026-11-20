@@ -169,7 +169,9 @@ vi.mock('../src/api.js', () => {
     configureApiKey: (...args: unknown[]) => configureApiKeyMock(...args),
     discoverSharedEntries: (...args: unknown[]) => discoverSharedEntriesMock(...args),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
+    getApiBaseUrl: vi.fn(() => 'http://localhost'),
     getApiKey: vi.fn(() => 'api-key-1'),
+    sendSessionViaHttp: vi.fn(async () => ({ ok: true })),
     listManagedSharesForServer: (...args: unknown[]) => listManagedSharesForServerMock(...args),
     listP2pRuns: (...args: unknown[]) => listP2pRunsMock(...args),
     normalizeLocalWebPreviewPath: (path: string) => path.startsWith('/') ? path : `/${path}`,
@@ -9895,6 +9897,49 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
 
     fireEvent.click(desktopBtn);
     await waitFor(() => expect(desktopBtn.getAttribute('aria-pressed')).toBe('true'));
+  }, 15000);
+
+  it('renders desktop-task-mode-btn right of Cloud Docs and mobile-task-mode-btn left of Cloud Docs with breathing border, toggles pure task mode without WS when closed, and deactivates background SessionPane while open', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const desktopTaskBtn = await screen.findByTestId('desktop-task-mode-btn');
+    const mobileTaskBtn = await screen.findByTestId('mobile-task-mode-btn');
+    const desktopCloudBtn = screen.getByTestId('desktop-cloud-docs-btn');
+    const mobileCloudBtn = screen.getByTestId('mobile-cloud-docs-btn');
+
+    expect(desktopTaskBtn.classList.contains('global-task-mode-entry-btn')).toBe(true);
+    expect(desktopTaskBtn.classList.contains('desktop-cloud-docs-marquee-btn')).toBe(false);
+    expect(mobileTaskBtn.classList.contains('global-task-mode-entry-btn')).toBe(true);
+    expect(mobileTaskBtn.classList.contains('desktop-cloud-docs-marquee-btn')).toBe(false);
+
+    // Relative DOM placement: desktop task mode immediately follows Cloud Docs; mobile task mode precedes Cloud Docs
+    expect(desktopCloudBtn.nextElementSibling).toBe(desktopTaskBtn);
+    expect(mobileTaskBtn.nextElementSibling).toBe(mobileCloudBtn);
+
+    // Closed by default: GlobalTaskModeView is not mounted, no /api/global-tasks/ws-ticket call, and background SessionPane is active
+    expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+    expect(apiFetchMock.mock.calls.some((c) => String(c[0]).includes('/api/global-tasks/ws-ticket'))).toBe(false);
+    const pane = await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(pane.getAttribute('data-is-active')).toBe('true');
+
+    // Open Task Mode -> mounts overlay and marks background SessionPane inactive to prevent duplicate TTS
+    fireEvent.click(desktopTaskBtn);
+    expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+    expect(screen.getByTestId('global-task-mode-view')).toBeTruthy();
+    expect(pane.getAttribute('data-is-active')).toBe('false');
+    await waitFor(() => {
+      expect(apiFetchMock.mock.calls.some((c) => String(c[0]).includes('/api/global-tasks/ws-ticket'))).toBe(true);
+    });
+
+    // Exit Task Mode -> unmounts overlay and restores active SessionPane
+    fireEvent.click(screen.getByTestId('task-mode-exit-btn'));
+    await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+    expect(pane.getAttribute('data-is-active')).toBe('true');
   }, 15000);
 
   it('switches servers (up/down) and tabs (left/right, multi-step) via mobile 1-finger long-press swipes with watermark HUD', async () => {

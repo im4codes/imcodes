@@ -53,6 +53,7 @@ export interface GlobalTaskModeState {
   connecting: boolean;
   loading: boolean;
   error: string | null;
+  snapshotSeq: number;
   tasks: GlobalTaskSummaryRow[];
   brains: GlobalTaskBrainSummary[];
   servers: GlobalTaskServerSummary[];
@@ -300,6 +301,7 @@ export class GlobalTaskModeStore {
       connecting: false,
       loading: false,
       error: null,
+      snapshotSeq: 0,
       tasks: [],
       brains: [],
       servers: [],
@@ -511,6 +513,7 @@ export class GlobalTaskModeStore {
       connecting: false,
       loading: false,
       error: null,
+      snapshotSeq: 0,
       tasks: [],
       brains: [],
       servers: [],
@@ -721,6 +724,7 @@ export class GlobalTaskModeStore {
     this.brainTextOrder = nextBrainTextOrder;
     this.setState({
       loading: false,
+      snapshotSeq: this.state.snapshotSeq + 1,
       tasks,
       brains,
       servers,
