@@ -20,7 +20,12 @@ import {
   type VoiceRecognitionEngine,
 } from '../voice-recognition-backend.js';
 import type { PluginListenerHandle } from '@capacitor/core';
-import { getPcAppBridge, type PcAppBridge, type PcAppVoiceEvent } from '../native-platform.js';
+import {
+  getPcAppBridge,
+  isPcAppInlineVoiceSupported,
+  type PcAppBridge,
+  type PcAppVoiceEvent,
+} from '../native-platform.js';
 import { stopSpeaking } from '../tts.js';
 
 export {
@@ -137,7 +142,7 @@ function isCapacitorNative(): boolean {
 
 export function isPcAppNativeSpeech(): boolean {
   if (isCapacitorNative()) return false;
-  return getPcAppBridge()?.voice?.isNativeSpeechSupported?.() === true;
+  return isPcAppInlineVoiceSupported();
 }
 
 function isNative(): boolean {

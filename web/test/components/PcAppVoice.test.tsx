@@ -223,4 +223,48 @@ describe('PC App inline voice dictation and quick permission grant', () => {
     expect(document.body.querySelector('.voice-overlay')).not.toBeNull();
     delete (globalThis as any).SpeechRecognition;
   });
+
+  it('keeps standard VoiceOverlay fallback on Windows PC App when native speech is unsupported', async () => {
+    const startListeningMock = vi.fn(async () => ({ ok: true }));
+    const fakeWin = createFakePcAppBridge({
+      isNativeSpeechSupported: () => false,
+      startListening: startListeningMock,
+    });
+    fakeWin.bridge.platform = 'win32';
+    (globalThis as any).__IMCODES_PC_APP__ = fakeWin.bridge;
+    (globalThis as any).SpeechRecognition = class MockWebSpeech {
+      start = vi.fn();
+      stop = vi.fn();
+      abort = vi.fn();
+    };
+
+    expect(VoiceInput.isPcAppNativeSpeech()).toBe(false);
+    expect(VoiceInput.isAvailable()).toBe(true);
+
+    const { container } = render(
+      <SessionControls
+        ws={makeWs()}
+        activeSession={{
+          name: 'deck_app_brain',
+          project: 'app',
+          role: 'brain',
+          state: 'idle',
+          projectDir: '/work/app',
+          agentType: 'claude-code',
+        } as never}
+        quickData={quickData}
+        serverId="srv1"
+        sessions={[]}
+        subSessions={[]}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const micBtn = container.querySelector('button[data-voice-trigger="desktop"]') as HTMLButtonElement;
+    fireEvent.click(micBtn);
+    expect(document.body.querySelector('.voice-overlay')).not.toBeNull();
+    expect(startListeningMock).not.toHaveBeenCalled();
+    expect(container.querySelector('.voice-streaming-robot-cursor')).toBeNull();
+    delete (globalThis as any).SpeechRecognition;
+  });
 });

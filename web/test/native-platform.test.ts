@@ -15,6 +15,7 @@ import {
   isDesignedForIpadMac,
   isNativeMacDesktop,
   isPcAppDesktop,
+  isPcAppInlineVoiceSupported,
   shouldUseIosMacTextScale,
   type NativePlatformEnvironment,
 } from '../src/native-platform';
@@ -300,7 +301,20 @@ describe('native platform detection and uniform UI scaling', () => {
       },
     };
     expect(isPcAppDesktop(pcEnv)).toBe(true);
+    expect(isPcAppInlineVoiceSupported(pcEnv)).toBe(true);
     expect(getPcAppBridge(pcEnv)?.platform).toBe('darwin');
+
+    const winPcEnv: NativePlatformEnvironment = {
+      capacitor: undefined,
+      navigator: { platform: 'Win32', userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Electron/45.3.3' },
+      pcApp: {
+        platform: 'win32',
+        isElectron: true,
+        voice: { isNativeSpeechSupported: () => false },
+      },
+    };
+    expect(isPcAppDesktop(winPcEnv)).toBe(true);
+    expect(isPcAppInlineVoiceSupported(winPcEnv)).toBe(false);
     expect(isNativeMacDesktop(pcEnv)).toBe(false);
     expect(isDesignedForIpadMac(pcEnv)).toBe(false);
     expect(shouldUseIosMacTextScale(pcEnv)).toBe(false);

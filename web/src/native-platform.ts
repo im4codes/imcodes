@@ -107,6 +107,17 @@ export function isPcAppDesktop(env: NativePlatformEnvironment = readNativePlatfo
   return getPcAppBridge(env) !== null;
 }
 
+/**
+ * Returns true when running inside an Electron PC App shell whose native OS speech
+ * bridge is active (macOS Swift SFSpeechRecognizer). Windows `pc-app` returns false so
+ * it retains the standard VoiceOverlay fallback instead of routing to inline dictation.
+ */
+export function isPcAppInlineVoiceSupported(
+  env: NativePlatformEnvironment = readNativePlatformEnvironment(),
+): boolean {
+  return getPcAppBridge(env)?.voice?.isNativeSpeechSupported?.() === true;
+}
+
 function getNativePlatform(env: NativePlatformEnvironment): string | null {
   const capacitor = env.capacitor;
   if (capacitor?.isNativePlatform?.() !== true) return null;

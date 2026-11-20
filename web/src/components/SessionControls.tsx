@@ -118,7 +118,7 @@ import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
 import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
-import { getPcAppBridge, isNativeMacDesktop, isPcAppDesktop } from '../native-platform.js';
+import { getPcAppBridge, isNativeMacDesktop, isPcAppInlineVoiceSupported } from '../native-platform.js';
 import { setBackgroundTransferKeepAliveLabels } from '../background-transfer-keepalive.js';
 import { getUploadBackgroundEpoch, isUploadEnvironmentSuspended } from '../upload-suspend-wait.js';
 import {
@@ -2235,13 +2235,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [macDesktop, setMacDesktop] = useState(() => isNativeMacDesktop());
   const macDesktopRef = useRef(macDesktop);
   macDesktopRef.current = macDesktop;
-  const [pcAppDesktop, setPcAppDesktop] = useState(() => isPcAppDesktop());
-  const inlineDesktopVoice = macDesktop || pcAppDesktop;
+  const [pcAppInlineVoice, setPcAppInlineVoice] = useState(() => isPcAppInlineVoiceSupported());
+  const inlineDesktopVoice = macDesktop || pcAppInlineVoice;
   const inlineDesktopVoiceRef = useRef(inlineDesktopVoice);
   inlineDesktopVoiceRef.current = inlineDesktopVoice;
   useEffect(() => subscribeDeviceLayoutChange(() => {
     setMacDesktop(isNativeMacDesktop());
-    setPcAppDesktop(isPcAppDesktop());
+    setPcAppInlineVoice(isPcAppInlineVoiceSupported());
   }, { includeResize: false }), []);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [voiceOverlayInitialText, setVoiceOverlayInitialText] = useState<string | null>(null);
@@ -6632,7 +6632,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleVoiceButtonActivate = useCallback(() => {
     if (inputDisabledRef.current) return;
-    if (inlineDesktopVoiceRef.current || isNativeMacDesktop() || isPcAppDesktop()) {
+    if (inlineDesktopVoiceRef.current || isNativeMacDesktop() || isPcAppInlineVoiceSupported()) {
       if (inlineVoiceActiveRef.current) {
         stopInlineVoice({ abort: true, restoreCaret: true });
       } else {
@@ -10297,7 +10297,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               : t('voice.mic_permission_failed')}
           </span>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
-            {(pcAppDesktop || getPcAppBridge()?.voice) && (
+            {(pcAppInlineVoice || getPcAppBridge()?.voice) && (
               <button
                 type="button"
                 data-testid="inline-voice-grant-btn"
