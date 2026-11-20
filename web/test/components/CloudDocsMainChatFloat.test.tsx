@@ -897,4 +897,39 @@ describe('CloudDocsMainChatFloat', () => {
     await waitFor(() => expect(screen.getByTestId('mini-quote-pill-0').textContent).toContain('[RemoteDesktop: Win Server 02 | id=srv-win-02]'));
     expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]?.onRemoteDesktopClick).toBe(onRemoteDesktopClick);
   });
+
+  it('hides only the robot FAB when hideFab is true while keeping an expanded mini chat open and interactive, and restores FAB when hideFab becomes false', async () => {
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+
+    const view = render(<CloudDocsMainChatFloat mainChat={mainChat} hideFab={false} />);
+    const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+    expect(fab.classList.contains('is-entering')).toBe(true);
+    const entranceEv = new Event('animationend', { bubbles: false });
+    Object.defineProperty(entranceEv, 'animationName', { value: 'cloudDocsFabEntrance' });
+    fireEvent(fab, entranceEv);
+    expect(fab.classList.contains('is-entering')).toBe(false);
+
+    // Expand mini chat before keyboard opens
+    fireEvent.click(fab);
+    const miniChat = await screen.findByTestId('cloud-docs-mini-chat');
+    expect(miniChat).toBeTruthy();
+
+    // Opening keyboard hides only the robot button; mini chat remains visible & usable for typing
+    view.rerender(<CloudDocsMainChatFloat mainChat={mainChat} hideFab={true} />);
+    expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull();
+    expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+    fireEvent.click(screen.getByTestId('mock-mini-send'));
+
+    // Closing keyboard shows the robot button again without replaying the entrance animation
+    view.rerender(<CloudDocsMainChatFloat mainChat={mainChat} hideFab={false} />);
+    const restoredFab = screen.getByTestId('cloud-docs-main-chat-fab');
+    expect(restoredFab).toBeTruthy();
+    expect(restoredFab.classList.contains('is-entering')).toBe(false);
+    expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+
+    // Closing mini chat works while hideFab is false
+    fireEvent.click(screen.getByTestId('cloud-docs-mini-chat-close'));
+    expect(screen.queryByTestId('cloud-docs-mini-chat')).toBeNull();
+  });
 });

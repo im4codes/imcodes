@@ -51,13 +51,26 @@ vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
 }));
 
 vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
-  RemoteDesktopPanel: ({ machine, active, inputActive }: {
+  RemoteDesktopPanel: ({ machine, active, inputActive, onMobileKeyboardOpenChange }: {
     machine: { serverId: string };
     active: boolean;
     inputActive: boolean;
+    onMobileKeyboardOpenChange?: (open: boolean) => void;
   }) => (
     <div data-testid={`panel-${machine.serverId}`} hidden={!active}>
       {String(active)}:{String(inputActive)}
+      <button
+        type="button"
+        data-testid={`panel-kb-open-${machine.serverId}`}
+        aria-label={`kb-open-${machine.serverId}`}
+        onClick={() => onMobileKeyboardOpenChange?.(true)}
+      />
+      <button
+        type="button"
+        data-testid={`panel-kb-close-${machine.serverId}`}
+        aria-label={`kb-close-${machine.serverId}`}
+        onClick={() => onMobileKeyboardOpenChange?.(false)}
+      />
     </div>
   ),
 }));
@@ -1210,5 +1223,179 @@ describe('RemoteDesktopWorkspace', () => {
     />);
     await waitFor(() => expect(screen.queryByTestId('cloud-docs-mini-chat-reattach')).toBeNull());
     expect(screen.queryByTestId('rd-mock-quote-0')).toBeNull();
+  });
+
+  it('hides only the robot FAB when panel or system soft keyboards open (preserving expanded mini chat) and restores it when closed', async () => {
+    localStorage.clear();
+    document.documentElement.classList.remove('kb-open', 'input-focused');
+
+    const hostA = machine('srv-alpha');
+    const hostB = machine('srv-beta');
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, hostA);
+    state = openRemoteDesktopWorkspaceHost(state, hostB);
+    const [hostAKey, hostBKey] = state.orderedHostKeys as [string, string];
+    const { manager } = setupManager();
+    const session: SessionInfo = {
+      name: 'deck_proj_brain',
+      label: 'MainBrain',
+      project: 'codedeck',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/repo',
+    };
+    const mainChat: CloudDocsMainChatContext = {
+      session,
+      sessions: [session],
+      subSessions: [],
+      ws: { connected: true, onMessage: () => () => {}, sendSessionCommand: vi.fn() } as unknown as WsClient,
+      connected: true,
+      serverId: 'srv-1',
+      quickData: {
+        loaded: true,
+        history: [],
+        commands: [],
+        phrases: [],
+        reload: vi.fn(),
+        recordHistory: vi.fn(),
+        addCommand: vi.fn(),
+        updateCommand: vi.fn(),
+        removeCommand: vi.fn(),
+        addPhrase: vi.fn(),
+        removePhrase: vi.fn(),
+      } as unknown as CloudDocsMainChatContext['quickData'],
+    };
+
+    const origInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    const origVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const origMatchMedia = window.matchMedia;
+    let vvHeight = 800;
+    const vvListeners = new Map<string, Set<() => void>>();
+    const mockVv = {
+      get height() { return vvHeight; },
+      offsetTop: 0,
+      addEventListener: (name: string, cb: () => void) => {
+        if (!vvListeners.has(name)) vvListeners.set(name, new Set());
+        vvListeners.get(name)!.add(cb);
+      },
+      removeEventListener: (name: string, cb: () => void) => {
+        vvListeners.get(name)?.delete(cb);
+      },
+    };
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: mockVv });
+    let coarsePointer = false;
+    window.matchMedia = vi.fn((query: string) => ({
+      matches: query === '(pointer: coarse)' ? coarsePointer : false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as typeof window.matchMedia;
+
+    try {
+      const view = render(<RemoteDesktopWorkspace
+        state={state}
+        manager={manager}
+        mainChat={mainChat}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+
+      // Expand mini chat first; robot FAB is visible initially
+      const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+      fireEvent.click(fab);
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy());
+
+      // Desktop text input focus with no viewport shrink and non-coarse pointer does NOT hide robot FAB
+      const desktopInput = document.createElement('textarea');
+      document.body.appendChild(desktopInput);
+      desktopInput.focus();
+      fireEvent.focusIn(desktopInput);
+      expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy();
+      fireEvent.focusOut(desktopInput);
+      desktopInput.remove();
+
+      // 1. Active RemoteDesktopPanel keyboard opens -> hides FAB, keeps mini chat visible
+      fireEvent.click(screen.getByTestId('panel-kb-open-srv-beta'));
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+
+      // Switching to tab hostA (whose keyboard is closed) restores FAB without losing hostB state
+      view.rerender(<RemoteDesktopWorkspace
+        state={activateRemoteDesktopWorkspaceTab(state, hostAKey)}
+        manager={manager}
+        mainChat={mainChat}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+
+      // Switching back to hostB hides FAB again, then closing hostB's keyboard restores FAB
+      view.rerender(<RemoteDesktopWorkspace
+        state={activateRemoteDesktopWorkspaceTab(state, hostBKey)}
+        manager={manager}
+        mainChat={mainChat}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      fireEvent.click(screen.getByTestId('panel-kb-close-srv-beta'));
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+
+      // 2. System keyboard via :root.kb-open hides FAB while keeping mini chat visible, then restores
+      act(() => { document.documentElement.classList.add('kb-open'); });
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+      act(() => { document.documentElement.classList.remove('kb-open'); });
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+
+      // 3. System keyboard via visualViewport shrink (standalone mode without app.tsx) hides & restores FAB
+      vvHeight = 480;
+      act(() => {
+        for (const cb of vvListeners.get('resize') ?? []) cb();
+      });
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+
+      vvHeight = 800;
+      act(() => {
+        for (const cb of vvListeners.get('resize') ?? []) cb();
+      });
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+
+      // 4. Coarse pointer + text input focus hides FAB and focusout restores it
+      coarsePointer = true;
+      const touchInput = document.createElement('textarea');
+      document.body.appendChild(touchInput);
+      touchInput.focus();
+      fireEvent.focusIn(touchInput);
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+      touchInput.blur();
+      fireEvent.focusOut(touchInput);
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+      touchInput.remove();
+    } finally {
+      document.documentElement.classList.remove('kb-open', 'input-focused');
+      window.matchMedia = origMatchMedia;
+      if (origInnerHeight) Object.defineProperty(window, 'innerHeight', origInnerHeight);
+      if (origVisualViewport) Object.defineProperty(window, 'visualViewport', origVisualViewport);
+      else delete (window as { visualViewport?: VisualViewport }).visualViewport;
+    }
   });
 });

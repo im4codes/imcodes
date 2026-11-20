@@ -1750,6 +1750,50 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
   });
 
+  it('notifies onMobileKeyboardOpenChange when opening ime or keys keyboard tabs and resets on close or unmount', async () => {
+    const onMobileKeyboardOpenChange = vi.fn();
+    const manager = new RemoteDesktopConnectionManager();
+    const rendered = render(
+      <RemoteDesktopPanel
+        machine={{
+          serverId: 'srv-kb-cb',
+          refName: 'srv-kb-cb',
+          displayName: 'KB Host',
+          os: 'win',
+          online: true,
+          execEnabled: true,
+          accessRole: 'owner',
+          capabilities: [REMOTE_DESKTOP_CAPABILITY],
+        }}
+        connectionManager={manager}
+        onClose={vi.fn()}
+        onMobileKeyboardOpenChange={onMobileKeyboardOpenChange}
+      />,
+    );
+    await act(async () => { await Promise.resolve(); });
+    onMobileKeyboardOpenChange.mockClear();
+
+    act(() => { (rendered.getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    expect(onMobileKeyboardOpenChange).toHaveBeenLastCalledWith(true);
+
+    // Switching from ime tab to virtual PC keys tab keeps keyboard open state true
+    onMobileKeyboardOpenChange.mockClear();
+    act(() => {
+      (rendered.getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+    });
+    expect(onMobileKeyboardOpenChange).not.toHaveBeenCalledWith(false);
+
+    // Closing keyboard notifies false
+    act(() => { (rendered.getByRole('button', { name: 'remote_desktop.close_mobile_keyboard' }) as HTMLButtonElement).click(); });
+    expect(onMobileKeyboardOpenChange).toHaveBeenLastCalledWith(false);
+
+    // Re-opening keyboard and unmounting resets parent state back to false
+    act(() => { (rendered.getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    expect(onMobileKeyboardOpenChange).toHaveBeenLastCalledWith(true);
+    rendered.unmount();
+    expect(onMobileKeyboardOpenChange).toHaveBeenLastCalledWith(false);
+  });
+
   it('keeps the remote screen at its size while the mobile keyboard is open', async () => {
     const { container, getByRole } = await renderPanel();
     const stage = container.querySelector('.remote-desktop-stage') as HTMLElement;

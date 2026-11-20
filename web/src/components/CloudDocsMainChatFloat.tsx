@@ -70,6 +70,7 @@ interface CloudDocsMainChatFloatProps {
   maxHeight?: number;
   overlayClassName?: string;
   visible?: boolean;
+  hideFab?: boolean;
 }
 
 function getLayoutStorageKey(heightStorageKey: string | undefined): string | undefined {
@@ -297,6 +298,7 @@ export function CloudDocsMainChatFloat({
   maxHeight,
   overlayClassName,
   visible = true,
+  hideFab = false,
 }: CloudDocsMainChatFloatProps) {
   const { t } = useTranslation();
   const safeMinWidth = useMemo(
@@ -1108,40 +1110,42 @@ export function CloudDocsMainChatFloat({
         </div>
       )}
 
-      <button
-        type="button"
-        class={`cloud-docs-fab${expanded ? ' active' : ''}${isBusy ? ' busy' : ''}${isEntering ? ' is-entering' : ''}${overlayClassSuffix}`}
-        onClick={() => setExpanded((prev) => !prev)}
-        onAnimationEnd={(event) => {
-          if (event.target !== event.currentTarget) return;
-          if (event.animationName && event.animationName !== 'cloudDocsFabEntrance') return;
-          setIsEntering(false);
-        }}
-        aria-expanded={expanded}
-        aria-label={expanded
-          ? t('cloud_docs.ai_chat.collapse', 'Collapse AI chat')
-          : t('cloud_docs.ai_chat.open', { session: sessionDisplayName })}
-        title={expanded
-          ? t('cloud_docs.ai_chat.collapse', 'Collapse AI chat')
-          : t('cloud_docs.ai_chat.open', { session: sessionDisplayName })}
-        data-testid="cloud-docs-main-chat-fab"
-      >
-        <span class="cloud-docs-fab-aura" aria-hidden="true" />
-        <span class="cloud-docs-fab-ring" aria-hidden="true" />
-        <img
-          class="cloud-docs-fab-avatar"
-          src="/imcodes-robot-avatar.png"
-          alt="IM.codes AI"
-          draggable={false}
-        />
-        {isBusy && (
-          <span
-            class="cloud-docs-fab-busy-dot"
-            aria-hidden="true"
-            data-testid="cloud-docs-fab-busy-dot"
+      {!hideFab && (
+        <button
+          type="button"
+          class={`cloud-docs-fab${expanded ? ' active' : ''}${isBusy ? ' busy' : ''}${isEntering ? ' is-entering' : ''}${overlayClassSuffix}`}
+          onClick={() => setExpanded((prev) => !prev)}
+          onAnimationEnd={(event) => {
+            if (event.target !== event.currentTarget) return;
+            if (event.animationName && event.animationName !== 'cloudDocsFabEntrance') return;
+            setIsEntering(false);
+          }}
+          aria-expanded={expanded}
+          aria-label={expanded
+            ? t('cloud_docs.ai_chat.collapse', 'Collapse AI chat')
+            : t('cloud_docs.ai_chat.open', { session: sessionDisplayName })}
+          title={expanded
+            ? t('cloud_docs.ai_chat.collapse', 'Collapse AI chat')
+            : t('cloud_docs.ai_chat.open', { session: sessionDisplayName })}
+          data-testid="cloud-docs-main-chat-fab"
+        >
+          <span class="cloud-docs-fab-aura" aria-hidden="true" />
+          <span class="cloud-docs-fab-ring" aria-hidden="true" />
+          <img
+            class="cloud-docs-fab-avatar"
+            src="/imcodes-robot-avatar.png"
+            alt="IM.codes AI"
+            draggable={false}
           />
-        )}
-      </button>
+          {isBusy && (
+            <span
+              class="cloud-docs-fab-busy-dot"
+              aria-hidden="true"
+              data-testid="cloud-docs-fab-busy-dot"
+            />
+          )}
+        </button>
+      )}
     </div>
   );
 }

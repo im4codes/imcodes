@@ -425,6 +425,8 @@ export interface RemoteDesktopPanelProps {
   onFocus?(): void;
   /** Account-scoped quick-input state shared with chat and every desktop host. */
   quickData?: UseQuickDataResult;
+  /** Notify parent workspace when this panel's mobile/virtual keyboard is open. */
+  onMobileKeyboardOpenChange?: (open: boolean) => void;
 }
 
 interface RemoteDesktopTransferRow {
@@ -469,6 +471,7 @@ export function RemoteDesktopPanel({
   zIndex,
   onFocus,
   quickData,
+  onMobileKeyboardOpenChange,
 }: RemoteDesktopPanelProps) {
   recordPerfRender('RemoteDesktopPanel');
   const { t } = useTranslation();
@@ -2879,6 +2882,16 @@ export function RemoteDesktopPanel({
       setMobileKeyboardViewportInset(0);
     };
   }, [mobileTextOpen]);
+
+  const onMobileKeyboardOpenChangeRef = useRef(onMobileKeyboardOpenChange);
+  onMobileKeyboardOpenChangeRef.current = onMobileKeyboardOpenChange;
+  const mobileKeyboardOpen = mobileTextOpen || mobileKeyboardViewportInset > 0;
+  useEffect(() => {
+    onMobileKeyboardOpenChangeRef.current?.(mobileKeyboardOpen);
+  }, [mobileKeyboardOpen]);
+  useEffect(() => () => {
+    onMobileKeyboardOpenChangeRef.current?.(false);
+  }, []);
 
   const comboModifierFlags = (keys: readonly RemoteDesktopChordKey[]) => ({
     control: keys.some((k) => k.code === 'ControlLeft' || k.code === 'ControlRight'),

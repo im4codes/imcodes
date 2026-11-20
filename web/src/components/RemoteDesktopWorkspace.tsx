@@ -30,10 +30,43 @@ import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { ControlledNodeMachineMenu } from './ControlledNodeMachineMenu.js';
 import { CloudDocsMainChatFloat, type CloudDocsMainChatContext } from './CloudDocsMainChatFloat.js';
 import { REMOTE_DESKTOP_OVERLAY_CLASS } from '../remote-desktop-pointer-overlay.js';
+import { isMobileKeyboardInputTarget } from '../mobile-keyboard.js';
+import { getActiveCssZoom } from '../ui-scale.js';
+import { boundedVisualViewportHeight } from '../visual-viewport.js';
 import './remote-desktop-workspace.css';
 import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 
 export const REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY = 'imcodes_rd_mini_chat_height_v1';
+
+function detectSystemKeyboardOpen(): boolean {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return false;
+  const root = document.documentElement;
+  if (root.classList.contains('kb-open')) return true;
+
+  const activeEl = document.activeElement;
+  const inputFocused = isMobileKeyboardInputTarget(activeEl);
+  const vv = window.visualViewport;
+  if (vv && typeof window.innerHeight === 'number' && window.innerHeight > 0) {
+    const cssZoom = getActiveCssZoom(document);
+    const viewportHeight = boundedVisualViewportHeight(
+      vv.height,
+      window.innerHeight,
+      root.clientHeight,
+      cssZoom,
+    );
+    if (viewportHeight !== null) {
+      const shrink = Math.max(0, window.innerHeight - viewportHeight);
+      if (shrink > 40 || (inputFocused && shrink > 15)) return true;
+    }
+  }
+
+  const isCoarsePointer = typeof window.matchMedia === 'function'
+    && window.matchMedia('(pointer: coarse)').matches;
+  if (isCoarsePointer && (root.classList.contains('input-focused') || inputFocused)) {
+    return true;
+  }
+  return false;
+}
 
 export interface RemoteDesktopWorkspaceProps {
   state: RemoteDesktopWorkspaceState;
@@ -95,6 +128,61 @@ export function RemoteDesktopWorkspace({
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const minimizeOriginRef = useRef<RemoteDesktopMinimizeOrigin | null>(null);
   const wasMinimizedRef = useRef(minimized);
+  const [mobileKeyboardOpenByHost, setMobileKeyboardOpenByHost] = useState<Record<string, boolean>>({});
+  const [systemKeyboardOpen, setSystemKeyboardOpen] = useState<boolean>(() => detectSystemKeyboardOpen());
+
+  const handleHostKeyboardOpenChange = useCallback((hostKey: string, open: boolean) => {
+    setMobileKeyboardOpenByHost((prev) => {
+      const current = Boolean(prev[hostKey]);
+      if (current === open) return prev;
+      if (!open) {
+        const next = { ...prev };
+        delete next[hostKey];
+        return next;
+      }
+      return { ...prev, [hostKey]: true };
+    });
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    let focusOutTimer: ReturnType<typeof setTimeout> | undefined;
+    const sync = () => {
+      setSystemKeyboardOpen(detectSystemKeyboardOpen());
+    };
+    const onFocusOut = () => {
+      sync();
+      if (focusOutTimer !== undefined) clearTimeout(focusOutTimer);
+      focusOutTimer = setTimeout(sync, 0);
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') sync();
+    };
+    sync();
+
+    const observer = typeof MutationObserver === 'function'
+      ? new MutationObserver(() => sync())
+      : null;
+    observer?.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', sync);
+    vv?.addEventListener('scroll', sync);
+    window.addEventListener('resize', sync);
+    document.addEventListener('focusin', sync);
+    document.addEventListener('focusout', onFocusOut);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      if (focusOutTimer !== undefined) clearTimeout(focusOutTimer);
+      observer?.disconnect();
+      vv?.removeEventListener('resize', sync);
+      vv?.removeEventListener('scroll', sync);
+      window.removeEventListener('resize', sync);
+      document.removeEventListener('focusin', sync);
+      document.removeEventListener('focusout', onFocusOut);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, []);
 
   useEffect(() => {
     const wasMinimized = wasMinimizedRef.current;
@@ -358,6 +446,7 @@ export function RemoteDesktopWorkspace({
           quickData={quickData}
           onClose={() => closeHost(hostKey)}
           onAuthorityLost={() => closeHost(hostKey)}
+          onMobileKeyboardOpenChange={(open) => handleHostKeyboardOpenChange(hostKey, open)}
         />
       ))}
       {mainChat && (
@@ -369,6 +458,7 @@ export function RemoteDesktopWorkspace({
           heightStorageKey={REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY}
           overlayClassName={REMOTE_DESKTOP_OVERLAY_CLASS}
           visible={!minimized}
+          hideFab={Boolean(activeHost && mobileKeyboardOpenByHost[activeHost.hostKey]) || systemKeyboardOpen}
         />
       )}
     </div>
