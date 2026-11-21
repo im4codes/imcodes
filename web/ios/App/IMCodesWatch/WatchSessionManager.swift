@@ -43,6 +43,9 @@ final class WatchSessionManager: NSObject, ObservableObject {
     private var routeTimeoutWorkItem: DispatchWorkItem?
     private var networkLoadedSessionServers: Set<String> = []
     private var loadingSessionServers: Set<String> = []
+    private var isLoadingAllPinnedSessions = false
+    private var isHydratingAllPinnedSessions = false
+    private var allPinnedBatchToken: UInt64 = 0
     private var lastSnapshotRequestAt: Date = .distantPast
 
     private override init() {
@@ -132,28 +135,28 @@ final class WatchSessionManager: NSObject, ObservableObject {
         "\(cachedSessionsKeyPrefix)\(serverId)"
     }
 
-    private static func sanitizedCacheComponent(_ value: String) -> String {
+    nonisolated private static func sanitizedCacheComponent(_ value: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._"))
         let mapped = value.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
         let result = String(mapped)
         return result.isEmpty || result == "." || result == ".." ? "_" : result
     }
 
-    private static func cachedSessionsFileName(for serverId: String) -> String {
+    nonisolated private static func cachedSessionsFileName(for serverId: String) -> String {
         "imcodes.watch.cachedSessions.\(sanitizedCacheComponent(serverId)).json"
     }
 
-    private static func cacheFileURL(named name: String) -> URL? {
+    nonisolated private static func cacheFileURL(named name: String) -> URL? {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
             .appendingPathComponent(name, isDirectory: false)
     }
 
-    private static func readCacheData(named name: String) -> Data? {
+    nonisolated private static func readCacheData(named name: String) -> Data? {
         guard let url = cacheFileURL(named: name) else { return nil }
         return try? Data(contentsOf: url)
     }
 
-    private static func writeCacheData(_ data: Data, named name: String) {
+    nonisolated private static func writeCacheData(_ data: Data, named name: String) {
         guard let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
             return
         }
@@ -164,8 +167,41 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     private func hydrateCachedSessions(for serverId: String) {
         if serverId == Self.allPinnedServerId {
-            for server in displayServers {
-                hydrateCachedSessions(for: server.id)
+            guard !isHydratingAllPinnedSessions else { return }
+            let serverIds = displayServers.map(\.id).filter {
+                !networkLoadedSessionServers.contains($0) && sessionsByServerId[$0] == nil
+            }
+            guard !serverIds.isEmpty else { return }
+            let batchToken = allPinnedBatchToken
+            isHydratingAllPinnedSessions = true
+            Task.detached(priority: .userInitiated) { [weak self] in
+                var decodedByServer: [String: [WatchSessionRow]] = [:]
+                let decoder = JSONDecoder()
+                for id in serverIds {
+                    if Task.isCancelled { break }
+                    let fileName = Self.cachedSessionsFileName(for: id)
+                    guard let data = Self.readCacheData(named: fileName),
+                          let decoded = try? decoder.decode([WatchSessionRow].self, from: data) else {
+                        continue
+                    }
+                    decodedByServer[id] = decoded
+                }
+                let snapshot = decodedByServer
+                await MainActor.run { [weak self, snapshot] in
+                    guard let self else { return }
+                    self.isHydratingAllPinnedSessions = false
+                    guard self.isAllPinnedSelected, self.allPinnedBatchToken == batchToken else { return }
+                    if !snapshot.isEmpty {
+                        var next = self.sessionsByServerId
+                        for (id, rows) in snapshot where !self.networkLoadedSessionServers.contains(id) && next[id] == nil {
+                            next[id] = rows
+                        }
+                        self.sessionsByServerId = next
+                        for id in snapshot.keys {
+                            self.seedVisibleHistoriesIfNeeded(serverId: id, pinnedOnly: true)
+                        }
+                    }
+                }
             }
             return
         }
@@ -238,18 +274,31 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
         if targetServerId == Self.allPinnedServerId {
             var seenIds: Set<String> = []
-            var aggregated: [WatchSessionRow] = []
+            var filtered: [WatchSessionRow] = []
             for server in displayServers {
                 let serverRows = sessionsByServerId[server.id]
                     ?? (loadedSessionsServerId == server.id
                         ? sessionRows.filter { $0.serverId == server.id }
                         : applicationContext.sessions.filter { $0.serverId == server.id })
-                for row in serverRows where seenIds.insert(row.id).inserted {
-                    aggregated.append(row)
+                var pinnedMainNames: Set<String> = []
+                for row in serverRows where !Self.isSubSessionRow(row) && (row.isPinned ?? false) {
+                    pinnedMainNames.insert(row.sessionName)
+                }
+                for row in serverRows {
+                    let keep: Bool
+                    if Self.isSubSessionRow(row) {
+                        keep = (row.isPinned ?? false)
+                            || (row.parentSessionName.map { pinnedMainNames.contains($0) } ?? false)
+                    } else {
+                        keep = row.isPinned ?? false
+                    }
+                    if keep, seenIds.insert(row.id).inserted {
+                        filtered.append(row)
+                    }
                 }
             }
             return Self.sortSessions(
-                aggregated,
+                filtered,
                 pinnedServerIds: Set(displayServers.filter { $0.isPinned ?? false }.map(\.id))
             )
         }
@@ -422,18 +471,23 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     /// Light refresh — reload sessions and task statuses (no servers). Used by auto-poll timer and view switches.
-    func refreshSessions() async {
+    func refreshSessions(includeSessions: Bool = true) async {
         guard canUseDirectApi else { return }
         async let tasksStep: Void = loadGlobalTasks(force: true)
-        if isAllPinnedSelected {
-            await loadAllPinnedSessions(force: true)
-        } else if let selectedServerId {
-            await loadSessions(serverId: selectedServerId, force: true)
+        if includeSessions {
+            if isAllPinnedSelected {
+                await loadAllPinnedSessions(force: true)
+            } else if let selectedServerId {
+                await loadSessions(serverId: selectedServerId, force: true)
+            }
         }
         _ = await tasksStep
     }
 
     func selectServer(_ serverId: String) async {
+        allPinnedBatchToken &+= 1
+        isLoadingAllPinnedSessions = false
+        isHydratingAllPinnedSessions = false
         if selectedServerId != serverId {
             selectedServerId = serverId
             activeRoute = nil
@@ -450,6 +504,9 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     func selectAllPinnedSessions() async {
         if selectedServerId != Self.allPinnedServerId {
+            allPinnedBatchToken &+= 1
+            isLoadingAllPinnedSessions = false
+            isHydratingAllPinnedSessions = false
             selectedServerId = Self.allPinnedServerId
             activeRoute = nil
             UserDefaults.standard.set(Self.allPinnedServerId, forKey: Self.selectedServerIdKey)
@@ -461,21 +518,129 @@ final class WatchSessionManager: NSObject, ObservableObject {
         resolvePendingRouteIfPossible()
     }
 
+    nonisolated private static func fetchAndCacheServerSessions(
+        restClient: WatchRestClient,
+        serverId: String,
+        baseUrl: URL,
+        apiKey: String,
+        manualNames: Set<String>
+    ) async -> (String, Result<[WatchSessionRow], Error>) {
+        do {
+            let response = try await restClient.fetchSessions(
+                baseUrl: baseUrl,
+                serverId: serverId,
+                apiKey: apiKey
+            )
+            let rowsToCache = Self.prepareSessionsForCache(response.sessions, manualNames: manualNames)
+            if let encoded = try? JSONEncoder().encode(rowsToCache) {
+                Self.writeCacheData(encoded, named: Self.cachedSessionsFileName(for: serverId))
+            }
+            return (serverId, .success(response.sessions))
+        } catch {
+            return (serverId, .failure(error))
+        }
+    }
+
     private func loadAllPinnedSessions(force: Bool) async {
-        guard canUseDirectApi else { return }
+        guard canUseDirectApi, let apiKey = currentApiKey() else { return }
+        guard !isLoadingAllPinnedSessions else { return }
+        let batchToken = allPinnedBatchToken
+        isLoadingAllPinnedSessions = true
+        defer {
+            if self.allPinnedBatchToken == batchToken {
+                self.isLoadingAllPinnedSessions = false
+            }
+        }
+
         if servers.isEmpty {
             await loadServers(force: false)
         }
-        let targetServerIds = displayServers.map(\.id)
-        await withTaskGroup(of: Void.self) { group in
-            for serverId in targetServerIds {
-                if !force && networkLoadedSessionServers.contains(serverId) {
-                    continue
+        guard isAllPinnedSelected, allPinnedBatchToken == batchToken else { return }
+
+        let serverTargets: [(serverId: String, baseUrl: URL, manualNames: Set<String>)] = displayServers.compactMap { server in
+            if !force && networkLoadedSessionServers.contains(server.id) {
+                return nil
+            }
+            guard let baseUrl = currentBaseUrl(for: server.id) else { return nil }
+            return (server.id, baseUrl, manualSessionNames(for: server.id))
+        }
+        guard !serverTargets.isEmpty else { return }
+
+        let batchResult = await Task.detached(priority: .userInitiated) { [restClient] in
+            var fetchedByServer: [String: [WatchSessionRow]] = [:]
+            var firstError: String?
+
+            await withTaskGroup(of: (String, Result<[WatchSessionRow], Error>).self) { group in
+                let maxConcurrent = 4
+                var nextIndex = 0
+
+                while nextIndex < serverTargets.count && nextIndex < maxConcurrent {
+                    let target = serverTargets[nextIndex]
+                    nextIndex += 1
+                    group.addTask {
+                        await Self.fetchAndCacheServerSessions(
+                            restClient: restClient,
+                            serverId: target.serverId,
+                            baseUrl: target.baseUrl,
+                            apiKey: apiKey,
+                            manualNames: target.manualNames
+                        )
+                    }
                 }
-                group.addTask {
-                    await self.loadSessions(serverId: serverId, force: force)
+
+                while let (serverId, result) = await group.next() {
+                    switch result {
+                    case .success(let rows):
+                        fetchedByServer[serverId] = rows
+                    case .failure(let error):
+                        if firstError == nil {
+                            firstError = (error as? WatchRestClient.WatchRestError)?.errorDescription
+                                ?? error.localizedDescription
+                        }
+                    }
+
+                    if nextIndex < serverTargets.count && !Task.isCancelled {
+                        let target = serverTargets[nextIndex]
+                        nextIndex += 1
+                        group.addTask {
+                            await Self.fetchAndCacheServerSessions(
+                                restClient: restClient,
+                                serverId: target.serverId,
+                                baseUrl: target.baseUrl,
+                                apiKey: apiKey,
+                                manualNames: target.manualNames
+                            )
+                        }
+                    }
                 }
             }
+            return (fetchedByServer, firstError)
+        }.value
+
+        guard isAllPinnedSelected, allPinnedBatchToken == batchToken else { return }
+
+        let (fetchedByServer, firstError) = batchResult
+        if !fetchedByServer.isEmpty {
+            var nextSessionsByServer = sessionsByServerId
+            for (serverId, rows) in fetchedByServer {
+                nextSessionsByServer[serverId] = rows
+                networkLoadedSessionServers.insert(serverId)
+                let legacyKey = Self.cachedSessionsKey(for: serverId)
+                if UserDefaults.standard.object(forKey: legacyKey) != nil {
+                    UserDefaults.standard.removeObject(forKey: legacyKey)
+                }
+            }
+            sessionsByServerId = nextSessionsByServer
+            isUsingFallbackSnapshot = false
+            lastErrorMessage = nil
+            for (serverId, rows) in fetchedByServer {
+                pruneSessionState(for: serverId, keepingSessionNames: Set(rows.map(\.sessionName)))
+                seedVisibleHistoriesIfNeeded(serverId: serverId, pinnedOnly: true)
+            }
+            resolvePendingRouteIfPossible()
+        } else if let firstError {
+            isUsingFallbackSnapshot = true
+            lastErrorMessage = firstError
         }
     }
 
@@ -734,9 +899,14 @@ final class WatchSessionManager: NSObject, ObservableObject {
                 loadedSessionsServerId = serverId
             }
             networkLoadedSessionServers.insert(serverId)
-            let rowsToCache = prepareSessionsForCache(response.sessions, serverId: serverId)
-            if let encoded = try? JSONEncoder().encode(rowsToCache) {
-                Self.writeCacheData(encoded, named: Self.cachedSessionsFileName(for: serverId))
+            let fetchedSessions = response.sessions
+            let manualNames = manualSessionNames(for: serverId)
+            let cacheFileName = Self.cachedSessionsFileName(for: serverId)
+            Task.detached(priority: .utility) {
+                let rowsToCache = Self.prepareSessionsForCache(fetchedSessions, manualNames: manualNames)
+                if let encoded = try? JSONEncoder().encode(rowsToCache) {
+                    Self.writeCacheData(encoded, named: cacheFileName)
+                }
             }
             let legacyKey = Self.cachedSessionsKey(for: serverId)
             if UserDefaults.standard.object(forKey: legacyKey) != nil {
@@ -744,7 +914,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
             }
             isUsingFallbackSnapshot = false
             lastErrorMessage = nil
-            pruneSessionState(for: serverId, keepingSessionNames: Set(response.sessions.map(\.sessionName)))
+            pruneSessionState(for: serverId, keepingSessionNames: Set(fetchedSessions.map(\.sessionName)))
             seedVisibleHistoriesIfNeeded(serverId: serverId)
             resolvePendingRouteIfPossible()
         } catch let error as WatchRestClient.WatchRestError {
@@ -765,8 +935,11 @@ final class WatchSessionManager: NSObject, ObservableObject {
         do {
             let nextTasks = try await restClient.fetchGlobalTasks(baseUrl: baseUrl, apiKey: apiKey)
             globalTasks = nextTasks
-            if let encoded = try? JSONEncoder().encode(nextTasks) {
-                Self.writeCacheData(encoded, named: Self.cachedGlobalTasksFileName)
+            let cacheFileName = Self.cachedGlobalTasksFileName
+            Task.detached(priority: .utility) {
+                if let encoded = try? JSONEncoder().encode(nextTasks) {
+                    Self.writeCacheData(encoded, named: cacheFileName)
+                }
             }
             if UserDefaults.standard.object(forKey: Self.cachedGlobalTasksKey) != nil {
                 UserDefaults.standard.removeObject(forKey: Self.cachedGlobalTasksKey)
@@ -840,19 +1013,20 @@ final class WatchSessionManager: NSObject, ObservableObject {
         historyByRoute[route.id] = seededHistoryState(for: route)
     }
 
-    private static func isSubSessionRow(_ row: WatchSessionRow) -> Bool {
+    nonisolated private static let autoShowAllMainSessionLimitCount = 5
+
+    nonisolated private static func isSubSessionRow(_ row: WatchSessionRow) -> Bool {
         row.isSubSession || row.sessionName.hasPrefix("deck_sub_") || row.parentSessionName != nil
     }
 
-    private func visibleSessionNameSet(in sessions: [WatchSessionRow], serverId: String) -> Set<String> {
+    nonisolated private static func visibleSessionNameSet(in sessions: [WatchSessionRow], manualNames: Set<String>) -> Set<String> {
         let mainRows = sessions.filter { !Self.isSubSessionRow($0) }
-        guard mainRows.count > Self.autoShowAllMainSessionLimit else {
+        guard mainRows.count > Self.autoShowAllMainSessionLimitCount else {
             return Set(sessions.map(\.sessionName))
         }
-        let manual = manualSessionNames(for: serverId)
         let visibleMainNames = Set(
             mainRows
-                .filter { ($0.isPinned ?? false) || manual.contains($0.sessionName) }
+                .filter { ($0.isPinned ?? false) || manualNames.contains($0.sessionName) }
                 .map(\.sessionName)
         )
         var visible = visibleMainNames
@@ -864,14 +1038,14 @@ final class WatchSessionManager: NSObject, ObservableObject {
         return visible
     }
 
-    private func prepareSessionsForCache(_ sessions: [WatchSessionRow], serverId: String) -> [WatchSessionRow] {
+    nonisolated private static func prepareSessionsForCache(_ sessions: [WatchSessionRow], manualNames: Set<String>) -> [WatchSessionRow] {
         let mainCount = sessions.reduce(into: 0) { count, row in
             if !Self.isSubSessionRow(row) { count += 1 }
         }
-        guard mainCount > Self.autoShowAllMainSessionLimit else {
+        guard mainCount > Self.autoShowAllMainSessionLimitCount else {
             return sessions
         }
-        let visibleNames = visibleSessionNameSet(in: sessions, serverId: serverId)
+        let visibleNames = visibleSessionNameSet(in: sessions, manualNames: manualNames)
         return sessions.map { row in
             if visibleNames.contains(row.sessionName) {
                 return row
@@ -882,10 +1056,33 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
     }
 
-    private func seedVisibleHistoriesIfNeeded(serverId: String) {
-        let serverSessions = displaySessions(for: serverId)
-        let visibleNames = visibleSessionNameSet(in: serverSessions, serverId: serverId)
-        for row in serverSessions where visibleNames.contains(row.sessionName) {
+    private func seedVisibleHistoriesIfNeeded(serverId: String, pinnedOnly: Bool = false) {
+        let serverSessions = sessionsByServerId[serverId]
+            ?? (loadedSessionsServerId == serverId
+                ? sessionRows.filter { $0.serverId == serverId }
+                : applicationContext.sessions.filter { $0.serverId == serverId })
+        guard !serverSessions.isEmpty else { return }
+
+        let targetRows: [WatchSessionRow]
+        if pinnedOnly {
+            var pinnedMainNames: Set<String> = []
+            for row in serverSessions where !Self.isSubSessionRow(row) && (row.isPinned ?? false) {
+                pinnedMainNames.insert(row.sessionName)
+            }
+            targetRows = serverSessions.filter { row in
+                if Self.isSubSessionRow(row) {
+                    return (row.isPinned ?? false)
+                        || (row.parentSessionName.map { pinnedMainNames.contains($0) } ?? false)
+                }
+                return row.isPinned ?? false
+            }
+        } else {
+            let manual = manualSessionNames(for: serverId)
+            let visibleNames = Self.visibleSessionNameSet(in: serverSessions, manualNames: manual)
+            targetRows = serverSessions.filter { visibleNames.contains($0.sessionName) }
+        }
+
+        for row in targetRows {
             let route = WatchRoute(serverId: row.serverId, sessionName: row.sessionName, title: row.title)
             if historyByRoute[route.id] == nil {
                 historyByRoute[route.id] = seededHistoryState(for: route)

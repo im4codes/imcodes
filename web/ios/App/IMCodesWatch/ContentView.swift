@@ -384,7 +384,10 @@ struct ContentView: View {
     var body: some View {
         NavigationStack(path: $path) {
             Group {
-                if sessionManager.currentApiKey() == nil && currentSessions.isEmpty && currentTasks.isEmpty {
+                if sessionManager.currentApiKey() == nil
+                    && sessionManager.applicationContext.sessions.isEmpty
+                    && sessionManager.sessionsByServerId.isEmpty
+                    && currentTasks.isEmpty {
                     VStack(spacing: 8) {
                         Text("Open IM.codes on iPhone")
                             .font(.footnote)
@@ -524,7 +527,7 @@ struct ContentView: View {
                     try? await Task.sleep(for: .seconds(12))
                     guard !Task.isCancelled else { break }
                     if scenePhase == .active {
-                        await sessionManager.refreshSessions()
+                        await sessionManager.refreshSessions(includeSessions: viewMode == .sessions)
                     }
                 }
             }
@@ -532,8 +535,8 @@ struct ContentView: View {
                 guard newPhase == .active else { return }
                 Task { await sessionManager.refreshOnForeground() }
             }
-            .onChange(of: viewMode) { _ in
-                Task { await sessionManager.refreshSessions() }
+            .onChange(of: viewMode) { newMode in
+                Task { await sessionManager.refreshSessions(includeSessions: newMode == .sessions) }
             }
             .onChange(of: sessionManager.activeRoute) { newRoute in
                 guard let newRoute else { return }
