@@ -4561,6 +4561,7 @@
     "resolution_menu": "{{display}} 的分辨率",
     "resolution_hint": "右键或长按可切换分辨率",
     "dpi_menu": "Windows DPI 缩放",
+    "dpi_auto": "自动 ({{percent}}%)",
     "clipboard_label": "剪贴板",
     "copy_remote_selection": "复制远端选中文字",
     "paste_local_clipboard": "粘贴",

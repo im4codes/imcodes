@@ -4561,6 +4561,7 @@
     "resolution_menu": "Resolution for {{display}}",
     "resolution_hint": "Right-click or press and hold to change resolution",
     "dpi_menu": "Windows DPI scale",
+    "dpi_auto": "Auto ({{percent}}%)",
     "clipboard_label": "Clipboard",
     "copy_remote_selection": "Copy remote selection",
     "paste_local_clipboard": "Paste",

@@ -4559,6 +4559,7 @@
     "resolution_menu": "{{display}} 해상도",
     "resolution_hint": "마우스 오른쪽 버튼을 클릭하거나 길게 눌러 해상도 변경",
     "dpi_menu": "Windows DPI 배율",
+    "dpi_auto": "자동 ({{percent}}%)",
     "clipboard_label": "클립보드",
     "copy_remote_selection": "원격 선택 텍스트 복사",
     "paste_local_clipboard": "붙여넣기",

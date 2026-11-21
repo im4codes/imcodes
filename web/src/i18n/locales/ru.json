@@ -4559,6 +4559,7 @@
     "resolution_menu": "Разрешение для {{display}}",
     "resolution_hint": "Щёлкните правой кнопкой или удерживайте, чтобы изменить разрешение",
     "dpi_menu": "Масштаб DPI Windows",
+    "dpi_auto": "Авто ({{percent}}%)",
     "clipboard_label": "Буфер обмена",
     "copy_remote_selection": "Копировать выделение с удалённого ПК",
     "paste_local_clipboard": "Вставить",

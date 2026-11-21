@@ -4560,6 +4560,7 @@
     "resolution_menu": "{{display}} 的解析度",
     "resolution_hint": "按右鍵或長按可切換解析度",
     "dpi_menu": "Windows DPI 縮放",
+    "dpi_auto": "自動 ({{percent}}%)",
     "clipboard_label": "剪貼簿",
     "copy_remote_selection": "複製遠端選取文字",
     "paste_local_clipboard": "貼上",

@@ -260,7 +260,11 @@ vi.mock('../src/components/FileBrowser.js', () => ({
   },
 }));
 
-import { RemoteDesktopPanel, resolveRemoteDesktopBrowserOpenUrl } from '../src/components/RemoteDesktopPanel.js';
+import {
+  RemoteDesktopPanel,
+  recommendRemoteDesktopDpiPercent,
+  resolveRemoteDesktopBrowserOpenUrl,
+} from '../src/components/RemoteDesktopPanel.js';
 import { RemoteDesktopWorkspace } from '../src/components/RemoteDesktopWorkspace.js';
 import type { UseQuickDataResult } from '../src/components/QuickInputPanel.js';
 import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
@@ -1429,6 +1433,70 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     ));
     act(() => { (secondModes[0] as HTMLButtonElement).click(); });
     expect(setDisplayMode).toHaveBeenCalledWith('display-second', 1280, 720);
+  });
+
+  it('places Windows DPI scale side-by-side with resolution options and updates DPI automatically when Auto DPI is enabled', async () => {
+    expect(recommendRemoteDesktopDpiPercent(5120, 2880)).toBe(250);
+    expect(recommendRemoteDesktopDpiPercent(3840, 2160)).toBe(200);
+    expect(recommendRemoteDesktopDpiPercent(2560, 1600)).toBe(150);
+    expect(recommendRemoteDesktopDpiPercent(2560, 1440)).toBe(150);
+    expect(recommendRemoteDesktopDpiPercent(1920, 1440)).toBe(125);
+    expect(recommendRemoteDesktopDpiPercent(1920, 1080)).toBe(100);
+    expect(recommendRemoteDesktopDpiPercent(1280, 720)).toBe(100);
+
+    const { getByRole, getAllByRole, getByTestId } = await renderPanel();
+    const displayTab = getByRole('tab', { name: 'remote_desktop.display_name_main' });
+    const openMenu = () => {
+      act(() => {
+        displayTab.dispatchEvent(new MouseEvent('contextmenu', {
+          bubbles: true,
+          cancelable: true,
+          clientX: 40,
+          clientY: 50,
+        }));
+      });
+    };
+
+    openMenu();
+    const menu = getByRole('menu');
+    const columns = menu.querySelector('.remote-desktop-display-menu-columns');
+    const resCol = menu.querySelector('.remote-desktop-resolution-col');
+    const dpiCol = menu.querySelector('.remote-desktop-dpi-col');
+    expect(columns).not.toBeNull();
+    expect(resCol).not.toBeNull();
+    expect(dpiCol).not.toBeNull();
+    expect(resCol?.contains(getAllByRole('menuitemradio').find((m) => m.textContent?.includes('×'))!)).toBe(true);
+    expect(dpiCol?.contains(getByTestId('remote-desktop-dpi-auto'))).toBe(true);
+    expect(dpiCol?.contains(getByRole('menuitemradio', { name: '150% DPI' }))).toBe(true);
+
+    // Enable Auto DPI -> immediately applies recommended DPI for current 1920x1080 display (100%)
+    act(() => { (getByTestId('remote-desktop-dpi-auto') as HTMLButtonElement).click(); });
+    expect(setDisplayScale).toHaveBeenCalledWith('display-primary', 100);
+
+    // Switch resolution to 4K while Auto DPI is active -> sends both setDisplayMode and setDisplayScale(200)
+    setDisplayScale.mockClear();
+    setDisplayMode.mockClear();
+    openMenu();
+    expect(getByTestId('remote-desktop-dpi-auto').getAttribute('aria-checked')).toBe('true');
+    const mode4k = getAllByRole('menuitemradio').find((mode) => mode.textContent?.includes('3840×2160'))!;
+    act(() => { (mode4k as HTMLButtonElement).click(); });
+    expect(setDisplayMode).toHaveBeenCalledWith('display-primary', 3840, 2160);
+    expect(setDisplayScale).toHaveBeenCalledWith('display-primary', 200);
+
+    // Selecting a manual DPI turns off Auto DPI for subsequent resolution switches
+    setDisplayScale.mockClear();
+    setDisplayMode.mockClear();
+    openMenu();
+    act(() => { (getByRole('menuitemradio', { name: '125% DPI' }) as HTMLButtonElement).click(); });
+    expect(setDisplayScale).toHaveBeenCalledWith('display-primary', 125);
+
+    setDisplayScale.mockClear();
+    openMenu();
+    expect(getByTestId('remote-desktop-dpi-auto').getAttribute('aria-checked')).toBe('false');
+    const mode1080p = getAllByRole('menuitemradio').find((mode) => mode.textContent?.includes('1920×1080'))!;
+    act(() => { (mode1080p as HTMLButtonElement).click(); });
+    expect(setDisplayMode).toHaveBeenCalledWith('display-primary', 1920, 1080);
+    expect(setDisplayScale).not.toHaveBeenCalled();
   });
 
   it('focuses the stage for physical keyboard input and supports explicit copy and paste', async () => {

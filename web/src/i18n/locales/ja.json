@@ -4559,6 +4559,7 @@
     "resolution_menu": "{{display}} の解像度",
     "resolution_hint": "右クリックまたは長押しで解像度を変更",
     "dpi_menu": "Windows DPI スケール",
+    "dpi_auto": "自動 ({{percent}}%)",
     "clipboard_label": "クリップボード",
     "copy_remote_selection": "リモートの選択文字をコピー",
     "paste_local_clipboard": "貼り付け",

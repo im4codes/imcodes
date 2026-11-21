@@ -14274,8 +14274,12 @@ button.quick-agent-delegation-preset.active {
 .remote-desktop-resolution-menu {
   position: fixed;
   z-index: 10020;
-  width: 216px;
-  padding: 7px;
+  width: auto;
+  min-width: min(390px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  max-height: min(calc(var(--imcodes-ui-vh, 100vh) * 0.7), 520px);
+  overflow-y: auto;
+  padding: 8px;
   color: #e9f7ff;
   background: rgb(5 19 32 / 98%);
   border: 1px solid rgb(99 201 255 / 48%);
@@ -14283,9 +14287,33 @@ button.quick-agent-delegation-preset.active {
   box-shadow: 0 16px 42px rgb(0 0 0 / 58%);
 }
 
-.remote-desktop-resolution-menu > strong {
+.remote-desktop-display-menu-columns {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.remote-desktop-resolution-col {
+  flex: 1 1 180px;
+  min-width: 170px;
+  max-height: min(calc(var(--imcodes-ui-vh, 100vh) * 0.7) - 18px, 420px);
+  overflow-y: auto;
+}
+
+.remote-desktop-dpi-col {
+  flex: 1 0 196px;
+  min-width: 196px;
+  padding-left: 10px;
+  border-left: 1px solid rgb(99 201 255 / 18%);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.remote-desktop-resolution-menu strong {
   display: block;
-  padding: 5px 7px 8px;
+  padding: 4px 6px 6px;
   overflow: hidden;
   color: #b9dcf3;
   font-size: 11px;
@@ -14295,12 +14323,12 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-resolution-menu button {
   width: 100%;
-  min-height: 38px;
+  min-height: 36px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 7px 9px;
+  padding: 6px 9px;
   color: #e9f7ff;
   background: transparent;
   border: 0;
@@ -14328,6 +14356,15 @@ button.quick-agent-delegation-preset.active {
   opacity: .72;
 }
 
+.remote-desktop-resolution-menu .remote-desktop-dpi-auto {
+  min-height: 32px;
+  justify-content: center;
+  padding: 5px 8px;
+  border: 1px solid rgb(99 201 255 / 26%);
+  font-size: 12px;
+  font-weight: 500;
+}
+
 .remote-desktop-dpi-options {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -14338,6 +14375,15 @@ button.quick-agent-delegation-preset.active {
   min-height: 32px;
   justify-content: center;
   padding: 5px 3px;
+}
+
+@media (max-width: 460px) {
+  .remote-desktop-dpi-col {
+    padding-left: 0;
+    padding-top: 8px;
+    border-left: 0;
+    border-top: 1px solid rgb(99 201 255 / 18%);
+  }
 }
 
 .remote-desktop-clipboard-switch {
@@ -14368,11 +14414,6 @@ button.quick-agent-delegation-preset.active {
   pointer-events: none;
   z-index: 1;
   animation: toast-in .18s ease-out;
-}
-
-.remote-desktop-resolution-menu {
-  max-height: min(calc(var(--imcodes-ui-vh, 100vh) * 0.7), 520px);
-  overflow-y: auto;
 }
 
 .remote-desktop-resolution-note {

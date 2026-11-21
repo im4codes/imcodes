@@ -301,6 +301,16 @@ function displayModeOptions(
   }));
 }
 
+/** Recommend a Windows DPI scale percentage suited to the target display resolution. */
+export function recommendRemoteDesktopDpiPercent(width: number, height: number): number {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return 100;
+  if (height >= 2880 || width >= 5120) return 250;
+  if (height >= 2160 || width >= 3840) return 200;
+  if (height >= 1600 || width >= 2560) return 150;
+  if (height >= 1440) return 125;
+  return 100;
+}
+
 /** How long a refused-command notice stays up before it fades on its own. */
 const CONTROL_NOTICE_MS = 6_000;
 /** How long the clipboard toast stays up before it fades on its own. */
@@ -603,6 +613,7 @@ export function RemoteDesktopPanel({
   const [quickInputOpen, setQuickInputOpen] = useState(false);
   const [quickInputPortalContainer, setQuickInputPortalContainer] = useState<Element | null>(null);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
+  const [autoDpiByDisplayId, setAutoDpiByDisplayId] = useState<Record<string, boolean>>({});
   const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus>('idle');
   const [mediaPresented, setMediaPresented] = useState(false);
   const [mediaRecovering, setMediaRecovering] = useState(false);
@@ -1497,9 +1508,10 @@ export function RemoteDesktopPanel({
     const rect = target.getBoundingClientRect();
     const requestedX = clientX && clientX > 0 ? clientX : rect.left;
     const requestedY = clientY && clientY > 0 ? clientY : rect.bottom;
+    const menuWidth = Math.min(430, Math.max(216, window.innerWidth - 24));
     setDisplayModeMenu({
       displayId,
-      x: Math.max(8, Math.min(requestedX, window.innerWidth - 224)),
+      x: Math.max(8, Math.min(requestedX, window.innerWidth - menuWidth - 12)),
       y: Math.max(8, Math.min(requestedY, window.innerHeight - 460)),
     });
   };
@@ -3607,6 +3619,9 @@ export function RemoteDesktopPanel({
         {displayModeMenu && (() => {
           const display = snapshot.displays.find((candidate) => candidate.id === displayModeMenu.displayId);
           if (!display?.available) return null;
+          const isAutoDpi = autoDpiByDisplayId[display.id] === true;
+          const recommendedDpiPercent = recommendRemoteDesktopDpiPercent(display.width, display.height);
+          const currentDpiPercent = Math.round(display.dpiScale * 100);
           return (
             <div
               ref={displayModeMenuRef}
@@ -3615,47 +3630,78 @@ export function RemoteDesktopPanel({
               aria-label={t('remote_desktop.resolution_menu', { display: remoteDesktopDisplayName(t, snapshot.displays, display) })}
               style={{ left: `${displayModeMenu.x}px`, top: `${displayModeMenu.y}px` }}
             >
-              <strong>{t('remote_desktop.resolution_menu', { display: remoteDesktopDisplayName(t, snapshot.displays, display) })}</strong>
-              {displayModeOptions(display).map((mode) => (
-                <button
-                  key={`${mode.width}x${mode.height}`}
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={display.width === mode.width && display.height === mode.height}
-                  // Clickable whenever this viewer holds control: when input is
-                  // not ready the click still gets an explanation, which beats a
-                  // grey button that never says why.
-                  disabled={snapshot.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL}
-                  onClick={() => {
-                    clientRef.current?.setDisplayMode(display.id, mode.width, mode.height);
-                    setDisplayModeMenu(null);
-                  }}
-                >
-                  <span>{mode.label ?? `${mode.width}×${mode.height}`}</span>
-                  <small>{mode.label ? `${mode.width}×${mode.height}` : ''}</small>
-                </button>
-              ))}
-              {display.modes === undefined && (
-                <small class="remote-desktop-resolution-note">
-                  {t('remote_desktop.resolution_unreported')}
-                </small>
-              )}
-              <strong>{t('remote_desktop.dpi_menu')}</strong>
-              <div class="remote-desktop-dpi-options" role="group" aria-label={t('remote_desktop.dpi_menu')}>
-                {REMOTE_DESKTOP_DPI_SCALE_PERCENTS.map((dpiScalePercent) => (
+              <div class="remote-desktop-display-menu-columns">
+                <div class="remote-desktop-resolution-col">
+                  <strong>{t('remote_desktop.resolution_menu', { display: remoteDesktopDisplayName(t, snapshot.displays, display) })}</strong>
+                  {displayModeOptions(display).map((mode) => (
+                    <button
+                      key={`${mode.width}x${mode.height}`}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={display.width === mode.width && display.height === mode.height}
+                      // Clickable whenever this viewer holds control: when input is
+                      // not ready the click still gets an explanation, which beats a
+                      // grey button that never says why.
+                      disabled={snapshot.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL}
+                      onClick={() => {
+                        clientRef.current?.setDisplayMode(display.id, mode.width, mode.height);
+                        if (isAutoDpi) {
+                          clientRef.current?.setDisplayScale(
+                            display.id,
+                            recommendRemoteDesktopDpiPercent(mode.width, mode.height),
+                          );
+                        }
+                        setDisplayModeMenu(null);
+                      }}
+                    >
+                      <span>{mode.label ?? `${mode.width}×${mode.height}`}</span>
+                      <small>{mode.label ? `${mode.width}×${mode.height}` : ''}</small>
+                    </button>
+                  ))}
+                  {display.modes === undefined && (
+                    <small class="remote-desktop-resolution-note">
+                      {t('remote_desktop.resolution_unreported')}
+                    </small>
+                  )}
+                </div>
+                <div class="remote-desktop-dpi-col">
+                  <strong>{t('remote_desktop.dpi_menu')}</strong>
                   <button
-                    key={dpiScalePercent}
                     type="button"
                     role="menuitemradio"
-                    aria-label={`${dpiScalePercent}% DPI`}
-                    aria-checked={Math.round(display.dpiScale * 100) === dpiScalePercent}
+                    class="remote-desktop-dpi-auto"
+                    data-testid="remote-desktop-dpi-auto"
+                    aria-label={t('remote_desktop.dpi_auto', { percent: recommendedDpiPercent })}
+                    aria-checked={isAutoDpi}
                     disabled={snapshot.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL}
                     onClick={() => {
-                      clientRef.current?.setDisplayScale(display.id, dpiScalePercent);
+                      setAutoDpiByDisplayId((current) => ({ ...current, [display.id]: true }));
+                      clientRef.current?.setDisplayScale(display.id, recommendedDpiPercent);
                       setDisplayModeMenu(null);
                     }}
-                  >{dpiScalePercent}%</button>
-                ))}
+                  >
+                    <span>{t('remote_desktop.dpi_auto', { percent: recommendedDpiPercent })}</span>
+                  </button>
+                  <div class="remote-desktop-dpi-options" role="group" aria-label={t('remote_desktop.dpi_menu')}>
+                    {REMOTE_DESKTOP_DPI_SCALE_PERCENTS.map((dpiScalePercent) => (
+                      <button
+                        key={dpiScalePercent}
+                        type="button"
+                        role="menuitemradio"
+                        aria-label={`${dpiScalePercent}% DPI`}
+                        aria-checked={!isAutoDpi && currentDpiPercent === dpiScalePercent}
+                        disabled={snapshot.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL}
+                        onClick={() => {
+                          setAutoDpiByDisplayId((current) => (
+                            current[display.id] ? { ...current, [display.id]: false } : current
+                          ));
+                          clientRef.current?.setDisplayScale(display.id, dpiScalePercent);
+                          setDisplayModeMenu(null);
+                        }}
+                      >{dpiScalePercent}%</button>
+                    ))}
+                  </div>
+                </div>
               </div>
             </div>
           );

@@ -4560,6 +4560,7 @@
     "resolution_menu": "Resolución de {{display}}",
     "resolution_hint": "Haz clic derecho o mantén pulsado para cambiar la resolución",
     "dpi_menu": "Escala DPI de Windows",
+    "dpi_auto": "Automático ({{percent}}%)",
     "clipboard_label": "Portapapeles",
     "copy_remote_selection": "Copiar selección remota",
     "paste_local_clipboard": "Pegar",
