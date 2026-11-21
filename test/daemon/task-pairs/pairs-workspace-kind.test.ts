@@ -429,4 +429,75 @@ describe('pair_workspace_gc (on-demand cleanup of ended pairs)', () => {
     await expect(notBrain[MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC]({ dryRun: false })).resolves.toMatchObject({ status: 'error' });
     expect(existsSync(pair(recent).workspace!.path)).toBe(true);
   });
+
+  it('preserves exact cherry semantics across 50+ branches, split commits, empty-diff commits, and non-primary integrations', async () => {
+    // Create >50 branches so gc exercises the indexed multi-branch fast path rather than the <=8 ref fallback.
+    const baseTip = git(project, 'rev-parse', 'HEAD');
+    for (let i = 0; i < 55; i++) {
+      writeFileSync(join(project, `bulk-${i}.txt`), `branch ${i}\n`);
+      git(project, 'add', `bulk-${i}.txt`);
+      git(project, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'commit', '-qm', `bulk ${i}`);
+      const tip = git(project, 'rev-parse', 'HEAD');
+      git(project, 'branch', `bulk/b${String(i).padStart(2, '0')}`, tip);
+      git(project, 'reset', '--hard', baseTip);
+    }
+
+    const commitFile = (wt: string, filename: string, content: string, message: string): string => {
+      writeFileSync(join(wt, filename), content);
+      git(wt, 'add', filename);
+      git(wt, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'commit', '-qm', message);
+      return git(wt, 'rev-parse', 'HEAD');
+    };
+
+    const cherryPicked = await endedPair('worktree', 'gc-many-cherry', 'cancel');
+    const cherrySha = commitFile(pair(cherryPicked).workspace!.path, 'picked.txt', 'picked\n', 'cherry-pickable');
+    git(project, 'checkout', '-q', 'bulk/b27');
+    git(project, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'cherry-pick', cherrySha);
+    git(project, 'checkout', '-q', '-');
+
+    const split = await endedPair('worktree', 'gc-many-split', 'cancel');
+    const splitPath = pair(split).workspace!.path;
+    const split1 = commitFile(splitPath, 'split1.txt', 'one\n', 'split part 1');
+    const split2 = commitFile(splitPath, 'split2.txt', 'two\n', 'split part 2');
+    git(project, 'checkout', '-q', 'bulk/b10');
+    git(project, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'cherry-pick', split1);
+    git(project, 'checkout', '-q', 'bulk/b20');
+    git(project, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'cherry-pick', split2);
+    git(project, 'checkout', '-q', '-');
+
+    const branchMerged = await endedPair('worktree', 'gc-many-merged', 'cancel');
+    const mergedSha = commitFile(pair(branchMerged).workspace!.path, 'merged.txt', 'merged\n', 'merged into bulk/b40');
+    git(project, 'branch', '-f', 'bulk/b40', mergedSha);
+
+    const emptyCommitUnpushed = await endedPair('worktree', 'gc-many-empty-unpushed', 'cancel');
+    const emptyWt = pair(emptyCommitUnpushed).workspace!.path;
+    const nonEmptyPart = commitFile(emptyWt, 'real.txt', 'real\n', 'non-empty commit');
+    git(emptyWt, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'commit', '--allow-empty', '-qm', 'evidence: empty unpushed');
+    git(project, 'checkout', '-q', 'bulk/b30');
+    git(project, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'cherry-pick', nonEmptyPart);
+    git(project, 'checkout', '-q', '-');
+
+    const emptyCommitMatched = await endedPair('worktree', 'gc-many-empty-matched', 'cancel');
+    const emptyMatchedWt = pair(emptyCommitMatched).workspace!.path;
+    git(emptyMatchedWt, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'commit', '--allow-empty', '-qm', 'evidence: empty matched');
+    git(project, 'checkout', '-q', 'bulk/b35');
+    git(project, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'commit', '--allow-empty', '-qm', 'evidence: empty on branch');
+    git(project, 'checkout', '-q', '-');
+
+    const dry = await gc({ dryRun: true, limit: 20 });
+    expect(entryOf(dry, cherryPicked)).toMatchObject({ action: 'would_remove' });
+    expect(entryOf(dry, split)).toMatchObject({ action: 'kept', reason: 'unpushed' });
+    expect(entryOf(dry, branchMerged)).toMatchObject({ action: 'would_remove' });
+    expect(entryOf(dry, emptyCommitUnpushed)).toMatchObject({ action: 'kept', reason: 'unpushed' });
+    expect(entryOf(dry, emptyCommitMatched)).toMatchObject({ action: 'would_remove' });
+
+    const applied = await gc({ dryRun: false, limit: 20 });
+    expect(entryOf(applied, cherryPicked)).toMatchObject({ action: 'removed' });
+    expect(entryOf(applied, split)).toMatchObject({ action: 'kept', reason: 'unpushed' });
+    expect(entryOf(applied, branchMerged)).toMatchObject({ action: 'removed' });
+    expect(entryOf(applied, emptyCommitUnpushed)).toMatchObject({ action: 'kept', reason: 'unpushed' });
+    expect(entryOf(applied, emptyCommitMatched)).toMatchObject({ action: 'removed' });
+    expect(existsSync(pair(split).workspace!.path)).toBe(true);
+    expect(existsSync(pair(emptyCommitUnpushed).workspace!.path)).toBe(true);
+  });
 });

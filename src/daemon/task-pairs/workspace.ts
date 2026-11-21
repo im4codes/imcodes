@@ -50,6 +50,7 @@ import {
   removeRegisteredGitWorktree,
   type SupervisionWorktreeGitInspection,
   type SupervisionWorktreeMetadata,
+  type TaskPairBranchPatchCache,
 } from '../supervision-worktree-gc.js';
 import { imcodesStateDir } from '../../util/imcodes-state-dir.js';
 
@@ -192,9 +193,15 @@ export interface TaskPairWorkspaceDeps {
   /** Re-check ownership/liveness immediately before deleting the workspace. */
   beforeRemove?: () => boolean | Promise<boolean>;
   /** Count pair commits not integrated into any local or remote branch. */
-  countCommitsNotInAnyBranch?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
+  countCommitsNotInAnyBranch?: (
+    repoPath: string,
+    baseRevision: string,
+    options?: { cache?: TaskPairBranchPatchCache },
+  ) => Promise<number | undefined>;
   /** @deprecated Use countCommitsNotInAnyBranch. */
   countCommitsNotInDev?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
+  /** Optional sweep-scoped patch-id cache shared across multiple worktree inspections. */
+  branchPatchCache?: TaskPairBranchPatchCache;
   /** Non-git projects: the copy-on-write primitive (tests simulate a filesystem without it). */
   cloneEngine?: CloneEngine | CloneFile;
   /** Non-git projects: the home directory to refuse as a project root (default os.homedir()). */
@@ -408,7 +415,15 @@ export async function describeKeptTaskPairWorkspace(
   if (!workspace || workspace.kind !== 'worktree') return {};
   const [unintegratedCommits, lastCommit] = await Promise.all([
     workspace.base
-      ? Promise.resolve((deps.countCommitsNotInAnyBranch ?? deps.countCommitsNotInDev ?? countTaskPairCommitsNotInAnyBranch)(workspace.path, workspace.base)).catch(() => undefined)
+      ? Promise.resolve(
+        deps.countCommitsNotInAnyBranch
+          ? (deps.branchPatchCache
+            ? deps.countCommitsNotInAnyBranch(workspace.path, workspace.base, { cache: deps.branchPatchCache })
+            : deps.countCommitsNotInAnyBranch(workspace.path, workspace.base))
+          : deps.countCommitsNotInDev
+            ? deps.countCommitsNotInDev(workspace.path, workspace.base)
+            : countTaskPairCommitsNotInAnyBranch(workspace.path, workspace.base, deps.branchPatchCache ? { cache: deps.branchPatchCache } : undefined),
+      ).catch(() => undefined)
       : Promise.resolve(undefined),
     new Promise<string | undefined>((resolvePromise) => execFile(
       'git', ['-C', workspace.path, 'log', '-1', '--format=%h %s'], { timeout: GIT_PROBE_TIMEOUT_MS },
@@ -463,9 +478,13 @@ export async function releaseTaskPairWorkspace(
     : workspace.base
       ? await (
         deps.countCommitsNotInAnyBranch
-        ?? deps.countCommitsNotInDev
-        ?? countTaskPairCommitsNotInAnyBranch
-      )(repoPath, workspace.base)
+          ? (deps.branchPatchCache
+            ? deps.countCommitsNotInAnyBranch(repoPath, workspace.base, { cache: deps.branchPatchCache })
+            : deps.countCommitsNotInAnyBranch(repoPath, workspace.base))
+          : deps.countCommitsNotInDev
+            ? deps.countCommitsNotInDev(repoPath, workspace.base)
+            : countTaskPairCommitsNotInAnyBranch(repoPath, workspace.base, deps.branchPatchCache ? { cache: deps.branchPatchCache } : undefined)
+      )
       : undefined;
   if (notInAnyBranch === undefined || notInAnyBranch > 0) return { action: 'kept', reason: 'unpushed' };
   if (!(await removalAllowed(deps))) return { action: 'skipped' };

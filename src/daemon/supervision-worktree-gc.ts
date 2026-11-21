@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   lstat,
@@ -637,6 +638,376 @@ export async function listTaskPairBranchesContaining(
   return out.stdout.split(/\r?\n/u).map((ref) => ref.trim()).filter((ref) => ref && !/^refs\/remotes\/[^/]+\/HEAD$/u.test(ref));
 }
 
+const PRIMARY_TASK_PAIR_INTEGRATION_REFS = [
+  'refs/heads/dev',
+  'refs/remotes/origin/dev',
+  'refs/heads/main',
+  'refs/remotes/origin/main',
+  'refs/heads/master',
+  'refs/remotes/origin/master',
+] as const;
+const PATCH_ID_STREAM_TIMEOUT_MS = 60_000;
+const CONTAINS_BATCH_SIZE = 64;
+const CHERRY_FALLBACK_CONCURRENCY = 8;
+const EMPTY_DIFF_PATCH_KEY = '__empty_diff__';
+
+export interface TaskPairBranchPatchCache {
+  /** Register a worktree and its base revision before scanning a sweep so the repo anchor can be computed once. */
+  registerWorktreeBase(worktreePath: string, baseRevision: string): void;
+}
+
+interface CommonDirPatchIndex {
+  anchor: string | undefined;
+  patchIdToCommits: Promise<Map<string, string[]> | undefined>;
+}
+
+class TaskPairBranchPatchCacheImpl implements TaskPairBranchPatchCache {
+  readonly commonDirPromises = new Map<string, Promise<string | undefined>>();
+  readonly branchRefsByCommonDir = new Map<string, Promise<TaskPairBranchRef[] | undefined>>();
+  readonly patchIndexByCommonDir = new Map<string, CommonDirPatchIndex>();
+  readonly registeredWorktrees: Array<{ worktreePath: string; baseRevision: string }> = [];
+
+  registerWorktreeBase(worktreePath: string, baseRevision: string): void {
+    if (!worktreePath || !baseRevision) return;
+    this.registeredWorktrees.push({ worktreePath, baseRevision });
+  }
+}
+
+/** Create a sweep-scoped cache sharing branch ref enumerations and patch-id scans per git commonDir. */
+export function createTaskPairBranchPatchCache(): TaskPairBranchPatchCache {
+  return new TaskPairBranchPatchCacheImpl();
+}
+
+function parseGitCherryUnique(stdout: string): Set<string> {
+  return new Set(stdout.split(/\r?\n/u).flatMap((line) => {
+    const match = /^\+\s+([0-9a-f]{40,64})$/u.exec(line.trim());
+    return match ? [match[1]!] : [];
+  }));
+}
+
+async function resolveGitCommonDir(repoPath: string, cache?: TaskPairBranchPatchCacheImpl): Promise<string> {
+  if (!cache) {
+    const out = await runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+    return out.ok && out.stdout.trim() ? out.stdout.trim() : repoPath;
+  }
+  let promise = cache.commonDirPromises.get(repoPath);
+  if (!promise) {
+    promise = runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
+      .then((out) => (out.ok && out.stdout.trim() ? out.stdout.trim() : repoPath));
+    cache.commonDirPromises.set(repoPath, promise);
+  }
+  return (await promise) ?? repoPath;
+}
+
+function streamPatchIdPipeline(
+  repoPath: string,
+  producerArgs: readonly string[],
+  stdinInput?: string,
+  timeoutMs = PATCH_ID_STREAM_TIMEOUT_MS,
+): Promise<Map<string, string> | undefined> {
+  return new Promise((resolvePromise) => {
+    const producerChild = spawn(
+      'git',
+      ['-C', repoPath, '-c', 'color.ui=false', '-c', 'log.showSignature=false', ...producerArgs],
+      { stdio: [stdinInput !== undefined ? 'pipe' : 'ignore', 'pipe', 'ignore'] },
+    );
+    const patchChild = spawn(
+      'git',
+      ['patch-id', '--stable'],
+      { cwd: repoPath, stdio: ['pipe', 'pipe', 'ignore'] },
+    );
+    let settled = false;
+    let producerExited = false;
+    let producerCode: number | null = null;
+    let patchExited = false;
+    let patchCode: number | null = null;
+    let stdout = '';
+    const finish = (result: Map<string, string> | undefined) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise(result);
+    };
+    const killBoth = () => {
+      try { if (!producerChild.killed && producerChild.exitCode === null) producerChild.kill('SIGKILL'); } catch { /* ignore */ }
+      try { if (!patchChild.killed && patchChild.exitCode === null) patchChild.kill('SIGKILL'); } catch { /* ignore */ }
+    };
+    const timer = setTimeout(() => {
+      killBoth();
+      finish(undefined);
+    }, timeoutMs);
+    timer.unref?.();
+
+    const maybeComplete = () => {
+      if (!producerExited || !patchExited) return;
+      if (producerCode !== 0 || patchCode !== 0) {
+        finish(undefined);
+        return;
+      }
+      const map = new Map<string, string>();
+      for (const line of stdout.split(/\r?\n/u)) {
+        const match = /^([0-9a-f]{40,64})\s+([0-9a-f]{40,64})$/u.exec(line.trim());
+        if (match) map.set(match[2]!, match[1]!);
+      }
+      finish(map);
+    };
+
+    if (!producerChild.stdout || !patchChild.stdin || !patchChild.stdout) {
+      killBoth();
+      finish(undefined);
+      return;
+    }
+    producerChild.stdout.pipe(patchChild.stdin);
+    producerChild.stdout.on('error', () => { killBoth(); finish(undefined); });
+    if (stdinInput !== undefined && producerChild.stdin) {
+      producerChild.stdin.on('error', (err) => {
+        if ((err as NodeJS.ErrnoException).code === 'EPIPE') return;
+        killBoth();
+        finish(undefined);
+      });
+      producerChild.stdin.end(stdinInput);
+    }
+    patchChild.stdin.on('error', (err) => {
+      if ((err as NodeJS.ErrnoException).code === 'EPIPE') return;
+      killBoth();
+      finish(undefined);
+    });
+    patchChild.stdout.setEncoding('utf8');
+    patchChild.stdout.on('data', (chunk: string) => { stdout += chunk; });
+    producerChild.on('error', () => { killBoth(); finish(undefined); });
+    patchChild.on('error', () => { killBoth(); finish(undefined); });
+    producerChild.on('close', (code) => { producerExited = true; producerCode = code; maybeComplete(); });
+    patchChild.on('close', (code) => { patchExited = true; patchCode = code; maybeComplete(); });
+  });
+}
+
+function streamGitPatchIds(
+  repoPath: string,
+  logArgs: readonly string[],
+  timeoutMs = PATCH_ID_STREAM_TIMEOUT_MS,
+): Promise<Map<string, string> | undefined> {
+  return streamPatchIdPipeline(
+    repoPath,
+    ['log', '-p', '--no-ext-diff', '--no-color', ...logArgs],
+    undefined,
+    timeoutMs,
+  );
+}
+
+function streamCommitPatchIdsFromList(
+  repoPath: string,
+  commits: readonly string[],
+  timeoutMs = PATCH_ID_STREAM_TIMEOUT_MS,
+): Promise<Map<string, string> | undefined> {
+  if (commits.length === 0) return Promise.resolve(new Map());
+  return streamPatchIdPipeline(
+    repoPath,
+    ['diff-tree', '--stdin', '-p', '--root', '--no-ext-diff', '--no-color', '--no-merges'],
+    `${commits.join('\n')}\n`,
+    timeoutMs,
+  );
+}
+
+function dedupeBranchRefsByTip(listed: readonly TaskPairBranchRef[]): {
+  primaryRefs: TaskPairBranchRef[];
+  remainingRefs: TaskPairBranchRef[];
+} {
+  const byRef = new Map<string, TaskPairBranchRef>();
+  for (const entry of listed) {
+    if (!byRef.has(entry.ref)) byRef.set(entry.ref, entry);
+  }
+  const seenTips = new Set<string>();
+  const primaryRefs: TaskPairBranchRef[] = [];
+  for (const name of PRIMARY_TASK_PAIR_INTEGRATION_REFS) {
+    const entry = byRef.get(name);
+    if (!entry || seenTips.has(entry.tip)) continue;
+    seenTips.add(entry.tip);
+    primaryRefs.push(entry);
+  }
+  const remainingRefs: TaskPairBranchRef[] = [];
+  for (const entry of listed) {
+    if (seenTips.has(entry.tip)) continue;
+    seenTips.add(entry.tip);
+    remainingRefs.push(entry);
+  }
+  return { primaryRefs, remainingRefs };
+}
+
+async function checkRefsWithCherry(
+  repoPath: string,
+  head: string,
+  refs: readonly TaskPairBranchRef[],
+  hashes: readonly string[],
+  initialBest: string[],
+  concurrency = 1,
+): Promise<string[]> {
+  let best = initialBest;
+  if (refs.length === 0 || best.length === 0) return best;
+  if (concurrency <= 1) {
+    for (const entry of refs) {
+      const cherry = await runGit(repoPath, ['cherry', entry.ref, head]);
+      if (!cherry.ok) continue;
+      const unique = parseGitCherryUnique(cherry.stdout);
+      const uniquePairCommits = hashes.filter((hash) => unique.has(hash));
+      if (uniquePairCommits.length === 0) return [];
+      if (uniquePairCommits.length < best.length) best = uniquePairCommits;
+    }
+    return best;
+  }
+  let index = 0;
+  let stopped = false;
+  const workerCount = Math.min(concurrency, refs.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (!stopped) {
+      const currentIndex = index++;
+      if (currentIndex >= refs.length) return;
+      const entry = refs[currentIndex]!;
+      const cherry = await runGit(repoPath, ['cherry', entry.ref, head]);
+      if (stopped || !cherry.ok) continue;
+      const unique = parseGitCherryUnique(cherry.stdout);
+      const uniquePairCommits = hashes.filter((hash) => unique.has(hash));
+      if (uniquePairCommits.length === 0) {
+        best = [];
+        stopped = true;
+        return;
+      }
+      if (uniquePairCommits.length < best.length) best = uniquePairCommits;
+    }
+  }));
+  return best;
+}
+
+async function resolveCommonAnchor(repoPath: string, candidateBases: readonly string[]): Promise<string | undefined> {
+  const unique = [...new Set(candidateBases.filter(Boolean))];
+  if (unique.length === 0) return undefined;
+  if (unique.length === 1) return unique[0];
+  const octopus = await runGit(repoPath, ['merge-base', '--octopus', ...unique]);
+  if (octopus.ok && octopus.stdout.trim()) {
+    return octopus.stdout.trim().split(/\s+/u)[0];
+  }
+  let current = unique[0]!;
+  for (let i = 1; i < unique.length; i++) {
+    const pairBase = await runGit(repoPath, ['merge-base', current, unique[i]!]);
+    if (!pairBase.ok || !pairBase.stdout.trim()) return undefined;
+    current = pairBase.stdout.trim().split(/\s+/u)[0]!;
+  }
+  return current;
+}
+
+function streamGitNonMergeHashes(
+  repoPath: string,
+  anchor: string | undefined,
+  timeoutMs = PATCH_ID_STREAM_TIMEOUT_MS,
+): Promise<string[] | undefined> {
+  return new Promise((resolvePromise) => {
+    const child = spawn(
+      'git',
+      ['-C', repoPath, 'rev-list', '--no-merges', '--branches', '--remotes', ...(anchor ? ['--not', anchor] : [])],
+      { stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    let settled = false;
+    let stdout = '';
+    const finish = (result: string[] | undefined) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise(result);
+    };
+    const timer = setTimeout(() => {
+      try { if (!child.killed && child.exitCode === null) child.kill('SIGKILL'); } catch { /* ignore */ }
+      finish(undefined);
+    }, timeoutMs);
+    timer.unref?.();
+    if (!child.stdout) {
+      finish(undefined);
+      return;
+    }
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+    child.on('error', () => finish(undefined));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish(undefined);
+        return;
+      }
+      finish(stdout.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean));
+    });
+  });
+}
+
+async function getBranchPatchIndex(
+  repoPath: string,
+  baseRevision: string,
+  cache?: TaskPairBranchPatchCacheImpl,
+): Promise<Map<string, string[]> | undefined> {
+  const buildForAnchor = async (anchor: string | undefined): Promise<Map<string, string[]> | undefined> => {
+    const [commitToPatch, allNonMergeHashes] = await Promise.all([
+      streamGitPatchIds(repoPath, [
+        '--no-merges',
+        '--root',
+        '--branches',
+        '--remotes',
+        ...(anchor ? ['--not', anchor] : []),
+      ]),
+      streamGitNonMergeHashes(repoPath, anchor),
+    ]);
+    if (!commitToPatch || !allNonMergeHashes) return undefined;
+    const patchToCommits = new Map<string, string[]>();
+    for (const [sha, patchId] of commitToPatch) {
+      const list = patchToCommits.get(patchId);
+      if (list) list.push(sha);
+      else patchToCommits.set(patchId, [sha]);
+    }
+    for (const sha of allNonMergeHashes) {
+      if (commitToPatch.has(sha)) continue;
+      const list = patchToCommits.get(EMPTY_DIFF_PATCH_KEY);
+      if (list) list.push(sha);
+      else patchToCommits.set(EMPTY_DIFF_PATCH_KEY, [sha]);
+    }
+    return patchToCommits;
+  };
+
+  if (!cache) return buildForAnchor(baseRevision);
+
+  const commonDir = await resolveGitCommonDir(repoPath, cache);
+  const existing = cache.patchIndexByCommonDir.get(commonDir);
+  if (existing) {
+    if (existing.anchor === undefined) return existing.patchIdToCommits;
+    const isAncestor = await runGit(repoPath, ['merge-base', '--is-ancestor', existing.anchor, baseRevision]);
+    if (isAncestor.ok) return existing.patchIdToCommits;
+  }
+
+  const seededBases: string[] = [baseRevision];
+  if (existing?.anchor) seededBases.push(existing.anchor);
+  for (const item of cache.registeredWorktrees) {
+    if ((await resolveGitCommonDir(item.worktreePath, cache)) === commonDir) {
+      seededBases.push(item.baseRevision);
+    }
+  }
+  const anchor = await resolveCommonAnchor(repoPath, seededBases);
+  const patchIdToCommits = buildForAnchor(anchor);
+  cache.patchIndexByCommonDir.set(commonDir, { anchor, patchIdToCommits });
+  return patchIdToCommits;
+}
+
+async function listBranchesContainingAnyCommit(
+  repoPath: string,
+  commitShas: readonly string[],
+): Promise<Set<string> | undefined> {
+  const matching = new Set<string>();
+  for (let i = 0; i < commitShas.length; i += CONTAINS_BATCH_SIZE) {
+    const batch = commitShas.slice(i, i + CONTAINS_BATCH_SIZE);
+    const containsArgs = batch.flatMap((sha) => ['--contains', sha]);
+    const out = await runGit(repoPath, ['for-each-ref', ...containsArgs, '--format=%(refname)', 'refs/heads', 'refs/remotes']);
+    if (!out.ok) return undefined;
+    for (const line of out.stdout.split(/\r?\n/u)) {
+      const ref = line.trim();
+      if (ref && !/^refs\/remotes\/[^/]+\/HEAD$/u.test(ref)) matching.add(ref);
+    }
+  }
+  return matching;
+}
+
 /**
  * The executor commits after `baseRevision` that are not represented by any
  * local or remote branch. A cherry-picked equivalent is considered
@@ -648,38 +1019,129 @@ export async function listTaskPairBranchesContaining(
 export async function listTaskPairCommitsNotInAnyBranch(
   repoPath: string,
   baseRevision: string,
-  options: { head?: string } = {},
+  options: { head?: string; cache?: TaskPairBranchPatchCache } = {},
 ): Promise<string[] | undefined> {
   const head = options.head ?? 'HEAD';
+  const cache = options.cache instanceof TaskPairBranchPatchCacheImpl ? options.cache : undefined;
   const commits = await runGit(repoPath, ['rev-list', '--reverse', `${baseRevision}..${head}`]);
   if (!commits.ok) return undefined;
   const hashes = commits.stdout.trim().split(/\s+/u).filter(Boolean);
   if (hashes.length === 0) return [];
 
   if ((await listTaskPairBranchesContaining(repoPath, head))?.length) return [];
-  const listed = await listTaskPairBranchRefs(repoPath);
-  if (!listed) return undefined;
-  const branchRefs = listed.map((entry) => entry.ref);
-  if (branchRefs.length === 0) return hashes;
-
-  let best = hashes;
-  for (const ref of branchRefs) {
-    const cherry = await runGit(repoPath, ['cherry', ref, head]);
-    if (!cherry.ok) continue;
-    const unique = new Set(cherry.stdout.split(/\r?\n/u).flatMap((line) => {
-      const match = /^\+\s+([0-9a-f]{40})$/u.exec(line.trim());
-      return match ? [match[1]] : [];
-    }));
-    const uniquePairCommits = hashes.filter((hash) => unique.has(hash));
-    if (uniquePairCommits.length === 0) return [];
-    if (uniquePairCommits.length < best.length) best = uniquePairCommits;
+  let listed: TaskPairBranchRef[] | undefined;
+  if (cache) {
+    const commonDir = await resolveGitCommonDir(repoPath, cache);
+    let refPromise = cache.branchRefsByCommonDir.get(commonDir);
+    if (!refPromise) {
+      refPromise = listTaskPairBranchRefs(repoPath);
+      cache.branchRefsByCommonDir.set(commonDir, refPromise);
+    }
+    listed = await refPromise;
+  } else {
+    listed = await listTaskPairBranchRefs(repoPath);
   }
-  return best;
+  if (!listed) return undefined;
+  if (listed.length === 0) return hashes;
+
+  const { primaryRefs, remainingRefs } = dedupeBranchRefsByTip(listed);
+  const allDedupedRefs = [...primaryRefs, ...remainingRefs];
+  if (allDedupedRefs.length <= 8) {
+    const best = await checkRefsWithCherry(repoPath, head, primaryRefs, hashes, hashes, 1);
+    if (best.length === 0 || remainingRefs.length === 0) return best;
+    return checkRefsWithCherry(repoPath, head, remainingRefs, hashes, best, CHERRY_FALLBACK_CONCURRENCY);
+  }
+
+  const primarySet = new Set(primaryRefs);
+  const fallbackRefs = async (initialBest: string[], refsToCheck: readonly TaskPairBranchRef[]) => {
+    const orderedPrimary = refsToCheck.filter((entry) => primarySet.has(entry));
+    const orderedRemaining = refsToCheck.filter((entry) => !primarySet.has(entry));
+    const currentBest = await checkRefsWithCherry(repoPath, head, orderedPrimary, hashes, initialBest, 1);
+    if (currentBest.length === 0 || orderedRemaining.length === 0) return currentBest;
+    return checkRefsWithCherry(repoPath, head, orderedRemaining, hashes, currentBest, CHERRY_FALLBACK_CONCURRENCY);
+  };
+
+  const nonMergeResult = await runGit(repoPath, ['rev-list', '--reverse', '--no-merges', `${baseRevision}..${head}`]);
+  if (!nonMergeResult.ok) return fallbackRefs(hashes, allDedupedRefs);
+  const nonMergeHashes = nonMergeResult.stdout.trim().split(/\s+/u).filter(Boolean);
+  if (nonMergeHashes.length === 0) return [];
+
+  const nonMergeSet = new Set(nonMergeHashes);
+  let best = hashes.filter((hash) => nonMergeSet.has(hash));
+  let uncheckedRefs = allDedupedRefs;
+  let checkedTopPrimary = false;
+
+  const baseAncestorCheck = await runGit(repoPath, ['merge-base', '--is-ancestor', baseRevision, head]);
+  if (!baseAncestorCheck.ok) {
+    return fallbackRefs(best, uncheckedRefs);
+  }
+
+  // If a worktree merged dev/main into itself, check the top primary branch once up front
+  // so merged upstream commits do not fan out into dozens of archive branches.
+  if (best.length > 10 && primaryRefs.length > 0) {
+    const topPrimary = primaryRefs[0]!;
+    best = await checkRefsWithCherry(repoPath, head, [topPrimary], hashes, best, 1);
+    if (best.length === 0) return [];
+    uncheckedRefs = uncheckedRefs.filter((entry) => entry.ref !== topPrimary.ref);
+    checkedTopPrimary = true;
+  }
+
+  const headPatchIds = await streamCommitPatchIdsFromList(repoPath, best);
+  if (!headPatchIds) {
+    return fallbackRefs(best, uncheckedRefs);
+  }
+
+  const patchIndex = await getBranchPatchIndex(repoPath, baseRevision, cache);
+  if (!patchIndex) {
+    return fallbackRefs(best, uncheckedRefs);
+  }
+
+  const collectMatchingBranchShas = (targetHashes: readonly string[]) => {
+    const shas = new Set<string>();
+    for (const hash of targetHashes) {
+      const patchId = headPatchIds.get(hash) ?? EMPTY_DIFF_PATCH_KEY;
+      const candidates = patchIndex.get(patchId);
+      if (!candidates) continue;
+      for (const sha of candidates) shas.add(sha);
+    }
+    return shas;
+  };
+
+  let matchingBranchShas = collectMatchingBranchShas(best);
+  if (matchingBranchShas.size === 0) return best;
+
+  let candidateRefNames = await listBranchesContainingAnyCommit(repoPath, [...matchingBranchShas]);
+  if (!candidateRefNames) {
+    return fallbackRefs(best, uncheckedRefs);
+  }
+  let matchingRefs = uncheckedRefs.filter((entry) => candidateRefNames!.has(entry.ref));
+  if (matchingRefs.length === 0) return best;
+
+  if (!checkedTopPrimary && matchingRefs.length > 2 && primaryRefs.length > 0 && candidateRefNames.has(primaryRefs[0]!.ref)) {
+    const topPrimary = primaryRefs[0]!;
+    best = await checkRefsWithCherry(repoPath, head, [topPrimary], hashes, best, 1);
+    if (best.length === 0) return [];
+    uncheckedRefs = uncheckedRefs.filter((entry) => entry.ref !== topPrimary.ref);
+    matchingBranchShas = collectMatchingBranchShas(best);
+    if (matchingBranchShas.size === 0) return best;
+    candidateRefNames = await listBranchesContainingAnyCommit(repoPath, [...matchingBranchShas]);
+    if (!candidateRefNames) {
+      return fallbackRefs(best, uncheckedRefs);
+    }
+    matchingRefs = uncheckedRefs.filter((entry) => candidateRefNames!.has(entry.ref));
+    if (matchingRefs.length === 0) return best;
+  }
+
+  return checkRefsWithCherry(repoPath, head, matchingRefs, hashes, best, CHERRY_FALLBACK_CONCURRENCY);
 }
 
 /** Count executor commits after base that are not integrated into any branch. */
-export async function countTaskPairCommitsNotInAnyBranch(repoPath: string, baseRevision: string): Promise<number | undefined> {
-  return (await listTaskPairCommitsNotInAnyBranch(repoPath, baseRevision))?.length;
+export async function countTaskPairCommitsNotInAnyBranch(
+  repoPath: string,
+  baseRevision: string,
+  options: { head?: string; cache?: TaskPairBranchPatchCache } = {},
+): Promise<number | undefined> {
+  return (await listTaskPairCommitsNotInAnyBranch(repoPath, baseRevision, options))?.length;
 }
 
 /** Count executor commits after base that are not patch-equivalent to origin/dev. */

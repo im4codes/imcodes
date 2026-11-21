@@ -96,6 +96,7 @@ import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewri
 import { applyBackCow, hasUnfinishedApplyBack, rollbackApplyBack, undoApplyBack } from './non-git.js';
 import { mergePairIntoProject } from './git-init.js';
 import { copyTaskPairOutput, describeKeptTaskPairWorkspace, gitBranch as gitBranchOf, listTaskPairSiblingWorktrees, provisionTaskPairWorkspace, releaseTaskPairWorkspace, rehomeTaskPairWorkspace, type TaskPairWorkspaceRelease, type TaskPairWorkspaceRevisionSource } from './workspace.js';
+import { createTaskPairBranchPatchCache, type TaskPairBranchPatchCache } from '../supervision-worktree-gc.js';
 import { AMBIGUOUS_PARTICIPANT_ACTOR, readSenderOwnerMachineAuthority, readSenderParticipantTurn } from '../sender-participant-turn.js';
 import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
 import type { McpRuntimeCaller } from '../memory-mcp-caller.js';
@@ -2510,14 +2511,20 @@ export class TaskPairService {
    * Deliver one retained-workspace notice, with bounded retry when the Brain was offline/unreadable. What to do with
    * the workspace is Brain's judgement for this task: the message carries what it needs and lists the options.
    */
-  async #notifyWorkspaceKept(project: string, pair: TaskPairState, now: number, reason: string): Promise<void> {
+  async #notifyWorkspaceKept(
+    project: string,
+    pair: TaskPairState,
+    now: number,
+    reason: string,
+    branchPatchCache?: TaskPairBranchPatchCache,
+  ): Promise<void> {
     if (!this.#workspaceKeptNoticeDue(project, pair, now, reason)) return;
     const store = getTaskPairStore();
     const previous = store.getPair(project, pair.taskId)!.liveness;
     const key = this.#workspaceKeptKey(pair, reason);
     const same = previous.workspaceKeptReminderKey === key;
     const count = same ? (previous.workspaceKeptReminderCount ?? 0) : 0;
-    const detail = await describeKeptTaskPairWorkspace(pair).catch(() => ({}));
+    const detail = await describeKeptTaskPairWorkspace(pair, branchPatchCache ? { branchPatchCache } : undefined).catch(() => ({}));
     const result = await sendTaskPairMessage(pair.brain, pair.taskId, TASK_PAIR_WORKSPACE_KEPT_REASON, buildWorkspaceKeptLine(pair, reason, { now, ...detail }));
     const delivered = result === 'sent' || result === 'queued' || result === 'skipped_pending';
     store.saveLiveness(project, pair.taskId, {
@@ -2535,7 +2542,11 @@ export class TaskPairService {
    * ones are still open (a Brain that has not acted on those is not given more). The rest wait for later sweeps and
    * are summarised in one message, at most once a day.
    */
-  async #announceKeptWorkspaces(kept: ReadonlyArray<{ project: string; pair: TaskPairState; reason: string }>, now: number): Promise<void> {
+  async #announceKeptWorkspaces(
+    kept: ReadonlyArray<{ project: string; pair: TaskPairState; reason: string }>,
+    now: number,
+    branchPatchCache?: TaskPairBranchPatchCache,
+  ): Promise<void> {
     if (kept.length === 0) return;
     const store = getTaskPairStore();
     const groups = new Map<string, { project: string; brain: string; items: Array<{ pair: TaskPairState; reason: string }> }>();
@@ -2556,7 +2567,7 @@ export class TaskPairService {
       });
       const allowance = Math.max(0, Math.min(TASK_PAIR_WORKSPACE_KEPT_MAX_PER_SWEEP, TASK_PAIR_WORKSPACE_KEPT_MAX_OUTSTANDING - open.length));
       const due = group.items.sort((a, b) => endedAt(a.pair) - endedAt(b.pair));
-      for (const item of due.slice(0, allowance)) await this.#notifyWorkspaceKept(group.project, item.pair, now, item.reason);
+      for (const item of due.slice(0, allowance)) await this.#notifyWorkspaceKept(group.project, item.pair, now, item.reason, branchPatchCache);
       const deferred = due.slice(allowance);
       if (deferred.length === 0) continue;
       const metaKey = taskPairWorkspaceKeptDigestMetaKey(group.project, group.brain);
@@ -2588,8 +2599,16 @@ export class TaskPairService {
     // interrupted by a restart, are stripped now -- in the background: a
     // backlog of large trees must not hold the heartbeat.
     this.#stripBacklogInBackground();
+    const branchPatchCache = createTaskPairBranchPatchCache();
+    const endedCandidates = store.listEndedWorkspacePairs();
+    for (const stored of endedCandidates) {
+      const workspace = stored.state.workspace;
+      if (workspace?.kind === 'worktree' && !workspace.nonGit && workspace.base) {
+        branchPatchCache.registerWorktreeBase(workspace.path, workspace.base);
+      }
+    }
     const keptThisSweep: Array<{ project: string; pair: TaskPairState; reason: string }> = [];
-    for (const stored of store.listEndedWorkspacePairs()) {
+    for (const stored of endedCandidates) {
       const pair = stored.state;
       const workspace = pair.workspace;
       if (!workspace || !isTerminalTaskPairStatus(pair.status)) continue;
@@ -2601,7 +2620,7 @@ export class TaskPairService {
           : TASK_PAIR_WORKSPACE_RETENTION_MS;
       if (now - (workspace.endedAt ?? pair.updatedAt) < retentionMs) continue;
       try {
-        const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, false);
+        const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, false, branchPatchCache);
         if (outcome?.kept) keptThisSweep.push(outcome.kept);
       } catch (error) {
         logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace sweep failed');
@@ -2609,7 +2628,7 @@ export class TaskPairService {
     }
     if (options.announceKept !== false) {
       try {
-        await this.#announceKeptWorkspaces(keptThisSweep, now);
+        await this.#announceKeptWorkspaces(keptThisSweep, now, branchPatchCache);
       } catch (error) {
         logger.warn({ err: error }, 'task-pair: kept-workspace announcement failed');
       }
@@ -2626,6 +2645,7 @@ export class TaskPairService {
     now: number,
     retentionMs: number,
     dryRun: boolean,
+    branchPatchCache?: TaskPairBranchPatchCache,
   ): Promise<{ released: TaskPairWorkspaceRelease; kept?: { project: string; pair: TaskPairState; reason: string } } | undefined> {
     const store = getTaskPairStore();
     const pair = stored.state;
@@ -2633,6 +2653,7 @@ export class TaskPairService {
     if (!workspace || !isTerminalTaskPairStatus(pair.status)) return undefined;
     const releaseDeps = {
       ...(dryRun ? { dryRun: true } : {}),
+      ...(branchPatchCache ? { branchPatchCache } : {}),
       beforeRemove: () => {
         const currentStored = store.getPair(stored.project, pair.taskId);
         const current = currentStored?.state;
@@ -2684,9 +2705,17 @@ export class TaskPairService {
     const store = getTaskPairStore();
     const candidates = store.listEndedWorkspacePairs()
       .filter((stored) => stored.project === project && stored.state.brain === brain && stored.state.workspace && isTerminalTaskPairStatus(stored.state.status))
-      .sort((a, b) => (a.state.workspace!.endedAt ?? a.state.updatedAt) - (b.state.workspace!.endedAt ?? b.state.updatedAt));
+      .sort((a, b) => (a.state.workspace!.endedAt ?? a.state.updatedAt) - (b.state.workspace!.endedAt ?? b.state.updatedAt))
+      .slice(0, limit);
+    const branchPatchCache = createTaskPairBranchPatchCache();
+    for (const stored of candidates) {
+      const workspace = stored.state.workspace;
+      if (workspace?.kind === 'worktree' && !workspace.nonGit && workspace.base) {
+        branchPatchCache.registerWorktreeBase(workspace.path, workspace.base);
+      }
+    }
     const entries: TaskPairWorkspaceGcEntry[] = [];
-    for (const stored of candidates.slice(0, limit)) {
+    for (const stored of candidates) {
       const pair = stored.state;
       const workspace = pair.workspace!;
       const endedAt = workspace.endedAt ?? pair.updatedAt;
@@ -2696,7 +2725,7 @@ export class TaskPairService {
           : Math.max(options.minAgeMs, TASK_PAIR_WORKSPACE_RETENTION_MS);
       if (now - endedAt < retentionMs) { entries.push({ ...base, action: 'too_recent' }); continue; }
       try {
-        const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, options.dryRun);
+        const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, options.dryRun, branchPatchCache);
         const released = outcome?.released;
         if (!released) { entries.push({ ...base, action: 'absent' }); continue; }
         entries.push(released.action === 'kept'
