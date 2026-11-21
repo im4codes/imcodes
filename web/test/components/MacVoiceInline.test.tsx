@@ -301,4 +301,70 @@ describe('Mac app inline composer voice input', () => {
       expect(input.querySelector('.voice-streaming-robot-cursor')).toBeNull();
     });
   });
+
+  it('applies partial/final results emitted during stopInlineVoice({ abort: false }) drain and ignores callbacks after drain or abort or restart', async () => {
+    let resolveStop!: () => void;
+    voiceState.stopListening.mockImplementation(() => new Promise<void>((resolve) => {
+      resolveStop = resolve;
+    }));
+
+    const { container, input } = renderComposer(1200);
+    input.focus();
+    setComposerTextAndCaret(input, 'prefix ', 7);
+
+    const micBtn = container.querySelector('button[data-voice-trigger="desktop"]') as HTMLButtonElement;
+    fireEvent.click(micBtn);
+    expect(voiceState.startListening).toHaveBeenCalledTimes(1);
+
+    const firstOnResult = voiceState.onResult!;
+    firstOnResult('partial', false);
+    expect(readComposerElementText(input)).toBe('prefix partial');
+    expect(input.querySelector('.voice-streaming-robot-cursor')).not.toBeNull();
+
+    // Stop without abort: UI stops immediately, robot cursor detaches, but drained results still apply until stop settles
+    fireEvent.click(micBtn);
+    expect(voiceState.stopListening).toHaveBeenCalledWith({ abort: false });
+    expect(micBtn.classList.contains('btn-voice-inline-active')).toBe(false);
+    expect(input.querySelector('.voice-streaming-robot-cursor')).toBeNull();
+
+    firstOnResult('partial final tail', true);
+    expect(readComposerElementText(input)).toBe('prefix partial final tail');
+    expect(input.querySelector('.voice-streaming-robot-cursor')).toBeNull();
+
+    resolveStop();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Once drain settles, late stale callbacks must be ignored
+    firstOnResult('too late', true);
+    expect(readComposerElementText(input)).toBe('prefix partial final tail');
+
+    // Boundary: starting a new inline session while previous stop is still draining invalidates the old token immediately
+    let resolveDrain2!: () => void;
+    voiceState.stopListening.mockImplementation(() => new Promise<void>((resolve) => {
+      resolveDrain2 = resolve;
+    }));
+    fireEvent.click(micBtn);
+    const oldSessionCallback = voiceState.onResult!;
+    oldSessionCallback('round two', false);
+    fireEvent.click(micBtn); // draining round two (abort: false)
+
+    // Immediately start round three before round two finishes draining
+    fireEvent.click(micBtn);
+    const newSessionCallback = voiceState.onResult!;
+    oldSessionCallback('stale from draining round two', true);
+    expect(readComposerElementText(input)).not.toContain('stale from draining round two');
+
+    newSessionCallback('round three', false);
+    expect(readComposerElementText(input)).toContain('round three');
+    resolveDrain2();
+
+    // Abort (Enter/send): discards any late callback immediately without waiting for drain
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
+    await waitFor(() => {
+      expect(voiceState.stopListening).toHaveBeenLastCalledWith({ abort: true });
+    });
+    newSessionCallback('dropped after abort', true);
+    expect(readComposerElementText(input)).toBe('');
+  });
 });

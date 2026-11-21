@@ -2259,6 +2259,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [inlineVoicePermissionTarget, setInlineVoicePermissionTarget] = useState<'mic' | 'speech' | null>(null);
   const inlineVoiceActiveRef = useRef(false);
   const inlineVoiceTokenRef = useRef(0);
+  const inlineVoiceDrainingTokenRef = useRef<number | null>(null);
   const inlineVoiceRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inlineVoiceRobotHostRef = useRef<HTMLSpanElement | null>(null);
   const programmaticVoiceWriteRef = useRef(false);
@@ -6251,8 +6252,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     restoreCaret?: boolean;
     skipStateUpdate?: boolean;
   }) => {
+    const abort = options?.abort ?? true;
     const wasActive = inlineVoiceActiveRef.current;
-    inlineVoiceTokenRef.current += 1;
+    const activeToken = inlineVoiceTokenRef.current;
+    if (abort) {
+      inlineVoiceTokenRef.current += 1;
+      inlineVoiceDrainingTokenRef.current = null;
+    } else if (wasActive) {
+      // Keep the active token valid while VoiceInput.stopListening({ abort: false }) drains trailing results.
+      inlineVoiceDrainingTokenRef.current = activeToken;
+    }
     if (inlineVoiceRecognizingTimerRef.current !== null) {
       clearTimeout(inlineVoiceRecognizingTimerRef.current);
       inlineVoiceRecognizingTimerRef.current = null;
@@ -6277,12 +6286,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setComposerCaretOffset(divRef.current, caretTarget);
     }
     if (wasActive) {
-      void Promise.resolve(VoiceInput.stopListening({ abort: options?.abort ?? true })).catch(() => {});
+      void Promise.resolve(VoiceInput.stopListening({ abort }))
+        .catch(() => {})
+        .finally(() => {
+          if (!abort && inlineVoiceDrainingTokenRef.current === activeToken && inlineVoiceTokenRef.current === activeToken) {
+            inlineVoiceDrainingTokenRef.current = null;
+            inlineVoiceTokenRef.current += 1;
+          }
+        });
     }
   }, []);
 
   const handleSend = useCallback(() => {
-    if (inlineVoiceActiveRef.current) {
+    if (inlineVoiceActiveRef.current || inlineVoiceDrainingTokenRef.current !== null) {
       stopInlineVoice({ abort: true, restoreCaret: false });
     }
     const outcome = requestSend(buildSendPayload(), { clearComposer: true });
@@ -6469,8 +6485,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, []);
 
   const interruptInlineVoiceForManualEdit = useCallback(() => {
-    if (!inlineVoiceActiveRef.current) return;
+    if (!inlineVoiceActiveRef.current && inlineVoiceDrainingTokenRef.current === null) return;
+    const wasActive = inlineVoiceActiveRef.current;
     inlineVoiceTokenRef.current += 1;
+    inlineVoiceDrainingTokenRef.current = null;
     if (inlineVoiceRecognizingTimerRef.current !== null) {
       clearTimeout(inlineVoiceRecognizingTimerRef.current);
       inlineVoiceRecognizingTimerRef.current = null;
@@ -6482,7 +6500,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     VoiceInput.onAudioLevel(null);
     // Detach the robot badge without rewriting root text so browser-inserted edits stay intact.
     detachInlineVoiceRobotHost(inlineVoiceRobotHostRef.current);
-    void Promise.resolve(VoiceInput.stopListening({ abort: true })).catch(() => {});
+    if (wasActive) {
+      void Promise.resolve(VoiceInput.stopListening({ abort: true })).catch(() => {});
+    }
   }, []);
   interruptInlineVoiceRef.current = interruptInlineVoiceForManualEdit;
 
@@ -6522,6 +6542,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     const token = ++inlineVoiceTokenRef.current;
+    inlineVoiceDrainingTokenRef.current = null;
     inlineVoiceActiveRef.current = true;
     setInlineVoiceActive(true);
     setInlineVoiceRecognizing(false);
@@ -6537,7 +6558,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     let started = false;
     void Promise.resolve(VoiceInput.startListening(
       (partial) => {
-        if (inlineVoiceTokenRef.current !== token || !inlineVoiceActiveRef.current) return;
+        const isCurrentToken = inlineVoiceTokenRef.current === token;
+        const isActiveOrDraining = inlineVoiceActiveRef.current || inlineVoiceDrainingTokenRef.current === token;
+        if (!isCurrentToken || !isActiveOrDraining) return;
         const target = divRef.current;
         if (!target) return;
         const seg = inlineVoiceSegmentRef.current;
@@ -6558,7 +6581,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             target,
             before,
             seg.suffix,
-            inlineVoiceRobotHostRef.current,
+            inlineVoiceActiveRef.current ? inlineVoiceRobotHostRef.current : null,
             typeof document !== 'undefined' && document.activeElement === target,
           );
         } finally {
@@ -6574,7 +6597,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
         );
         syncMobileComposerMetrics();
-        pulseInlineRecognizing();
+        if (inlineVoiceActiveRef.current) {
+          pulseInlineRecognizing();
+        }
       },
       (listening) => {
         if (inlineVoiceTokenRef.current !== token) return;
@@ -6654,7 +6679,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (inputDisabledRef.current) return;
     if (inlineDesktopVoiceRef.current || isNativeMacDesktop() || isPcAppInlineVoiceSupported()) {
       if (inlineVoiceActiveRef.current) {
-        stopInlineVoice({ abort: true, restoreCaret: true });
+        stopInlineVoice({ abort: false, restoreCaret: true });
       } else {
         startInlineVoice();
       }
@@ -6693,13 +6718,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }), [handleMacVoiceShortcutTrigger]);
 
   useEffect(() => {
-    if (inputDisabled && inlineVoiceActiveRef.current) {
+    if (inputDisabled && (inlineVoiceActiveRef.current || inlineVoiceDrainingTokenRef.current !== null)) {
       stopInlineVoice({ abort: true, restoreCaret: false });
     }
   }, [inputDisabled, stopInlineVoice]);
 
   useEffect(() => () => {
-    if (inlineVoiceActiveRef.current) {
+    if (inlineVoiceActiveRef.current || inlineVoiceDrainingTokenRef.current !== null) {
       stopInlineVoice({ abort: true, restoreCaret: false, skipStateUpdate: !mountedRef.current });
     }
   }, [activeSession?.name, stopInlineVoice]);
