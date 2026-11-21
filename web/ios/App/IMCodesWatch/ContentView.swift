@@ -31,7 +31,18 @@ struct ContentView: View {
     @AppStorage("watchViewMode") private var viewMode: WatchViewMode = .tasks
     @State private var path: [WatchRoute] = []
     @State private var showServerPicker = false
+    @State private var showAddSessionSheet = false
     @State private var expandedSessions: Set<String> = []
+
+    private static let autoShowAllMainSessionLimit = 5
+
+    private var activeServerId: String? {
+        sessionManager.selectedServerId ?? (sessionManager.displayServers.count == 1 ? sessionManager.displayServers.first?.id : nil)
+    }
+
+    private var requiresServerSelection: Bool {
+        sessionManager.displayServers.count > 1 && sessionManager.selectedServerId == nil
+    }
 
     private var currentSessions: [WatchSessionRow] {
         sessionManager.displaySessions()
@@ -47,6 +58,28 @@ struct ContentView: View {
 
     private var mainSessions: [WatchSessionRow] {
         currentSessions.filter { !isSubSessionRow($0) }
+    }
+
+    private var currentManualSessionNames: Set<String> {
+        guard let activeServerId else { return [] }
+        return sessionManager.manualSessionNames(for: activeServerId)
+    }
+
+    private var isManualFilterActive: Bool {
+        mainSessions.count > Self.autoShowAllMainSessionLimit
+    }
+
+    private var visibleMainSessions: [WatchSessionRow] {
+        guard !requiresServerSelection else { return [] }
+        guard isManualFilterActive else { return mainSessions }
+        let manual = currentManualSessionNames
+        return mainSessions.filter { ($0.isPinned ?? false) || manual.contains($0.sessionName) }
+    }
+
+    private var addableMainSessions: [WatchSessionRow] {
+        guard !requiresServerSelection, isManualFilterActive else { return [] }
+        let manual = currentManualSessionNames
+        return mainSessions.filter { !($0.isPinned ?? false) && !manual.contains($0.sessionName) }
     }
 
     private func subSessions(for parent: String) -> [WatchSessionRow] {
@@ -116,7 +149,7 @@ struct ContentView: View {
                     Text("No tasks")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                    if !mainSessions.isEmpty {
+                    if !mainSessions.isEmpty || requiresServerSelection {
                         Button("View Sessions") {
                             viewMode = .sessions
                         }
@@ -150,15 +183,45 @@ struct ContentView: View {
 
     @ViewBuilder
     private var sessionsModeContent: some View {
-        if mainSessions.isEmpty {
+        if requiresServerSelection {
+            List {
+                statusBanners
+                Section("Select Server") {
+                    ForEach(sessionManager.displayServers) { server in
+                        Button {
+                            Task { await sessionManager.selectServer(server.id) }
+                        } label: {
+                            HStack {
+                                Text(server.name)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .listStyle(.plain)
+        } else if visibleMainSessions.isEmpty {
             VStack(spacing: 8) {
                 statusBanners
                 if sessionManager.isLoadingSessions || sessionManager.isLoadingServers {
                     ProgressView()
                 } else {
-                    Text("No sessions")
+                    Text(isManualFilterActive ? "No pinned sessions" : "No sessions")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                    if !addableMainSessions.isEmpty {
+                        Button {
+                            showAddSessionSheet = true
+                        } label: {
+                            Label("Add Session", systemImage: "plus.circle")
+                                .font(.caption2)
+                        }
+                    }
                     if !currentTasks.isEmpty {
                         Button("View Tasks") {
                             viewMode = .tasks
@@ -173,9 +236,12 @@ struct ContentView: View {
             List {
                 statusBanners
 
-                ForEach(mainSessions) { session in
+                ForEach(visibleMainSessions) { session in
                     let subs = subSessions(for: session.sessionName)
                     let isExpanded = expandedSessions.contains(session.sessionName)
+                    let isManualOnly = isManualFilterActive
+                        && !(session.isPinned ?? false)
+                        && currentManualSessionNames.contains(session.sessionName)
 
                     HStack(spacing: 0) {
                         Button {
@@ -209,6 +275,13 @@ struct ContentView: View {
                         }
                     }
                     .swipeActions(edge: .trailing) {
+                        if isManualOnly {
+                            Button(role: .destructive) {
+                                sessionManager.removeManualSession(session.sessionName, serverId: session.serverId)
+                            } label: {
+                                Label("Remove", systemImage: "trash")
+                            }
+                        }
                         if !subs.isEmpty {
                             Button {
                                 withAnimation {
@@ -232,6 +305,16 @@ struct ContentView: View {
                             }
                             .buttonStyle(.plain)
                         }
+                    }
+                }
+
+                if !addableMainSessions.isEmpty {
+                    Button {
+                        showAddSessionSheet = true
+                    } label: {
+                        Label("Add Session", systemImage: "plus.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -293,6 +376,24 @@ struct ContentView: View {
                             }
                         }
                     }
+                }
+            }
+            .sheet(isPresented: $showAddSessionSheet) {
+                if addableMainSessions.isEmpty {
+                    Text("No sessions to add")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding()
+                } else {
+                    List(addableMainSessions) { session in
+                        Button {
+                            sessionManager.addManualSession(session.sessionName, serverId: session.serverId)
+                            showAddSessionSheet = false
+                        } label: {
+                            SessionRowView(session: session)
+                        }
+                    }
+                    .listStyle(.plain)
                 }
             }
             .navigationDestination(for: WatchRoute.self) { route in

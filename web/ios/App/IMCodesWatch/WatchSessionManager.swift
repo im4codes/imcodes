@@ -15,6 +15,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
     @Published private(set) var globalTasks: [WatchGlobalTaskRow] = []
     @Published private(set) var loadedSessionsServerId: String?
     @Published private(set) var selectedServerId: String?
+    @Published private(set) var manualSessionsByServer: [String: Set<String>] = [:]
     @Published private(set) var historyByRoute: [String: WatchHistoryViewState] = [:]
     @Published private(set) var isUsingFallbackSnapshot = true
     @Published private(set) var isLoadingServers = false
@@ -22,15 +23,22 @@ final class WatchSessionManager: NSObject, ObservableObject {
     @Published private(set) var isLoadingGlobalTasks = false
 
     private static let cachedGlobalTasksKey = "imcodes.watch.cachedGlobalTasks.v1"
+    private static let selectedServerIdKey = "watchSelectedServerId"
+    private static let manualSessionsKeyPrefix = "watchManualSessions:"
+    private static let cachedSessionsKeyPrefix = "watchCachedSessions:"
 
     private let restClient = WatchRestClient()
     private var pendingRoute: WatchRoute?
     private var routeTimeoutWorkItem: DispatchWorkItem?
+    private var networkLoadedSessionServers: Set<String> = []
 
     private override init() {
         super.init()
         hydrateCachedContext()
         bootstrapFromContext(applicationContext, triggerReload: false)
+        if let selectedServerId {
+            hydrateCachedSessions(for: selectedServerId)
+        }
     }
 
     var displayServers: [WatchServerRow] {
@@ -38,19 +46,66 @@ final class WatchSessionManager: NSObject, ObservableObject {
         return applicationContext.servers
     }
 
+    private static func manualSessionsKey(for serverId: String) -> String {
+        "\(manualSessionsKeyPrefix)\(serverId)"
+    }
+
+    private static func cachedSessionsKey(for serverId: String) -> String {
+        "\(cachedSessionsKeyPrefix)\(serverId)"
+    }
+
+    private func hydrateCachedSessions(for serverId: String) {
+        guard let data = UserDefaults.standard.data(forKey: Self.cachedSessionsKey(for: serverId)),
+              let decoded = try? JSONDecoder().decode([WatchSessionRow].self, from: data) else {
+            return
+        }
+        sessionRows = decoded
+        loadedSessionsServerId = serverId
+        seedVisibleHistoriesIfNeeded(serverId: serverId)
+    }
+
+    func manualSessionNames(for serverId: String) -> Set<String> {
+        if let cached = manualSessionsByServer[serverId] {
+            return cached
+        }
+        let stored = UserDefaults.standard.stringArray(forKey: Self.manualSessionsKey(for: serverId)) ?? []
+        return Set(stored)
+    }
+
+    func addManualSession(_ sessionName: String, serverId: String) {
+        let trimmed = sessionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !serverId.isEmpty else { return }
+        var current = manualSessionNames(for: serverId)
+        guard !current.contains(trimmed) else { return }
+        current.insert(trimmed)
+        manualSessionsByServer[serverId] = current
+        UserDefaults.standard.set(Array(current).sorted(), forKey: Self.manualSessionsKey(for: serverId))
+    }
+
+    func removeManualSession(_ sessionName: String, serverId: String) {
+        var current = manualSessionNames(for: serverId)
+        guard current.remove(sessionName) != nil else { return }
+        manualSessionsByServer[serverId] = current
+        UserDefaults.standard.set(Array(current).sorted(), forKey: Self.manualSessionsKey(for: serverId))
+    }
+
     func displaySessions(for serverId: String? = nil) -> [WatchSessionRow] {
         let targetServerId = serverId ?? selectedServerId
-        let raw: [WatchSessionRow]
-        if let targetServerId {
-            if loadedSessionsServerId == targetServerId {
-                raw = sessionRows.filter { $0.serverId == targetServerId }
-            } else {
-                raw = applicationContext.sessions.filter { $0.serverId == targetServerId }
+        guard let targetServerId else {
+            if displayServers.count > 1 {
+                return []
             }
-        } else if loadedSessionsServerId != nil {
-            raw = sessionRows
+            if let onlyServerId = displayServers.first?.id {
+                return displaySessions(for: onlyServerId)
+            }
+            let raw = loadedSessionsServerId != nil ? sessionRows : applicationContext.sessions
+            return Self.sortSessions(raw)
+        }
+        let raw: [WatchSessionRow]
+        if loadedSessionsServerId == targetServerId {
+            raw = sessionRows.filter { $0.serverId == targetServerId }
         } else {
-            raw = applicationContext.sessions
+            raw = applicationContext.sessions.filter { $0.serverId == targetServerId }
         }
         return Self.sortSessions(raw)
     }
@@ -156,8 +211,10 @@ final class WatchSessionManager: NSObject, ObservableObject {
             await loadServers(force: false)
         }
         if let selectedServerId {
-            let alreadyLoaded = sessionRows.contains(where: { $0.serverId == selectedServerId })
-            if !alreadyLoaded {
+            if loadedSessionsServerId != selectedServerId {
+                hydrateCachedSessions(for: selectedServerId)
+            }
+            if !networkLoadedSessionServers.contains(selectedServerId) {
                 await loadSessions(serverId: selectedServerId, force: false)
             }
         }
@@ -190,6 +247,12 @@ final class WatchSessionManager: NSObject, ObservableObject {
         if selectedServerId != serverId {
             selectedServerId = serverId
             activeRoute = nil
+            UserDefaults.standard.set(serverId, forKey: Self.selectedServerIdKey)
+            sessionRows = []
+            loadedSessionsServerId = nil
+            hydrateCachedSessions(for: serverId)
+        } else if loadedSessionsServerId != serverId {
+            hydrateCachedSessions(for: serverId)
         }
         await loadSessions(serverId: serverId, force: true)
         resolvePendingRouteIfPossible()
@@ -321,10 +384,18 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     private func bootstrapFromContext(_ context: WatchApplicationContext, triggerReload: Bool) {
         if selectedServerId == nil {
-            selectedServerId = context.currentServerId ?? context.servers.first?.id
+            if let saved = UserDefaults.standard.string(forKey: Self.selectedServerIdKey),
+               !saved.isEmpty,
+               displayServers.isEmpty || displayServers.contains(where: { $0.id == saved }) {
+                selectedServerId = saved
+            } else if displayServers.count <= 1 {
+                selectedServerId = context.currentServerId ?? displayServers.first?.id
+            }
+        } else if !displayServers.isEmpty && !displayServers.contains(where: { $0.id == selectedServerId }) {
+            selectedServerId = displayServers.count == 1 ? displayServers.first?.id : nil
         }
-        if selectedServerId == nil {
-            selectedServerId = displayServers.first?.id
+        if let selectedServerId, loadedSessionsServerId != selectedServerId {
+            hydrateCachedSessions(for: selectedServerId)
         }
         if triggerReload && canUseDirectApi {
             Task { await self.refresh() }
@@ -336,11 +407,20 @@ final class WatchSessionManager: NSObject, ObservableObject {
            let decodedTasks = try? JSONDecoder().decode([WatchGlobalTaskRow].self, from: cachedTaskData) {
             globalTasks = decodedTasks
         }
+        if let savedServerId = UserDefaults.standard.string(forKey: Self.selectedServerIdKey), !savedServerId.isEmpty {
+            selectedServerId = savedServerId
+        }
         guard WCSession.isSupported() else { return }
         let cached = WCSession.default.receivedApplicationContext
         guard !cached.isEmpty else { return }
         if let decoded = decodeContext(cached) {
             applicationContext = decoded
+            for server in decoded.servers {
+                let stored = UserDefaults.standard.stringArray(forKey: Self.manualSessionsKey(for: server.id)) ?? []
+                if !stored.isEmpty {
+                    manualSessionsByServer[server.id] = Set(stored)
+                }
+            }
         }
     }
 
@@ -367,8 +447,22 @@ final class WatchSessionManager: NSObject, ObservableObject {
         do {
             let nextServers = try await restClient.fetchServers(baseUrl: baseUrl, apiKey: apiKey)
             servers = nextServers
-            if selectedServerId == nil || !nextServers.contains(where: { $0.id == selectedServerId }) {
-                selectedServerId = nextServers.first?.id ?? applicationContext.currentServerId
+            for server in nextServers where manualSessionsByServer[server.id] == nil {
+                let stored = UserDefaults.standard.stringArray(forKey: Self.manualSessionsKey(for: server.id)) ?? []
+                if !stored.isEmpty {
+                    manualSessionsByServer[server.id] = Set(stored)
+                }
+            }
+            if let current = selectedServerId, !nextServers.contains(where: { $0.id == current }) {
+                selectedServerId = nextServers.count == 1 ? nextServers.first?.id : nil
+                if let resolved = selectedServerId {
+                    hydrateCachedSessions(for: resolved)
+                }
+            } else if selectedServerId == nil && nextServers.count == 1 {
+                selectedServerId = nextServers.first?.id
+                if let resolved = selectedServerId {
+                    hydrateCachedSessions(for: resolved)
+                }
             }
             isUsingFallbackSnapshot = false
             lastErrorMessage = nil
@@ -391,6 +485,10 @@ final class WatchSessionManager: NSObject, ObservableObject {
             let response = try await restClient.fetchSessions(baseUrl: baseUrl, serverId: serverId, apiKey: apiKey)
             sessionRows = response.sessions
             loadedSessionsServerId = serverId
+            networkLoadedSessionServers.insert(serverId)
+            if let encoded = try? JSONEncoder().encode(response.sessions) {
+                UserDefaults.standard.set(encoded, forKey: Self.cachedSessionsKey(for: serverId))
+            }
             isUsingFallbackSnapshot = false
             lastErrorMessage = nil
             pruneSessionState(for: serverId, keepingSessionNames: Set(response.sessions.map(\.sessionName)))
