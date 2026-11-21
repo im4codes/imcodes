@@ -1,7 +1,11 @@
 import type { MacVoiceInlineModifier, ShortcutModifierKey } from './keyboard-shortcuts.js';
 import { DEFAULT_MAC_VOICE_INLINE_MODIFIER } from './keyboard-shortcuts.js';
 import { subscribeDeviceLayoutChange } from './mobile-device.js';
-import { isNativeMacDesktop } from './native-platform.js';
+import { isNativeMacDesktop, isPcAppInlineVoiceSupported } from './native-platform.js';
+
+export function isMacVoiceShortcutEnabled(): boolean {
+  return isNativeMacDesktop() || isPcAppInlineVoiceSupported();
+}
 
 export const DOUBLE_TAP_MODIFIER_WINDOW_MS = 450;
 export const MAX_MODIFIER_TAP_HOLD_MS = 450;
@@ -91,7 +95,7 @@ export function isShortcutRecordingActiveInDom(): boolean {
 export function createDoubleTapModifierDetector(
   options: DoubleTapModifierDetectorOptions,
 ): DoubleTapModifierDetector {
-  const isEnabled = options.isEnabled ?? (() => isNativeMacDesktop());
+  const isEnabled = options.isEnabled ?? isMacVoiceShortcutEnabled;
   const now = options.now ?? (() => Date.now());
   const doubleTapWindowMs = options.doubleTapWindowMs ?? DOUBLE_TAP_MODIFIER_WINDOW_MS;
   const maxHoldMs = options.maxHoldMs ?? MAX_MODIFIER_TAP_HOLD_MS;
@@ -317,7 +321,7 @@ function attachShortcutListenerInternal(options: InstallMacVoiceShortcutListener
   win.addEventListener('compositionstart', onCompositionStart, true);
   win.addEventListener(NATIVE_MODIFIER_PRESS_EVENT, onNativeEvent as EventListener);
   const unsubscribeHost = subscribeDeviceLayoutChange(() => {
-    if (!(options.isEnabled ? options.isEnabled() : isNativeMacDesktop())) {
+    if (!(options.isEnabled ? options.isEnabled() : isMacVoiceShortcutEnabled())) {
       detector.reset();
     }
   }, { includeResize: false });

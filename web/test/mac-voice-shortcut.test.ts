@@ -8,6 +8,7 @@ import {
   NATIVE_MODIFIER_PRESS_EVENT,
   createDoubleTapModifierDetector,
   installMacVoiceShortcutListener,
+  isMacVoiceShortcutEnabled,
 } from '../src/mac-voice-shortcut.js';
 import type { MacVoiceInlineModifier } from '../src/keyboard-shortcuts.js';
 
@@ -31,6 +32,7 @@ function modEvent(
 describe('mac-voice-shortcut double-tap modifier detector', () => {
   afterEach(() => {
     document.body.innerHTML = '';
+    delete (globalThis as Record<string, unknown>).__IMCODES_PC_APP__;
     vi.restoreAllMocks();
   });
 
@@ -261,5 +263,94 @@ describe('mac-voice-shortcut double-tap modifier detector', () => {
     expect(onDoubleTap).toHaveBeenCalledTimes(1);
 
     cleanup();
+  });
+
+  it('enables default double-tap modifier detection on macOS PC App while keeping plain/Windows browsers disabled and honoring explicit isEnabled', () => {
+    let now = 3000;
+    const onDoubleTap = vi.fn();
+
+    // Plain web browser (no Capacitor Mac desktop and no PC App bridge): disabled
+    expect(isMacVoiceShortcutEnabled()).toBe(false);
+    const plainCleanup = installMacVoiceShortcutListener({
+      getTargetModifier: () => 'ctrl',
+      now: () => now,
+      onDoubleTap,
+    });
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true }));
+    now += 30;
+    window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft' }));
+    now += 80;
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true }));
+    now += 30;
+    window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft' }));
+    expect(onDoubleTap).not.toHaveBeenCalled();
+
+    // Windows PC App (isNativeSpeechSupported === false): remains disabled
+    (globalThis as Record<string, unknown>).__IMCODES_PC_APP__ = {
+      platform: 'win32',
+      isElectron: true,
+      voice: { isNativeSpeechSupported: () => false },
+    };
+    expect(isMacVoiceShortcutEnabled()).toBe(false);
+    now += 500;
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true }));
+    now += 30;
+    window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft' }));
+    now += 80;
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true }));
+    now += 30;
+    window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft' }));
+    expect(onDoubleTap).not.toHaveBeenCalled();
+
+    // macOS PC App (isNativeSpeechSupported === true, Capacitor false): enables listener & detector
+    (globalThis as Record<string, unknown>).__IMCODES_PC_APP__ = {
+      platform: 'darwin',
+      isElectron: true,
+      voice: { isNativeSpeechSupported: () => true },
+    };
+    expect(isMacVoiceShortcutEnabled()).toBe(true);
+    now += 500;
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true }));
+    now += 30;
+    window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft' }));
+    now += 80;
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true }));
+    now += 30;
+    window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft' }));
+    expect(onDoubleTap).toHaveBeenCalledTimes(1);
+
+    const detector = createDoubleTapModifierDetector({
+      getTargetModifier: () => 'meta',
+      now: () => now,
+      onDoubleTap,
+    });
+    now += 500;
+    detector.handleKeyDown(modEvent('Meta', 'MetaLeft'));
+    now += 25;
+    detector.handleKeyUp(modEvent('Meta', 'MetaLeft', { metaKey: false }));
+    now += 90;
+    detector.handleKeyDown(modEvent('Meta', 'MetaLeft'));
+    now += 25;
+    detector.handleKeyUp(modEvent('Meta', 'MetaLeft', { metaKey: false }));
+    expect(onDoubleTap).toHaveBeenCalledTimes(2);
+
+    // Explicit isEnabled override takes precedence
+    const suppressedDetector = createDoubleTapModifierDetector({
+      getTargetModifier: () => 'ctrl',
+      isEnabled: () => false,
+      now: () => now,
+      onDoubleTap,
+    });
+    now += 500;
+    suppressedDetector.handleKeyDown(modEvent('Control', 'ControlLeft'));
+    now += 25;
+    suppressedDetector.handleKeyUp(modEvent('Control', 'ControlLeft', { ctrlKey: false }));
+    now += 90;
+    suppressedDetector.handleKeyDown(modEvent('Control', 'ControlLeft'));
+    now += 25;
+    suppressedDetector.handleKeyUp(modEvent('Control', 'ControlLeft', { ctrlKey: false }));
+    expect(onDoubleTap).toHaveBeenCalledTimes(2);
+
+    plainCleanup();
   });
 });
