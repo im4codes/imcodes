@@ -687,6 +687,7 @@ export interface TaskPairBranchPatchCache {
 }
 
 interface CommonDirPatchIndex {
+  ready: Promise<void>;
   anchor: string | undefined;
   patchIdToCommits: Promise<Map<string, string[]> | undefined>;
 }
@@ -1002,22 +1003,38 @@ async function getBranchPatchIndex(
   const commonDir = await resolveGitCommonDir(repoPath, cache);
   const existing = cache.patchIndexByCommonDir.get(commonDir);
   if (existing) {
+    await existing.ready;
     if (existing.anchor === undefined) return existing.patchIdToCommits;
     const isAncestor = await runGit(repoPath, ['merge-base', '--is-ancestor', existing.anchor, baseRevision]);
     if (isAncestor.ok) return existing.patchIdToCommits;
   }
 
-  const seededBases: string[] = [baseRevision];
-  if (existing?.anchor) seededBases.push(existing.anchor);
-  for (const item of cache.registeredWorktrees) {
-    if ((await resolveGitCommonDir(item.worktreePath, cache)) === commonDir) {
-      seededBases.push(item.baseRevision);
+  // Register the index entry synchronously before awaiting anchor resolution so concurrent
+  // dryRun workers share the single patch-id scan instead of rebuilding it in parallel.
+  const entry: CommonDirPatchIndex = {
+    ready: Promise.resolve(),
+    anchor: undefined,
+    patchIdToCommits: Promise.resolve(undefined),
+  };
+  const anchorPromise = (async (): Promise<string | undefined> => {
+    const seededBases: string[] = [baseRevision];
+    if (existing?.anchor) seededBases.push(existing.anchor);
+    const registeredBases = await Promise.all(
+      cache.registeredWorktrees.map(async (item) => (
+        (await resolveGitCommonDir(item.worktreePath, cache)) === commonDir ? item.baseRevision : undefined
+      )),
+    );
+    for (const base of registeredBases) {
+      if (base) seededBases.push(base);
     }
-  }
-  const anchor = await resolveCommonAnchor(repoPath, seededBases);
-  const patchIdToCommits = buildForAnchor(anchor);
-  cache.patchIndexByCommonDir.set(commonDir, { anchor, patchIdToCommits });
-  return patchIdToCommits;
+    const anchor = await resolveCommonAnchor(repoPath, seededBases);
+    entry.anchor = anchor;
+    return anchor;
+  })();
+  entry.ready = anchorPromise.then(() => undefined);
+  entry.patchIdToCommits = anchorPromise.then((anchor) => buildForAnchor(anchor));
+  cache.patchIndexByCommonDir.set(commonDir, entry);
+  return entry.patchIdToCommits;
 }
 
 async function listBranchesContainingAnyCommit(
