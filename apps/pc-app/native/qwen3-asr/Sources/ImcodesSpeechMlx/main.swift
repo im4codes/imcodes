@@ -357,7 +357,8 @@ func joinTranscriptSegments(_ committed: String, _ active: String) -> String {
 
 final class QwenStreamingSession {
     private let sampleRate = 16_000
-    private let strideSamples = 32_000 // 2.0s stride
+    private let initialStrideSamples = 12_800 // 0.8s initial partial threshold
+    private let strideSamples = 16_000 // 1.0s stride
     private let maxSegmentSamples = 216_000 // 13.5s bounded segment
     private let rollbackTokenCount = 5
 
@@ -557,14 +558,25 @@ final class QwenStreamingSession {
                 pendingSamples.removeAll(keepingCapacity: true)
             }
             let currentLen = activeSegment.count
-            let newCount = currentLen - lastDecodedCount
+            let decodedCountSnapshot = lastDecodedCount
+            let newCount = currentLen - decodedCountSnapshot
             lock.unlock()
 
             if isAborted {
                 break
             }
 
-            if newCount >= strideSamples || (isStop && currentLen > 0) {
+            if isStop && newCount == 0 && !lastEmittedText.isEmpty {
+                emitJson([
+                    "type": "result",
+                    "text": lastEmittedText,
+                    "isFinal": true,
+                ])
+                break
+            }
+
+            let threshold = decodedCountSnapshot == 0 ? initialStrideSamples : strideSamples
+            if newCount >= threshold || (isStop && currentLen > 0) {
                 let isFinalPass = isStop
                 let options = Qwen3DecodingOptions(
                     maxTokens: 192,

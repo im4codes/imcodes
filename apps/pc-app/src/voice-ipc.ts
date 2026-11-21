@@ -167,6 +167,7 @@ function defaultBuildDevHelper(outPath: string, arch = process.arch === 'x64' ? 
 
 export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let activeChild: ChildProcess | null = null;
+  let activeChildIsMlx = false;
   let activeStopTimer: ReturnType<typeof setTimeout> | null = null;
   let cachedDevHelperPath: string | null = null;
   let cachedMlxSupport: boolean | null =
@@ -715,9 +716,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       activeStopTimer = null;
     }
     const child = activeChild;
+    const isMlxChild = activeChildIsMlx;
     if (!child) return;
     if (options?.abort) {
       activeChild = null;
+      activeChildIsMlx = false;
       try {
         child.kill('SIGTERM');
       } catch { /* already exited */ }
@@ -729,6 +732,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     } catch {
       try { child.kill('SIGTERM'); } catch { /* ignore */ }
     }
+    const stopTimeoutMs = isMlxChild ? 12_000 : 2_200;
     await new Promise<void>((resolveStop) => {
       let settled = false;
       const done = () => {
@@ -744,10 +748,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       activeStopTimer = setTimeout(() => {
         if (activeChild === child) {
           activeChild = null;
+          activeChildIsMlx = false;
         }
         try { child.kill('SIGTERM'); } catch { /* ignore */ }
         done();
-      }, 2_200);
+      }, stopTimeoutMs);
     });
   };
 
@@ -767,12 +772,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     const variant = choiceToSpeechVariant(selectedModel);
     let bin: string | null = null;
     let args: string[];
+    let isMlxHelper = false;
 
     if (variant && (await checkMlxSupported()) && downloader.isModelReadySync(variant)) {
       const mlxBin = resolveMlxHelperPath();
       const verified = await downloader.verifyModelFilesOnDisk(variant);
       if (mlxBin && verified) {
         bin = mlxBin;
+        isMlxHelper = true;
         args = ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant];
         if (typeof options?.locale === 'string' && options.locale.trim()) {
           args.push('--locale', options.locale.trim());
@@ -818,6 +825,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     appendVoiceLog(`startListening model=${selectedModel} device=${selectedInputDevice} bin=${bin} args=${JSON.stringify(args)}`);
     const child = (deps.spawnHelper ?? ((p, a) => spawn(p, a, { stdio: ['pipe', 'pipe', 'pipe'] })))(bin, args);
     activeChild = child;
+    activeChildIsMlx = isMlxHelper;
 
     let stdoutBuffer = '';
     let stderrBuffer = '';
@@ -827,11 +835,17 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       if (payload.type === 'level' && !loggedFirstLevel && payload.value > 0.01) {
         loggedFirstLevel = true;
         appendVoiceLog(`first level value=${payload.value.toFixed(4)}`);
-      } else if (payload.type === 'result' && !loggedFirstResult && payload.text.trim()) {
-        loggedFirstResult = true;
-        appendVoiceLog(
-          `first result isFinal=${payload.isFinal} len=${payload.text.trim().length} text=${JSON.stringify(payload.text.trim().slice(0, 80))}`,
-        );
+      } else if (payload.type === 'result') {
+        const trimmed = payload.text.trim();
+        if (!loggedFirstResult && trimmed) {
+          loggedFirstResult = true;
+          appendVoiceLog(
+            `first result isFinal=${payload.isFinal} len=${trimmed.length} text=${JSON.stringify(trimmed.slice(0, 80))}`,
+          );
+        }
+        if (payload.isFinal) {
+          appendVoiceLog(`final result len=${trimmed.length} text=${JSON.stringify(trimmed.slice(0, 80))}`);
+        }
       } else if (payload.type === 'error') {
         appendVoiceLog(`helper error code=${payload.code} target=${payload.target ?? '-'} message=${payload.message ?? '-'}`);
       }
@@ -877,6 +891,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       appendVoiceLog(`helper exit code=${code ?? 'null'} signal=${signal ?? 'null'}`);
       if (activeChild === child) {
         activeChild = null;
+        activeChildIsMlx = false;
         if (code && code !== 0) {
           const message = stderrBuffer.trim();
           emitSafe({
@@ -893,6 +908,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       appendVoiceLog(`helper spawn_error: ${err.message}`);
       if (activeChild === child) {
         activeChild = null;
+        activeChildIsMlx = false;
       }
       emitSafe({ type: 'error', code: 'helper_spawn_failed', message: err.message });
       emitSafe({ type: 'end' });
