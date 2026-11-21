@@ -14,7 +14,7 @@ import {
   utimes,
   writeFile,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { cpus, tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { TASK_PAIR_WORKTREE_PREFIX } from '../../shared/task-pair.js';
 import type { SupervisionRetentionGcResult } from './supervision-retention-gc.js';
@@ -486,52 +486,80 @@ function taskHasMergedAuthority(reference: SupervisionWorktreeRegistryReference)
   return finalization.pushResult === 'pushed' || finalization.pushResult === 'already_present';
 }
 
-async function worktreeBlock(porcelain: string, repoPath: string): Promise<string | undefined> {
-  const canonical = await realpath(repoPath);
-  for (const block of porcelain.split(/\n\n+/)) {
-    const worktreeLine = block.split('\n').find((line) => line.startsWith('worktree '));
-    if (!worktreeLine) continue;
-    const listed = await realpath(worktreeLine.slice('worktree '.length)).catch(() => undefined);
-    if (listed === canonical) return block;
+async function getWorktreeBlocksByCanonicalPath(
+  repoPath: string,
+  cache?: TaskPairBranchPatchCacheImpl,
+): Promise<Map<string, string> | undefined> {
+  const buildMap = async () => {
+    const worktreeResult = await runGit(repoPath, ['worktree', 'list', '--porcelain']);
+    if (!worktreeResult.ok) return undefined;
+    const blocks = worktreeResult.stdout.split(/\n\n+/u);
+    const resolved = await Promise.all(blocks.map(async (block) => {
+      const worktreeLine = block.split('\n').find((line) => line.startsWith('worktree '));
+      if (!worktreeLine) return undefined;
+      const listed = await realpath(worktreeLine.slice('worktree '.length)).catch(() => undefined);
+      return listed ? [listed, block] as const : undefined;
+    }));
+    const map = new Map<string, string>();
+    for (const entry of resolved) {
+      if (entry) map.set(entry[0], entry[1]);
+    }
+    return map;
+  };
+  if (!cache) return buildMap();
+  const commonDir = await resolveGitCommonDir(repoPath, cache);
+  let promise = cache.worktreeBlocksByCommonDir.get(commonDir);
+  if (!promise) {
+    promise = buildMap();
+    cache.worktreeBlocksByCommonDir.set(commonDir, promise);
   }
-  return undefined;
+  return promise;
 }
 
-export async function inspectSupervisionGitWorktree(repoPath: string): Promise<SupervisionWorktreeGitInspection> {
-  const inside = await runGit(repoPath, ['rev-parse', '--is-inside-work-tree']);
+export async function inspectSupervisionGitWorktree(
+  repoPath: string,
+  options?: { cache?: TaskPairBranchPatchCache; skipRemoteCheck?: boolean },
+): Promise<SupervisionWorktreeGitInspection> {
+  const cache = options?.cache instanceof TaskPairBranchPatchCacheImpl ? options.cache : undefined;
+  const [inside, statusResult, commonResult] = await Promise.all([
+    runGit(repoPath, ['rev-parse', '--is-inside-work-tree']),
+    runGit(repoPath, ['status', '--porcelain=v2', '--untracked-files=all']),
+    runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
+  ]);
   if (!inside.ok || inside.stdout.trim() !== 'true') {
     return { ok: false, reason: SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE };
   }
-  const statusResult = await runGit(repoPath, ['status', '--porcelain=v2', '--untracked-files=all']);
   if (!statusResult.ok) return { ok: false, reason: SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE };
   const statusLines = statusResult.stdout.split('\n').filter(Boolean);
   const untracked = statusLines.some((line) => line.startsWith('? '));
   const dirty = statusLines.some((line) => !line.startsWith('? '));
 
-  const commonResult = await runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
   if (!commonResult.ok || !commonResult.stdout.trim()) {
     return { ok: false, reason: SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE };
   }
   const commonDir = resolve(repoPath, commonResult.stdout.trim());
-  const worktreeResult = await runGit(repoPath, ['worktree', 'list', '--porcelain']);
-  if (!worktreeResult.ok) return { ok: false, reason: SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE };
-  const block = await worktreeBlock(worktreeResult.stdout, repoPath);
+  const blockMap = await getWorktreeBlocksByCanonicalPath(repoPath, cache);
+  if (!blockMap) return { ok: false, reason: SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE };
+  const canonicalRepoPath = await realpath(repoPath).catch(() => undefined);
+  const block = canonicalRepoPath ? blockMap.get(canonicalRepoPath) : undefined;
   const locked = block?.split('\n').some((line) => line === 'locked' || line.startsWith('locked ')) ?? false;
 
   let branchOnly = false;
   let unpushed = false;
-  const branch = await runGit(repoPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
-  if (branch.ok && branch.stdout.trim()) {
-    const upstream = await runGit(repoPath, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
-    if (!upstream.ok || !upstream.stdout.trim()) {
-      branchOnly = true;
+  if (!options?.skipRemoteCheck) {
+    const branch = await runGit(repoPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    if (branch.ok && branch.stdout.trim()) {
+      const upstream = await runGit(repoPath, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
+      if (!upstream.ok || !upstream.stdout.trim()) {
+        branchOnly = true;
+      } else {
+        const ahead = await runGit(repoPath, ['rev-list', '--count', '@{upstream}..HEAD']);
+        unpushed = !ahead.ok || Number.parseInt(ahead.stdout.trim(), 10) > 0;
+      }
     } else {
-      const ahead = await runGit(repoPath, ['rev-list', '--count', '@{upstream}..HEAD']);
-      unpushed = !ahead.ok || Number.parseInt(ahead.stdout.trim(), 10) > 0;
+      const remoteContains = await runGit(repoPath, ['for-each-ref', '--format=%(refname)', '--contains', 'HEAD', 'refs/remotes']);
+      unpushed = !remoteContains.ok || remoteContains.stdout.trim().length === 0;
     }
-  } else {
-    const remoteContains = await runGit(repoPath, ['for-each-ref', '--format=%(refname)', '--contains', 'HEAD', 'refs/remotes']);
-    unpushed = !remoteContains.ok || remoteContains.stdout.trim().length === 0;
   }
 
   return {
@@ -649,6 +677,8 @@ const PRIMARY_TASK_PAIR_INTEGRATION_REFS = [
 const PATCH_ID_STREAM_TIMEOUT_MS = 60_000;
 const CONTAINS_BATCH_SIZE = 64;
 const CHERRY_FALLBACK_CONCURRENCY = 8;
+const PATCH_INDEX_SHARD_MIN_COMMITS = 64;
+const PATCH_INDEX_MAX_SHARDS = 6;
 const EMPTY_DIFF_PATCH_KEY = '__empty_diff__';
 
 export interface TaskPairBranchPatchCache {
@@ -664,6 +694,8 @@ interface CommonDirPatchIndex {
 class TaskPairBranchPatchCacheImpl implements TaskPairBranchPatchCache {
   readonly commonDirPromises = new Map<string, Promise<string | undefined>>();
   readonly branchRefsByCommonDir = new Map<string, Promise<TaskPairBranchRef[] | undefined>>();
+  readonly worktreeBlocksByCommonDir = new Map<string, Promise<Map<string, string> | undefined>>();
+  readonly containsRefsByCommonDirKey = new Map<string, Promise<Set<string> | undefined>>();
   readonly patchIndexByCommonDir = new Map<string, CommonDirPatchIndex>();
   readonly registeredWorktrees: Array<{ worktreePath: string; baseRevision: string }> = [];
 
@@ -779,19 +811,6 @@ function streamPatchIdPipeline(
     producerChild.on('close', (code) => { producerExited = true; producerCode = code; maybeComplete(); });
     patchChild.on('close', (code) => { patchExited = true; patchCode = code; maybeComplete(); });
   });
-}
-
-function streamGitPatchIds(
-  repoPath: string,
-  logArgs: readonly string[],
-  timeoutMs = PATCH_ID_STREAM_TIMEOUT_MS,
-): Promise<Map<string, string> | undefined> {
-  return streamPatchIdPipeline(
-    repoPath,
-    ['log', '-p', '--no-ext-diff', '--no-color', ...logArgs],
-    undefined,
-    timeoutMs,
-  );
 }
 
 function streamCommitPatchIdsFromList(
@@ -941,17 +960,28 @@ async function getBranchPatchIndex(
   cache?: TaskPairBranchPatchCacheImpl,
 ): Promise<Map<string, string[]> | undefined> {
   const buildForAnchor = async (anchor: string | undefined): Promise<Map<string, string[]> | undefined> => {
-    const [commitToPatch, allNonMergeHashes] = await Promise.all([
-      streamGitPatchIds(repoPath, [
-        '--no-merges',
-        '--root',
-        '--branches',
-        '--remotes',
-        ...(anchor ? ['--not', anchor] : []),
-      ]),
-      streamGitNonMergeHashes(repoPath, anchor),
-    ]);
-    if (!commitToPatch || !allNonMergeHashes) return undefined;
+    const allNonMergeHashes = await streamGitNonMergeHashes(repoPath, anchor);
+    if (!allNonMergeHashes) return undefined;
+    if (allNonMergeHashes.length === 0) return new Map();
+
+    const shardCount = allNonMergeHashes.length < PATCH_INDEX_SHARD_MIN_COMMITS
+      ? 1
+      : Math.min(PATCH_INDEX_MAX_SHARDS, Math.max(1, cpus().length), Math.ceil(allNonMergeHashes.length / PATCH_INDEX_SHARD_MIN_COMMITS));
+    const shards: string[][] = Array.from({ length: shardCount }, () => []);
+    for (let i = 0; i < allNonMergeHashes.length; i++) {
+      shards[i % shardCount]!.push(allNonMergeHashes[i]!);
+    }
+    const shardMaps = await Promise.all(
+      shards.filter((shard) => shard.length > 0).map((shard) => streamCommitPatchIdsFromList(repoPath, shard)),
+    );
+    if (shardMaps.some((map) => !map)) return undefined;
+
+    const commitToPatch = new Map<string, string>();
+    for (const shardMap of shardMaps) {
+      if (!shardMap) continue;
+      for (const [sha, patchId] of shardMap) commitToPatch.set(sha, patchId);
+    }
+
     const patchToCommits = new Map<string, string[]>();
     for (const [sha, patchId] of commitToPatch) {
       const list = patchToCommits.get(patchId);
@@ -993,19 +1023,31 @@ async function getBranchPatchIndex(
 async function listBranchesContainingAnyCommit(
   repoPath: string,
   commitShas: readonly string[],
+  cache?: TaskPairBranchPatchCacheImpl,
 ): Promise<Set<string> | undefined> {
-  const matching = new Set<string>();
-  for (let i = 0; i < commitShas.length; i += CONTAINS_BATCH_SIZE) {
-    const batch = commitShas.slice(i, i + CONTAINS_BATCH_SIZE);
-    const containsArgs = batch.flatMap((sha) => ['--contains', sha]);
-    const out = await runGit(repoPath, ['for-each-ref', ...containsArgs, '--format=%(refname)', 'refs/heads', 'refs/remotes']);
-    if (!out.ok) return undefined;
-    for (const line of out.stdout.split(/\r?\n/u)) {
-      const ref = line.trim();
-      if (ref && !/^refs\/remotes\/[^/]+\/HEAD$/u.test(ref)) matching.add(ref);
+  const runUncached = async () => {
+    const matching = new Set<string>();
+    for (let i = 0; i < commitShas.length; i += CONTAINS_BATCH_SIZE) {
+      const batch = commitShas.slice(i, i + CONTAINS_BATCH_SIZE);
+      const containsArgs = batch.flatMap((sha) => ['--contains', sha]);
+      const out = await runGit(repoPath, ['for-each-ref', ...containsArgs, '--format=%(refname)', 'refs/heads', 'refs/remotes']);
+      if (!out.ok) return undefined;
+      for (const line of out.stdout.split(/\r?\n/u)) {
+        const ref = line.trim();
+        if (ref && !/^refs\/remotes\/[^/]+\/HEAD$/u.test(ref)) matching.add(ref);
+      }
     }
+    return matching;
+  };
+  if (!cache) return runUncached();
+  const commonDir = await resolveGitCommonDir(repoPath, cache);
+  const key = `${commonDir}\0${[...commitShas].sort().join(',')}`;
+  let promise = cache.containsRefsByCommonDirKey.get(key);
+  if (!promise) {
+    promise = runUncached();
+    cache.containsRefsByCommonDirKey.set(key, promise);
   }
-  return matching;
+  return promise;
 }
 
 /**
@@ -1023,12 +1065,15 @@ export async function listTaskPairCommitsNotInAnyBranch(
 ): Promise<string[] | undefined> {
   const head = options.head ?? 'HEAD';
   const cache = options.cache instanceof TaskPairBranchPatchCacheImpl ? options.cache : undefined;
-  const commits = await runGit(repoPath, ['rev-list', '--reverse', `${baseRevision}..${head}`]);
+  const [commits, containingBranches] = await Promise.all([
+    runGit(repoPath, ['rev-list', '--reverse', `${baseRevision}..${head}`]),
+    listTaskPairBranchesContaining(repoPath, head),
+  ]);
   if (!commits.ok) return undefined;
   const hashes = commits.stdout.trim().split(/\s+/u).filter(Boolean);
   if (hashes.length === 0) return [];
 
-  if ((await listTaskPairBranchesContaining(repoPath, head))?.length) return [];
+  if (containingBranches?.length) return [];
   let listed: TaskPairBranchRef[] | undefined;
   if (cache) {
     const commonDir = await resolveGitCommonDir(repoPath, cache);
@@ -1061,7 +1106,14 @@ export async function listTaskPairCommitsNotInAnyBranch(
     return checkRefsWithCherry(repoPath, head, orderedRemaining, hashes, currentBest, CHERRY_FALLBACK_CONCURRENCY);
   };
 
-  const nonMergeResult = await runGit(repoPath, ['rev-list', '--reverse', '--no-merges', `${baseRevision}..${head}`]);
+  const topPrimaryTip = primaryRefs[0]?.tip;
+  const nonMergeResult = await runGit(repoPath, [
+    'rev-list',
+    '--reverse',
+    '--no-merges',
+    `${baseRevision}..${head}`,
+    ...(topPrimaryTip ? ['--not', topPrimaryTip] : []),
+  ]);
   if (!nonMergeResult.ok) return fallbackRefs(hashes, allDedupedRefs);
   const nonMergeHashes = nonMergeResult.stdout.trim().split(/\s+/u).filter(Boolean);
   if (nonMergeHashes.length === 0) return [];
@@ -1069,21 +1121,10 @@ export async function listTaskPairCommitsNotInAnyBranch(
   const nonMergeSet = new Set(nonMergeHashes);
   let best = hashes.filter((hash) => nonMergeSet.has(hash));
   let uncheckedRefs = allDedupedRefs;
-  let checkedTopPrimary = false;
 
   const baseAncestorCheck = await runGit(repoPath, ['merge-base', '--is-ancestor', baseRevision, head]);
   if (!baseAncestorCheck.ok) {
     return fallbackRefs(best, uncheckedRefs);
-  }
-
-  // If a worktree merged dev/main into itself, check the top primary branch once up front
-  // so merged upstream commits do not fan out into dozens of archive branches.
-  if (best.length > 10 && primaryRefs.length > 0) {
-    const topPrimary = primaryRefs[0]!;
-    best = await checkRefsWithCherry(repoPath, head, [topPrimary], hashes, best, 1);
-    if (best.length === 0) return [];
-    uncheckedRefs = uncheckedRefs.filter((entry) => entry.ref !== topPrimary.ref);
-    checkedTopPrimary = true;
   }
 
   const headPatchIds = await streamCommitPatchIdsFromList(repoPath, best);
@@ -1110,21 +1151,21 @@ export async function listTaskPairCommitsNotInAnyBranch(
   let matchingBranchShas = collectMatchingBranchShas(best);
   if (matchingBranchShas.size === 0) return best;
 
-  let candidateRefNames = await listBranchesContainingAnyCommit(repoPath, [...matchingBranchShas]);
+  let candidateRefNames = await listBranchesContainingAnyCommit(repoPath, [...matchingBranchShas], cache);
   if (!candidateRefNames) {
     return fallbackRefs(best, uncheckedRefs);
   }
   let matchingRefs = uncheckedRefs.filter((entry) => candidateRefNames!.has(entry.ref));
   if (matchingRefs.length === 0) return best;
 
-  if (!checkedTopPrimary && matchingRefs.length > 2 && primaryRefs.length > 0 && candidateRefNames.has(primaryRefs[0]!.ref)) {
+  if (matchingRefs.length > 2 && primaryRefs.length > 0 && candidateRefNames.has(primaryRefs[0]!.ref)) {
     const topPrimary = primaryRefs[0]!;
     best = await checkRefsWithCherry(repoPath, head, [topPrimary], hashes, best, 1);
     if (best.length === 0) return [];
     uncheckedRefs = uncheckedRefs.filter((entry) => entry.ref !== topPrimary.ref);
     matchingBranchShas = collectMatchingBranchShas(best);
     if (matchingBranchShas.size === 0) return best;
-    candidateRefNames = await listBranchesContainingAnyCommit(repoPath, [...matchingBranchShas]);
+    candidateRefNames = await listBranchesContainingAnyCommit(repoPath, [...matchingBranchShas], cache);
     if (!candidateRefNames) {
       return fallbackRefs(best, uncheckedRefs);
     }

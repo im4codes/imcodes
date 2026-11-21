@@ -2714,8 +2714,7 @@ export class TaskPairService {
         branchPatchCache.registerWorktreeBase(workspace.path, workspace.base);
       }
     }
-    const entries: TaskPairWorkspaceGcEntry[] = [];
-    for (const stored of candidates) {
+    const evaluateCandidate = async (stored: StoredTaskPair): Promise<TaskPairWorkspaceGcEntry> => {
       const pair = stored.state;
       const workspace = pair.workspace!;
       const endedAt = workspace.endedAt ?? pair.updatedAt;
@@ -2723,19 +2722,34 @@ export class TaskPairService {
       const retentionMs = pair.status === 'cancelled' ? 0
         : workspace.kind === 'worktree' && !workspace.nonGit ? options.minAgeMs
           : Math.max(options.minAgeMs, TASK_PAIR_WORKSPACE_RETENTION_MS);
-      if (now - endedAt < retentionMs) { entries.push({ ...base, action: 'too_recent' }); continue; }
+      if (now - endedAt < retentionMs) return { ...base, action: 'too_recent' };
       try {
         const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, options.dryRun, branchPatchCache);
         const released = outcome?.released;
-        if (!released) { entries.push({ ...base, action: 'absent' }); continue; }
-        entries.push(released.action === 'kept'
+        if (!released) return { ...base, action: 'absent' };
+        return released.action === 'kept'
           ? { ...base, action: 'kept', reason: released.reason }
-          : { ...base, action: released.action === 'removed' ? (options.dryRun ? 'would_remove' : 'removed') : released.action });
+          : { ...base, action: released.action === 'removed' ? (options.dryRun ? 'would_remove' : 'removed') : released.action };
       } catch (error) {
         logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace gc failed');
-        entries.push({ ...base, action: 'failed' });
+        return { ...base, action: 'failed' };
       }
+    };
+    if (!options.dryRun || candidates.length <= 1) {
+      const entries: TaskPairWorkspaceGcEntry[] = [];
+      for (const stored of candidates) entries.push(await evaluateCandidate(stored));
+      return entries;
     }
+    const entries = new Array<TaskPairWorkspaceGcEntry>(candidates.length);
+    const workerCount = Math.min(8, candidates.length);
+    let nextIndex = 0;
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const idx = nextIndex++;
+        if (idx >= candidates.length) return;
+        entries[idx] = await evaluateCandidate(candidates[idx]!);
+      }
+    }));
     return entries;
   }
 

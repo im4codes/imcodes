@@ -464,7 +464,12 @@ export async function releaseTaskPairWorkspace(
     if (!deps.dryRun) await rm(assignmentRoot, { recursive: true, force: true });
     return { action: 'removed' };
   }
-  const inspection = await (deps.inspectGit ?? inspectSupervisionGitWorktree)(repoPath);
+  const inspection = deps.inspectGit
+    ? await deps.inspectGit(repoPath)
+    : await inspectSupervisionGitWorktree(repoPath, {
+      cache: deps.branchPatchCache,
+      skipRemoteCheck: true,
+    });
   if (!inspection.ok) return { action: 'kept', reason: 'unreadable' };
   if (inspection.locked) return { action: 'kept', reason: 'locked' };
   if (inspection.dirty) return { action: 'kept', reason: 'dirty' };

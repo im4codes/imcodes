@@ -484,12 +484,16 @@ describe('pair_workspace_gc (on-demand cleanup of ended pairs)', () => {
     git(project, '-c', 'user.email=t@example.invalid', '-c', 'user.name=T', 'commit', '--allow-empty', '-qm', 'evidence: empty on branch');
     git(project, 'checkout', '-q', '-');
 
+    const lockedTree = await endedPair('worktree', 'gc-many-locked', 'cancel');
+    git(project, 'worktree', 'lock', pair(lockedTree).workspace!.path);
+
     const dry = await gc({ dryRun: true, limit: 20 });
     expect(entryOf(dry, cherryPicked)).toMatchObject({ action: 'would_remove' });
     expect(entryOf(dry, split)).toMatchObject({ action: 'kept', reason: 'unpushed' });
     expect(entryOf(dry, branchMerged)).toMatchObject({ action: 'would_remove' });
     expect(entryOf(dry, emptyCommitUnpushed)).toMatchObject({ action: 'kept', reason: 'unpushed' });
     expect(entryOf(dry, emptyCommitMatched)).toMatchObject({ action: 'would_remove' });
+    expect(entryOf(dry, lockedTree)).toMatchObject({ action: 'kept', reason: 'locked' });
 
     const applied = await gc({ dryRun: false, limit: 20 });
     expect(entryOf(applied, cherryPicked)).toMatchObject({ action: 'removed' });
@@ -497,7 +501,10 @@ describe('pair_workspace_gc (on-demand cleanup of ended pairs)', () => {
     expect(entryOf(applied, branchMerged)).toMatchObject({ action: 'removed' });
     expect(entryOf(applied, emptyCommitUnpushed)).toMatchObject({ action: 'kept', reason: 'unpushed' });
     expect(entryOf(applied, emptyCommitMatched)).toMatchObject({ action: 'removed' });
+    expect(entryOf(applied, lockedTree)).toMatchObject({ action: 'kept', reason: 'locked' });
     expect(existsSync(pair(split).workspace!.path)).toBe(true);
     expect(existsSync(pair(emptyCommitUnpushed).workspace!.path)).toBe(true);
+    expect(existsSync(pair(lockedTree).workspace!.path)).toBe(true);
+    git(project, 'worktree', 'unlock', pair(lockedTree).workspace!.path);
   });
 });
