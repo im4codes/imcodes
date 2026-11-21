@@ -39,7 +39,10 @@ struct ContentView: View {
     private static let autoShowAllMainSessionLimit = 5
 
     private var activeServerId: String? {
-        sessionManager.selectedServerId ?? (sessionManager.displayServers.count == 1 ? sessionManager.displayServers.first?.id : nil)
+        if sessionManager.isAllPinnedSelected {
+            return nil
+        }
+        return sessionManager.selectedServerId ?? (sessionManager.displayServers.count == 1 ? sessionManager.displayServers.first?.id : nil)
     }
 
     private var requiresServerSelection: Bool {
@@ -73,19 +76,26 @@ struct ContentView: View {
 
     private var visibleMainSessions: [WatchSessionRow] {
         guard !requiresServerSelection else { return [] }
+        if sessionManager.isAllPinnedSelected {
+            return mainSessions.filter { $0.isPinned ?? false }
+        }
         guard isManualFilterActive else { return mainSessions }
         let manual = currentManualSessionNames
         return mainSessions.filter { ($0.isPinned ?? false) || manual.contains($0.sessionName) }
     }
 
     private var addableMainSessions: [WatchSessionRow] {
-        guard !requiresServerSelection, isManualFilterActive else { return [] }
+        guard !requiresServerSelection, !sessionManager.isAllPinnedSelected, isManualFilterActive else { return [] }
         let manual = currentManualSessionNames
         return mainSessions.filter { !($0.isPinned ?? false) && !manual.contains($0.sessionName) }
     }
 
-    private func subSessions(for parent: String) -> [WatchSessionRow] {
-        currentSessions.filter { isSubSessionRow($0) && $0.parentSessionName == parent }
+    private func subSessions(for parent: WatchSessionRow) -> [WatchSessionRow] {
+        currentSessions.filter {
+            isSubSessionRow($0)
+                && $0.serverId == parent.serverId
+                && $0.parentSessionName == parent.sessionName
+        }
     }
 
     private func brainRoute(for task: WatchGlobalTaskRow) -> WatchRoute? {
@@ -125,7 +135,7 @@ struct ContentView: View {
                 }
                 .accessibilityLabel("Filter devices")
             }
-        } else if sessionManager.displayServers.count > 1 {
+        } else if sessionManager.displayServers.count > 1 || sessionManager.isAllPinnedSelected {
             Button {
                 showServerPicker = true
             } label: {
@@ -206,6 +216,28 @@ struct ContentView: View {
             List {
                 statusBanners
                 Section("Select Server") {
+                    Button {
+                        Task { await sessionManager.selectAllPinnedSessions() }
+                    } label: {
+                        HStack {
+                            Image(systemName: "pin.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.orange)
+                            Text("Pinned Sessions")
+                                .font(.caption)
+                                .lineLimit(1)
+                            Spacer()
+                            if sessionManager.isAllPinnedSelected {
+                                Image(systemName: "checkmark")
+                                    .font(.caption2)
+                            } else {
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+
                     ForEach(sessionManager.displayServers) { server in
                         Button {
                             Task { await sessionManager.selectServer(server.id) }
@@ -235,7 +267,7 @@ struct ContentView: View {
                 if sessionManager.isLoadingSessions || sessionManager.isLoadingServers {
                     ProgressView()
                 } else {
-                    Text(isManualFilterActive ? "No pinned sessions" : "No sessions")
+                    Text(sessionManager.isAllPinnedSelected || isManualFilterActive ? "No pinned sessions" : "No sessions")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                     if !addableMainSessions.isEmpty {
@@ -261,17 +293,20 @@ struct ContentView: View {
                 statusBanners
 
                 ForEach(visibleMainSessions) { session in
-                    let subs = subSessions(for: session.sessionName)
-                    let isExpanded = expandedSessions.contains(session.sessionName)
+                    let subs = subSessions(for: session)
+                    let isExpanded = expandedSessions.contains(session.id)
                     let isManualOnly = isManualFilterActive
                         && !(session.isPinned ?? false)
                         && currentManualSessionNames.contains(session.sessionName)
+                    let serverBadgeName = sessionManager.isAllPinnedSelected
+                        ? sessionManager.serverName(for: session.serverId)
+                        : nil
 
                     HStack(spacing: 0) {
                         Button {
                             path = [WatchRoute(serverId: session.serverId, sessionName: session.sessionName, title: session.title)]
                         } label: {
-                            SessionRowView(session: session)
+                            SessionRowView(session: session, serverName: serverBadgeName)
                         }
                         .buttonStyle(.plain)
 
@@ -280,8 +315,8 @@ struct ContentView: View {
                         if !subs.isEmpty {
                             Button {
                                 withAnimation {
-                                    if isExpanded { expandedSessions.remove(session.sessionName) }
-                                    else { expandedSessions.insert(session.sessionName) }
+                                    if isExpanded { expandedSessions.remove(session.id) }
+                                    else { expandedSessions.insert(session.id) }
                                 }
                             } label: {
                                 HStack(spacing: 2) {
@@ -309,8 +344,8 @@ struct ContentView: View {
                         if !subs.isEmpty {
                             Button {
                                 withAnimation {
-                                    if isExpanded { expandedSessions.remove(session.sessionName) }
-                                    else { expandedSessions.insert(session.sessionName) }
+                                    if isExpanded { expandedSessions.remove(session.id) }
+                                    else { expandedSessions.insert(session.id) }
                                 }
                             } label: {
                                 Label(isExpanded ? "Fold" : "\(subs.count) sub", systemImage: isExpanded ? "chevron.up" : "chevron.down")
@@ -324,7 +359,7 @@ struct ContentView: View {
                             Button {
                                 path = [WatchRoute(serverId: sub.serverId, sessionName: sub.sessionName, title: sub.title)]
                             } label: {
-                                SessionRowView(session: sub)
+                                SessionRowView(session: sub, serverName: serverBadgeName)
                                     .padding(.leading, 14)
                             }
                             .buttonStyle(.plain)
@@ -386,22 +421,41 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showServerPicker) {
-                List(sessionManager.displayServers) { server in
+                List {
                     Button {
                         showServerPicker = false
-                        Task { await sessionManager.selectServer(server.id) }
+                        Task { await sessionManager.selectAllPinnedSessions() }
                     } label: {
                         HStack {
-                            if server.isPinned ?? false {
-                                Image(systemName: "pin.fill")
-                                    .font(.system(size: 8))
-                                    .foregroundStyle(.orange)
-                            }
-                            Text(server.name).font(.caption)
+                            Image(systemName: "pin.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.orange)
+                            Text("Pinned Sessions").font(.caption)
                             Spacer()
-                            if sessionManager.selectedServerId == server.id {
+                            if sessionManager.isAllPinnedSelected {
                                 Image(systemName: "checkmark")
                                     .font(.caption2)
+                            }
+                        }
+                    }
+
+                    ForEach(sessionManager.displayServers) { server in
+                        Button {
+                            showServerPicker = false
+                            Task { await sessionManager.selectServer(server.id) }
+                        } label: {
+                            HStack {
+                                if server.isPinned ?? false {
+                                    Image(systemName: "pin.fill")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(.orange)
+                                }
+                                Text(server.name).font(.caption)
+                                Spacer()
+                                if sessionManager.selectedServerId == server.id {
+                                    Image(systemName: "checkmark")
+                                        .font(.caption2)
+                                }
                             }
                         }
                     }
@@ -491,6 +545,7 @@ struct ContentView: View {
 
 private struct SessionRowView: View {
     let session: WatchSessionRow
+    var serverName: String? = nil
 
     var body: some View {
         HStack(spacing: 5) {
@@ -516,6 +571,16 @@ private struct SessionRowView: View {
                             .font(.system(size: 8))
                             .foregroundStyle(.tertiary)
                     }
+                }
+
+                if let serverName, !serverName.isEmpty {
+                    Text(serverName)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.cyan)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.cyan.opacity(0.16), in: Capsule())
+                        .lineLimit(1)
                 }
 
                 if let previewText = session.effectivePreviewText, !previewText.isEmpty {

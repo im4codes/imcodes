@@ -12,6 +12,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
     @Published private(set) var activeRoute: WatchRoute?
     @Published private(set) var servers: [WatchServerRow] = []
     @Published private(set) var sessionRows: [WatchSessionRow] = []
+    @Published private(set) var sessionsByServerId: [String: [WatchSessionRow]] = [:]
     @Published private(set) var globalTasks: [WatchGlobalTaskRow] = []
     @Published private(set) var loadedSessionsServerId: String?
     @Published private(set) var selectedServerId: String?
@@ -22,6 +23,12 @@ final class WatchSessionManager: NSObject, ObservableObject {
     @Published private(set) var isLoadingServers = false
     @Published private(set) var isLoadingSessions = false
     @Published private(set) var isLoadingGlobalTasks = false
+
+    static let allPinnedServerId = "__all_pinned__"
+
+    var isAllPinnedSelected: Bool {
+        selectedServerId == Self.allPinnedServerId
+    }
 
     private static let cachedGlobalTasksKey = "imcodes.watch.cachedGlobalTasks.v1"
     private static let selectedServerIdKey = "watchSelectedServerId"
@@ -34,6 +41,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
     private var pendingRoute: WatchRoute?
     private var routeTimeoutWorkItem: DispatchWorkItem?
     private var networkLoadedSessionServers: Set<String> = []
+    private var loadingSessionServers: Set<String> = []
     private var lastSnapshotRequestAt: Date = .distantPast
 
     private override init() {
@@ -46,7 +54,9 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
         hydrateCachedContext()
         bootstrapFromContext(applicationContext, triggerReload: false)
-        if let selectedServerId {
+        if isAllPinnedSelected {
+            hydrateCachedSessions(for: Self.allPinnedServerId)
+        } else if let selectedServerId {
             hydrateCachedSessions(for: selectedServerId)
         }
     }
@@ -122,13 +132,27 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     private func hydrateCachedSessions(for serverId: String) {
+        if serverId == Self.allPinnedServerId {
+            for server in displayServers {
+                hydrateCachedSessions(for: server.id)
+            }
+            return
+        }
         guard let data = UserDefaults.standard.data(forKey: Self.cachedSessionsKey(for: serverId)),
               let decoded = try? JSONDecoder().decode([WatchSessionRow].self, from: data) else {
             return
         }
-        sessionRows = decoded
-        loadedSessionsServerId = serverId
+        sessionsByServerId[serverId] = decoded
+        if selectedServerId == serverId {
+            sessionRows = decoded
+            loadedSessionsServerId = serverId
+        }
         seedVisibleHistoriesIfNeeded(serverId: serverId)
+    }
+
+    func serverName(for serverId: String) -> String? {
+        displayServers.first(where: { $0.id == serverId })?.name
+            ?? applicationContext.servers.first(where: { $0.id == serverId })?.name
     }
 
     func manualSessionNames(for serverId: String) -> Set<String> {
@@ -171,8 +195,27 @@ final class WatchSessionManager: NSObject, ObservableObject {
             let raw = loadedSessionsServerId != nil ? sessionRows : applicationContext.sessions
             return Self.sortSessions(raw)
         }
+        if targetServerId == Self.allPinnedServerId {
+            var seenIds: Set<String> = []
+            var aggregated: [WatchSessionRow] = []
+            for server in displayServers {
+                let serverRows = sessionsByServerId[server.id]
+                    ?? (loadedSessionsServerId == server.id
+                        ? sessionRows.filter { $0.serverId == server.id }
+                        : applicationContext.sessions.filter { $0.serverId == server.id })
+                for row in serverRows where seenIds.insert(row.id).inserted {
+                    aggregated.append(row)
+                }
+            }
+            return Self.sortSessions(
+                aggregated,
+                pinnedServerIds: Set(displayServers.filter { $0.isPinned ?? false }.map(\.id))
+            )
+        }
         let raw: [WatchSessionRow]
-        if loadedSessionsServerId == targetServerId {
+        if let perServer = sessionsByServerId[targetServerId] {
+            raw = perServer
+        } else if loadedSessionsServerId == targetServerId {
             raw = sessionRows.filter { $0.serverId == targetServerId }
         } else {
             raw = applicationContext.sessions.filter { $0.serverId == targetServerId }
@@ -180,11 +223,17 @@ final class WatchSessionManager: NSObject, ObservableObject {
         return Self.sortSessions(raw)
     }
 
-    static func sortSessions(_ sessions: [WatchSessionRow]) -> [WatchSessionRow] {
+    static func sortSessions(_ sessions: [WatchSessionRow], pinnedServerIds: Set<String> = []) -> [WatchSessionRow] {
         sessions.sorted { lhs, rhs in
             let lhsPinned = lhs.isPinned ?? false
             let rhsPinned = rhs.isPinned ?? false
             if lhsPinned != rhsPinned { return lhsPinned }
+
+            if !pinnedServerIds.isEmpty {
+                let lhsServerPinned = pinnedServerIds.contains(lhs.serverId)
+                let rhsServerPinned = pinnedServerIds.contains(rhs.serverId)
+                if lhsServerPinned != rhsServerPinned { return lhsServerPinned }
+            }
 
             let lhsPriority = sessionStatePriority(lhs.state)
             let rhsPriority = sessionStatePriority(rhs.state)
@@ -246,7 +295,8 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     func session(for route: WatchRoute) -> WatchSessionRow? {
-        displaySessions(for: route.serverId).first { $0.sessionName == route.sessionName }
+        sessionsByServerId[route.serverId]?.first { $0.sessionName == route.sessionName }
+            ?? displaySessions(for: route.serverId).first { $0.sessionName == route.sessionName }
             ?? applicationContext.sessions.first { $0.serverId == route.serverId && $0.sessionName == route.sessionName }
     }
 
@@ -281,7 +331,10 @@ final class WatchSessionManager: NSObject, ObservableObject {
         if servers.isEmpty {
             await loadServers(force: false)
         }
-        if let selectedServerId {
+        if isAllPinnedSelected {
+            hydrateCachedSessions(for: Self.allPinnedServerId)
+            await loadAllPinnedSessions(force: false)
+        } else if let selectedServerId {
             if loadedSessionsServerId != selectedServerId {
                 hydrateCachedSessions(for: selectedServerId)
             }
@@ -301,7 +354,9 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
         async let tasksStep: Void = loadGlobalTasks(force: true)
         await loadServers(force: true)
-        if let selectedServerId {
+        if isAllPinnedSelected {
+            await loadAllPinnedSessions(force: true)
+        } else if let selectedServerId {
             await loadSessions(serverId: selectedServerId, force: true)
         }
         _ = await tasksStep
@@ -317,7 +372,9 @@ final class WatchSessionManager: NSObject, ObservableObject {
         if servers.isEmpty || servers.contains(where: { $0.isPinned == nil }) {
             await loadServers(force: false)
         }
-        if let selectedServerId {
+        if isAllPinnedSelected {
+            await loadAllPinnedSessions(force: true)
+        } else if let selectedServerId {
             await loadSessions(serverId: selectedServerId, force: true)
         }
         _ = await tasksStep
@@ -327,7 +384,9 @@ final class WatchSessionManager: NSObject, ObservableObject {
     func refreshSessions() async {
         guard canUseDirectApi else { return }
         async let tasksStep: Void = loadGlobalTasks(force: true)
-        if let selectedServerId {
+        if isAllPinnedSelected {
+            await loadAllPinnedSessions(force: true)
+        } else if let selectedServerId {
             await loadSessions(serverId: selectedServerId, force: true)
         }
         _ = await tasksStep
@@ -346,6 +405,37 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
         await loadSessions(serverId: serverId, force: true)
         resolvePendingRouteIfPossible()
+    }
+
+    func selectAllPinnedSessions() async {
+        if selectedServerId != Self.allPinnedServerId {
+            selectedServerId = Self.allPinnedServerId
+            activeRoute = nil
+            UserDefaults.standard.set(Self.allPinnedServerId, forKey: Self.selectedServerIdKey)
+            sessionRows = []
+            loadedSessionsServerId = nil
+        }
+        hydrateCachedSessions(for: Self.allPinnedServerId)
+        await loadAllPinnedSessions(force: true)
+        resolvePendingRouteIfPossible()
+    }
+
+    private func loadAllPinnedSessions(force: Bool) async {
+        guard canUseDirectApi else { return }
+        if servers.isEmpty {
+            await loadServers(force: false)
+        }
+        let targetServerIds = displayServers.map(\.id)
+        await withTaskGroup(of: Void.self) { group in
+            for serverId in targetServerIds {
+                if !force && networkLoadedSessionServers.contains(serverId) {
+                    continue
+                }
+                group.addTask {
+                    await self.loadSessions(serverId: serverId, force: force)
+                }
+            }
+        }
     }
 
     func loadHistoryIfNeeded(for route: WatchRoute) async {
@@ -476,15 +566,15 @@ final class WatchSessionManager: NSObject, ObservableObject {
         if selectedServerId == nil {
             if let saved = UserDefaults.standard.string(forKey: Self.selectedServerIdKey),
                !saved.isEmpty,
-               displayServers.isEmpty || displayServers.contains(where: { $0.id == saved }) {
+               saved == Self.allPinnedServerId || displayServers.isEmpty || displayServers.contains(where: { $0.id == saved }) {
                 selectedServerId = saved
             } else if displayServers.count <= 1 {
                 selectedServerId = context.currentServerId ?? displayServers.first?.id
             }
-        } else if !displayServers.isEmpty && !displayServers.contains(where: { $0.id == selectedServerId }) {
+        } else if selectedServerId != Self.allPinnedServerId && !displayServers.isEmpty && !displayServers.contains(where: { $0.id == selectedServerId }) {
             selectedServerId = displayServers.count == 1 ? displayServers.first?.id : nil
         }
-        if let selectedServerId, loadedSessionsServerId != selectedServerId {
+        if let selectedServerId, selectedServerId == Self.allPinnedServerId || loadedSessionsServerId != selectedServerId {
             hydrateCachedSessions(for: selectedServerId)
         }
         if triggerReload && canUseDirectApi {
@@ -543,7 +633,9 @@ final class WatchSessionManager: NSObject, ObservableObject {
                     manualSessionsByServer[server.id] = Set(stored)
                 }
             }
-            if let current = selectedServerId, !nextServers.contains(where: { $0.id == current }) {
+            if let current = selectedServerId,
+               current != Self.allPinnedServerId,
+               !nextServers.contains(where: { $0.id == current }) {
                 selectedServerId = nextServers.count == 1 ? nextServers.first?.id : nil
                 if let resolved = selectedServerId {
                     hydrateCachedSessions(for: resolved)
@@ -567,14 +659,21 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     private func loadSessions(serverId: String, force: Bool) async {
         guard canUseDirectApi, let baseUrl = currentBaseUrl(for: serverId), let apiKey = currentApiKey() else { return }
-        if isLoadingSessions && !force { return }
-        isLoadingSessions = true
-        defer { isLoadingSessions = false }
+        if loadingSessionServers.contains(serverId) && !force { return }
+        loadingSessionServers.insert(serverId)
+        isLoadingSessions = !loadingSessionServers.isEmpty
+        defer {
+            loadingSessionServers.remove(serverId)
+            isLoadingSessions = !loadingSessionServers.isEmpty
+        }
 
         do {
             let response = try await restClient.fetchSessions(baseUrl: baseUrl, serverId: serverId, apiKey: apiKey)
-            sessionRows = response.sessions
-            loadedSessionsServerId = serverId
+            sessionsByServerId[serverId] = response.sessions
+            if selectedServerId == serverId {
+                sessionRows = response.sessions
+                loadedSessionsServerId = serverId
+            }
             networkLoadedSessionServers.insert(serverId)
             let rowsToCache = prepareSessionsForCache(response.sessions, serverId: serverId)
             if let encoded = try? JSONEncoder().encode(rowsToCache) {
