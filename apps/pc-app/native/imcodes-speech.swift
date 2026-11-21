@@ -4,7 +4,11 @@ import CoreAudio
 import Foundation
 import Speech
 
+private let outputLock = NSLock()
+
 func emitJson(_ dict: [String: Any]) {
+  outputLock.lock()
+  defer { outputLock.unlock() }
   if let data = try? JSONSerialization.data(withJSONObject: dict, options: []),
      let str = String(data: data, encoding: .utf8) {
     print(str)
@@ -81,11 +85,69 @@ func currentStatusPayload() -> [String: Any] {
   ]
 }
 
-func resolveRecognizer(localeTag: String?) -> SFSpeechRecognizer? {
-  if let raw = localeTag?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
-    if let exact = SFSpeechRecognizer(locale: Locale(identifier: raw)) {
-      return exact
+private func resolveSupportedRecognizer(for rawTag: String, supported: Set<Locale>) -> SFSpeechRecognizer? {
+  let normalized = rawTag.trimmingCharacters(in: .whitespacesAndNewlines)
+    .replacingOccurrences(of: "_", with: "-")
+  guard !normalized.isEmpty else { return nil }
+
+  func makeMatched(_ identifier: String) -> SFSpeechRecognizer? {
+    let targetLower = identifier.replacingOccurrences(of: "_", with: "-").lowercased()
+    if !supported.isEmpty {
+      if let exact = supported.first(where: {
+        $0.identifier.replacingOccurrences(of: "_", with: "-").lowercased() == targetLower
+      }) {
+        return SFSpeechRecognizer(locale: exact)
+      }
+      return nil
     }
+    return SFSpeechRecognizer(locale: Locale(identifier: identifier))
+  }
+
+  if let exact = makeMatched(normalized) {
+    return exact
+  }
+
+  let lower = normalized.lowercased()
+  if lower == "zh-hans" || lower.hasPrefix("zh-hans-") {
+    for candidate in ["zh-CN", "zh-SG"] {
+      if let r = makeMatched(candidate) { return r }
+    }
+  } else if lower == "zh-hant" || lower.hasPrefix("zh-hant-") {
+    for candidate in ["zh-TW", "zh-HK", "zh-MO"] {
+      if let r = makeMatched(candidate) { return r }
+    }
+  }
+
+  let baseLang = lower.split(separator: "-", maxSplits: 1).first.map(String.init) ?? lower
+  if !supported.isEmpty {
+    if baseLang == "zh" {
+      for candidate in ["zh-CN", "zh-TW", "zh-HK"] {
+        if let r = makeMatched(candidate) { return r }
+      }
+    }
+    let prefix = baseLang + "-"
+    if let prefixed = supported
+      .sorted(by: { $0.identifier < $1.identifier })
+      .first(where: {
+        let idLower = $0.identifier.replacingOccurrences(of: "_", with: "-").lowercased()
+        return idLower == baseLang || idLower.hasPrefix(prefix)
+      }) {
+      return SFSpeechRecognizer(locale: prefixed)
+    }
+  }
+
+  return SFSpeechRecognizer(locale: Locale(identifier: normalized))
+}
+
+func resolveRecognizer(localeTag: String?) -> SFSpeechRecognizer? {
+  let supported = SFSpeechRecognizer.supportedLocales()
+  if let raw = localeTag?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+    if let resolved = resolveSupportedRecognizer(for: raw, supported: supported) {
+      return resolved
+    }
+  }
+  if let current = resolveSupportedRecognizer(for: Locale.current.identifier, supported: supported) {
+    return current
   }
   return SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer()
 }
@@ -350,14 +412,29 @@ func selectPreferredPhysicalInputDeviceID() -> AudioDeviceID? {
 
 final class SpeechSession {
   private let audioEngine = AVAudioEngine()
+  private let recognitionQueue: OperationQueue = {
+    let queue = OperationQueue()
+    queue.name = "com.imcodes.speech.recognition"
+    queue.maxConcurrentOperationCount = 1
+    queue.qualityOfService = .userInitiated
+    return queue
+  }()
+  private var recognizer: SFSpeechRecognizer?
   private var request: SFSpeechAudioBufferRecognitionRequest?
   private var task: SFSpeechRecognitionTask?
   private let lock = NSLock()
   private var stopped = false
   private var finished = false
+  private var loggedFirstResult = false
+  private var loggedTaskError = false
   private var lastLevelEmit = Date.distantPast
   private var latestText = ""
-  private let doneSemaphore = DispatchSemaphore(value: 0)
+
+  private func isFinished() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return finished
+  }
 
   func run(localeTag: String?, deviceUID: String?) -> Int32 {
     let micStatus = requestMicIfNeeded()
@@ -392,6 +469,9 @@ final class SpeechSession {
       ])
       return 1
     }
+    recognizer.queue = recognitionQueue
+    self.recognizer = recognizer
+    fputs("[imcodes-speech] recognizer locale=\(recognizer.locale.identifier) requested=\(localeTag ?? "default") available=\(recognizer.isAvailable)\n", stderr)
 
     let inputNode = audioEngine.inputNode
     let targetInputID = resolveInputDeviceID(deviceUID: deviceUID)
@@ -435,8 +515,15 @@ final class SpeechSession {
       if let result = result {
         let text = result.bestTranscription.formattedString
         self.lock.lock()
+        let shouldLogFirst = !self.loggedFirstResult
+        if shouldLogFirst {
+          self.loggedFirstResult = true
+        }
         self.latestText = text
         self.lock.unlock()
+        if shouldLogFirst {
+          fputs("[imcodes-speech] recognition callback delivered first result (isFinal=\(result.isFinal), len=\(text.count))\n", stderr)
+        }
         emitJson([
           "type": "result",
           "text": text,
@@ -452,7 +539,14 @@ final class SpeechSession {
         // Ignore routine end-of-audio / no-speech cancellation once user requested stop.
         self.lock.lock()
         let wasStopped = self.stopped
+        let shouldLogError = !self.loggedTaskError
+        if shouldLogError {
+          self.loggedTaskError = true
+        }
         self.lock.unlock()
+        if shouldLogError {
+          fputs("[imcodes-speech] recognition callback error: domain=\(nsErr.domain) code=\(nsErr.code) msg=\(nsErr.localizedDescription)\n", stderr)
+        }
         let isNoSpeechOrCancelled = (nsErr.domain == "kAFAssistantErrorDomain" && (nsErr.code == 1110 || nsErr.code == 216 || nsErr.code == 203))
         if !wasStopped && !isNoSpeechOrCancelled {
           emitJson([
@@ -477,7 +571,13 @@ final class SpeechSession {
       self?.stop(abort: false)
     }
 
-    _ = doneSemaphore.wait(timeout: .distantFuture)
+    // Pump RunLoop.main without busy-spinning so Speech/Audio XPC callbacks can service RunLoop.main if needed.
+    let keepAliveTimer = Timer(timeInterval: 0.25, repeats: true) { _ in }
+    RunLoop.main.add(keepAliveTimer, forMode: .default)
+    defer { keepAliveTimer.invalidate() }
+    while !isFinished() {
+      RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.25))
+    }
     return 0
   }
 
@@ -555,7 +655,7 @@ final class SpeechSession {
     if emitEnd {
       emitJson(["type": "end"])
     }
-    doneSemaphore.signal()
+    CFRunLoopStop(CFRunLoopGetMain())
   }
 }
 
