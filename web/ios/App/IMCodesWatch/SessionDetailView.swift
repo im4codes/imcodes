@@ -328,7 +328,11 @@ struct SessionDetailView: View {
 
     private var replyComposer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if !draft.isEmpty {
+            if draft.isEmpty {
+                TextField("Reply…", text: $draft)
+                    .font(.caption2)
+                    .id("replyField")
+            } else {
                 HStack(alignment: .top, spacing: 4) {
                     Text(draft)
                         .font(.caption2)
@@ -354,11 +358,8 @@ struct SessionDetailView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
                 .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-
-            TextField(draft.isEmpty ? "Reply…" : "Edit…", text: $draft)
-                .font(.caption2)
                 .id("replyField")
+            }
 
             holdToTalkControl
 
@@ -447,7 +448,7 @@ struct SessionDetailView: View {
         .opacity(isSending ? 0.5 : 1.0)
         .disabled(isGestureDisabled)
         .highPriorityGesture(
-            DragGesture(minimumDistance: 0)
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
                 .onChanged { value in
                     handleVoiceDragChanged(value)
                 }
