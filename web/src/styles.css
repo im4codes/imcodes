@@ -8899,6 +8899,7 @@ html.mobile-nav-gesture-active .chat-view {
 /* Desktop vertical sub-session rail. It is an ordinary flex child between the
    sidebar and main content or after main: never fixed/absolute and never overlays chat. */
 .subsession-vertical-rail-host { position: relative; display: flex; flex: 0 0 var(--subsession-compact-card-width); width: var(--subsession-compact-card-width); min-width: var(--subsession-compact-card-width); max-width: var(--subsession-compact-card-width); min-height: 0; overflow: hidden; background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.025) 22px 23px), linear-gradient(180deg, #0b1422 0%, #070c15 100%); z-index: 1; }
+.subsession-vertical-rail-host:empty { display: none; }
 .subsession-vertical-rail-host-left { border-right: 1px solid rgba(34,211,238,0.20); box-shadow: inset -1px 0 0 rgba(255,255,255,0.035), 8px 0 24px rgba(0,0,0,0.22); }
 .subsession-vertical-rail-host-right { border-left: 1px solid rgba(34,211,238,0.20); box-shadow: inset 1px 0 0 rgba(255,255,255,0.035), -8px 0 24px rgba(0,0,0,0.22); }
 .subsession-vertical-rail { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
@@ -8929,6 +8930,7 @@ html.mobile-nav-gesture-active .chat-view {
 /* Team discussion layout mirrors the sub-session rail: a real root flex child
    plus a portal, never a fixed overlay over chat or the composer. */
 .team-discussion-rail-host { position: relative; display: flex; flex: 0 0 var(--team-discussion-rail-width); width: var(--team-discussion-rail-width); min-width: var(--team-discussion-rail-width); max-width: var(--team-discussion-rail-width); min-height: 0; overflow: hidden; border-left: 1px solid rgba(96,165,250,0.24); background: linear-gradient(180deg, #0b1422 0%, #070c15 100%); box-shadow: inset 1px 0 0 rgba(255,255,255,0.035), -8px 0 24px rgba(0,0,0,0.22); z-index: 1; }
+.team-discussion-rail-host:empty { display: none; }
 .team-discussion-rail { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
 .team-discussion-rail-header { display: grid; flex: 0 0 auto; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; min-height: 38px; padding: 5px 6px; border-bottom: 1px solid rgba(96,165,250,0.20); background: linear-gradient(180deg, rgba(37,99,235,0.13), rgba(15,23,42,0.18)); }
 .team-discussion-rail-title { min-width: 0; overflow: hidden; color: #bfdbfe; font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }

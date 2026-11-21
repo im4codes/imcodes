@@ -3163,7 +3163,21 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // GLOBAL toggle (not per-session): defaults open, synced across windows/tabs.
   const [desiredAgentsOpen, setDesiredAgentsOpen] = useState(readSdkAgentsOpen);
   // Explicit manual inspection of recent terminal/diagnostic rows when runningCount === 0.
-  const [inspectRecentAgentsOpen, setInspectRecentAgentsOpen] = useState(false);
+  // Keyed to sessionId so switching tabs/servers resets inspection synchronously on render 1 (no 1-frame flash).
+  const [inspectRecentAgentsState, setInspectRecentAgentsState] = useState<{ sessionId: string | null | undefined; open: boolean }>(() => ({
+    sessionId,
+    open: false,
+  }));
+  const inspectRecentAgentsOpen = inspectRecentAgentsState.sessionId === sessionId && inspectRecentAgentsState.open;
+  const setInspectRecentAgentsOpen = useCallback((next: boolean | ((prev: boolean) => boolean)) => {
+    setInspectRecentAgentsState((current) => {
+      const prevOpen = current.sessionId === sessionId && current.open;
+      const resolved = typeof next === 'function' ? next(prevOpen) : next;
+      return current.sessionId === sessionId && current.open === resolved
+        ? current
+        : { sessionId, open: resolved };
+    });
+  }, [sessionId]);
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const filePanelWidthRef = useRef(filePanelWidth);
   filePanelWidthRef.current = filePanelWidth;

@@ -130,6 +130,11 @@ describe('styles.css regression contracts', () => {
     expect(leftRule).not.toMatch(/position:\s*(fixed|absolute)/);
     expect(rightRule).not.toMatch(/position:\s*(fixed|absolute)/);
 
+    const emptySubSessionHostRule = cssWithoutComments.match(/\.subsession-vertical-rail-host:empty\s*\{[^}]*\}/)?.[0];
+    expect(emptySubSessionHostRule).toMatch(/display:\s*none/);
+    const emptyTeamHostRule = cssWithoutComments.match(/\.team-discussion-rail-host:empty\s*\{[^}]*\}/)?.[0];
+    expect(emptyTeamHostRule).toMatch(/display:\s*none/);
+
     const scrollRule = cssWithoutComments.match(/\.subsession-vertical-rail-scroll\s*\{[^}]*\}/)?.[0];
     expect(scrollRule).toBeTruthy();
     expect(scrollRule).toMatch(/overflow-y:\s*auto/);

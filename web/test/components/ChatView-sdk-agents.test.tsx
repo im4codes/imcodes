@@ -2,6 +2,7 @@
  * @vitest-environment jsdom
  */
 import { h } from 'preact';
+import { useLayoutEffect, useRef } from 'preact/hooks';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -728,5 +729,55 @@ describe('ChatView SDK agents panel', () => {
     rerender(<ChatView events={[agyBashRunning, agyNativeSubagent, agyBashStopped, agyNativeDone]} loading={false} sessionId="deck_agents" />);
     expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' })).toBeTruthy();
     expect(screen.queryByRole('region', { name: 'Agents' })).toBeNull();
+  });
+
+  it('resets inspectRecentAgentsOpen synchronously when sessionId changes so the panel never flashes before effects run', () => {
+    const terminalA = makeSdkEvent('agent-a-done', makeMeta({
+      canonicalKey: 'claude:deck_a:done',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      childStatusSummary: 'Tab A finished work',
+    }));
+    const terminalB = makeSdkEvent('agent-b-done', makeMeta({
+      canonicalKey: 'claude:deck_b:done',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      childStatusSummary: 'Tab B finished work',
+    }));
+
+    const prePaintPanelSeen: Array<{ sessionId: string; open: boolean }> = [];
+    function Wrapper({ sessionId, events }: { sessionId: string; events: TimelineEvent[] }) {
+      const hostRef = useRef<HTMLDivElement | null>(null);
+      useLayoutEffect(() => {
+        const hasPanel = Boolean(hostRef.current?.querySelector('.chat-sdk-agents-panel'));
+        prePaintPanelSeen.push({ sessionId, open: hasPanel });
+      }, [sessionId]);
+      return (
+        <div ref={hostRef}>
+          <ChatView events={events} loading={false} sessionId={sessionId} />
+        </div>
+      );
+    }
+
+    const { container, rerender } = render(<Wrapper sessionId="deck_a" events={[terminalA]} />);
+    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
+
+    // Open manual recent-agents inspection on Tab A and verify toggling works within the same session.
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
+    expect(container.querySelector('.chat-sdk-agents-panel')).toBeTruthy();
+
+    // Switch to Tab B (also 0 running + recent rows): pre-paint layout commit must already have panel closed.
+    prePaintPanelSeen.length = 0;
+    rerender(<Wrapper sessionId="deck_b" events={[terminalB]} />);
+    expect(prePaintPanelSeen).toEqual([{ sessionId: 'deck_b', open: false }]);
+    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
+
+    // Switching back to Tab A keeps it closed, and toggling within Tab A still works cleanly.
+    rerender(<Wrapper sessionId="deck_a" events={[terminalA]} />);
+    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
+    expect(container.querySelector('.chat-sdk-agents-panel')).toBeTruthy();
   });
 });
