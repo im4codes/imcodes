@@ -10,6 +10,10 @@ struct ContentView: View {
         sessionManager.displaySessions()
     }
 
+    private var currentTasks: [WatchGlobalTaskRow] {
+        sessionManager.displayTasks()
+    }
+
     private func isSubSessionRow(_ row: WatchSessionRow) -> Bool {
         row.isSubSession || row.sessionName.hasPrefix("deck_sub_") || row.parentSessionName != nil
     }
@@ -22,10 +26,22 @@ struct ContentView: View {
         currentSessions.filter { isSubSessionRow($0) && $0.parentSessionName == parent }
     }
 
+    private func brainRoute(for task: WatchGlobalTaskRow) -> WatchRoute? {
+        guard let brainSession = task.brainSession?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !brainSession.isEmpty,
+              sessionManager.displayServers.contains(where: { $0.id == task.serverId }) else {
+            return nil
+        }
+        let brainTitle = [task.brainLabel, task.projectName]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty }) ?? task.title
+        return WatchRoute(serverId: task.serverId, sessionName: brainSession, title: brainTitle)
+    }
+
     var body: some View {
         NavigationStack(path: $path) {
             Group {
-                if currentSessions.isEmpty {
+                if currentSessions.isEmpty && currentTasks.isEmpty {
                     VStack(spacing: 8) {
                         if sessionManager.currentApiKey() == nil {
                             Text("Open IM.codes on iPhone")
@@ -54,6 +70,24 @@ struct ContentView: View {
                             Text(error)
                                 .font(.caption2)
                                 .foregroundStyle(.red)
+                        }
+
+                        if !currentTasks.isEmpty {
+                            Section("Tasks") {
+                                ForEach(currentTasks) { task in
+                                    let route = brainRoute(for: task)
+                                    if let route {
+                                        Button {
+                                            path = [route]
+                                        } label: {
+                                            TaskRowView(task: task, hasNavigation: true)
+                                        }
+                                        .buttonStyle(.plain)
+                                    } else {
+                                        TaskRowView(task: task, hasNavigation: false)
+                                    }
+                                }
+                            }
                         }
 
                         ForEach(mainSessions) { session in
@@ -219,6 +253,98 @@ private struct SessionRowView: View {
         case .idle: return .green
         case .error: return .red
         case .stopped: return .gray
+        }
+    }
+}
+
+private struct TaskRowView: View {
+    let task: WatchGlobalTaskRow
+    let hasNavigation: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(task.title)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+
+                HStack(spacing: 4) {
+                    Text(statusLabel)
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(statusColor)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(statusColor.opacity(0.18), in: Capsule())
+                        .lineLimit(1)
+
+                    if let round = task.round, round > 0 {
+                        Text("R\(round)")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    if let project = task.projectName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !project.isEmpty {
+                        Text(project)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+
+            if hasNavigation {
+                Spacer(minLength: 2)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var normalizedStatus: String {
+        task.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private var statusLabel: String {
+        switch normalizedStatus {
+        case "working": return "Working"
+        case "in_audit", "awaiting_audit": return "In Audit"
+        case "rework": return "Rework"
+        case "passed": return "Passed"
+        case "done": return "Done"
+        case "queued": return "Queued"
+        case "paused": return "Paused"
+        case "blocked": return "Blocked"
+        case "needs_input": return "Input"
+        case "needs_decision": return "Decision"
+        case "cancelled", "canceled": return "Cancelled"
+        default: return task.status
+        }
+    }
+
+    private var statusColor: Color {
+        if task.needsAttention == true {
+            return .orange
+        }
+        switch normalizedStatus {
+        case "working":
+            return .yellow
+        case "in_audit", "awaiting_audit":
+            return .cyan
+        case "rework", "needs_input", "needs_decision":
+            return .orange
+        case "blocked":
+            return .red
+        case "passed", "done":
+            return .green
+        case "queued", "paused":
+            return .blue
+        case "cancelled", "canceled":
+            return .gray
+        default:
+            return .secondary
         }
     }
 }

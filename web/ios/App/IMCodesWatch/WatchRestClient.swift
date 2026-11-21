@@ -90,6 +90,14 @@ actor WatchRestClient {
         return try makeAuthorizedRequest(url: url, apiKey: apiKey)
     }
 
+    static func makeGlobalTasksRequest(baseUrl: URL, apiKey: String) throws -> URLRequest {
+        guard !apiKey.isEmpty else { throw WatchRestError.missingParameters }
+        let url = baseUrl
+            .appendingPathComponent("api")
+            .appendingPathComponent("global-tasks")
+        return try makeAuthorizedRequest(url: url, apiKey: apiKey)
+    }
+
     static func makeHistoryRequest(
         baseUrl: URL,
         serverId: String,
@@ -156,6 +164,12 @@ actor WatchRestClient {
     func fetchSessions(baseUrl: URL, serverId: String, apiKey: String) async throws -> WatchSessionListResponse {
         let request = try Self.makeSessionsRequest(baseUrl: baseUrl, serverId: serverId, apiKey: apiKey)
         return try await performJSON(request: request)
+    }
+
+    func fetchGlobalTasks(baseUrl: URL, apiKey: String) async throws -> [WatchGlobalTaskRow] {
+        let request = try Self.makeGlobalTasksRequest(baseUrl: baseUrl, apiKey: apiKey)
+        let response: WatchGlobalTasksResponse = try await performJSON(request: request)
+        return response.tasks
     }
 
     func fetchHistory(

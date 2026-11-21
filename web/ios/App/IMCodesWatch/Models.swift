@@ -148,6 +148,163 @@ struct WatchSessionListResponse: Codable, Equatable {
     let sessions: [WatchSessionRow]
 }
 
+struct WatchGlobalTaskChecklist: Codable, Equatable {
+    var total: Int
+    var implemented: Int
+    var audited: Int
+
+    enum CodingKeys: String, CodingKey {
+        case total, implemented, audited
+    }
+
+    init(total: Int = 0, implemented: Int = 0, audited: Int = 0) {
+        self.total = total
+        self.implemented = implemented
+        self.audited = audited
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.total = (try? container.decodeIfPresent(Int.self, forKey: .total)) ?? 0
+        self.implemented = (try? container.decodeIfPresent(Int.self, forKey: .implemented)) ?? 0
+        self.audited = (try? container.decodeIfPresent(Int.self, forKey: .audited)) ?? 0
+    }
+}
+
+struct WatchGlobalTaskRow: Identifiable, Codable, Equatable {
+    let taskId: String
+    let serverId: String
+    var serverName: String?
+    var serverOnline: Bool?
+    var title: String
+    var status: String
+    var round: Int?
+    var projectName: String?
+    var brainSession: String?
+    var brainLabel: String?
+    var flags: [String]?
+    var checklist: WatchGlobalTaskChecklist?
+    var liveSummary: String?
+    var updatedAt: Double?
+    var isTerminal: Bool?
+    var needsAttention: Bool?
+
+    var id: String { "\(serverId):\(taskId)" }
+
+    enum CodingKeys: String, CodingKey {
+        case taskId, serverId, serverName, serverOnline, title, status, round, projectName
+        case brainSession, brainLabel, flags, checklist, liveSummary, updatedAt, isTerminal, needsAttention
+    }
+
+    init(
+        taskId: String,
+        serverId: String,
+        serverName: String? = nil,
+        serverOnline: Bool? = nil,
+        title: String,
+        status: String,
+        round: Int? = nil,
+        projectName: String? = nil,
+        brainSession: String? = nil,
+        brainLabel: String? = nil,
+        flags: [String]? = nil,
+        checklist: WatchGlobalTaskChecklist? = nil,
+        liveSummary: String? = nil,
+        updatedAt: Double? = nil,
+        isTerminal: Bool? = nil,
+        needsAttention: Bool? = nil
+    ) {
+        self.taskId = taskId
+        self.serverId = serverId
+        self.serverName = serverName
+        self.serverOnline = serverOnline
+        self.title = title
+        self.status = status
+        self.round = round
+        self.projectName = projectName
+        self.brainSession = brainSession
+        self.brainLabel = brainLabel
+        self.flags = flags
+        self.checklist = checklist
+        self.liveSummary = liveSummary
+        self.updatedAt = updatedAt
+        self.isTerminal = isTerminal
+        self.needsAttention = needsAttention
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let taskId = try container.decode(String.self, forKey: .taskId)
+        let serverId = try container.decode(String.self, forKey: .serverId)
+        let rawTitle = (try? container.decodeIfPresent(String.self, forKey: .title)) ?? nil
+        let title = rawTitle?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? taskId
+        let rawStatus = (try? container.decodeIfPresent(String.self, forKey: .status)) ?? nil
+        let status = rawStatus?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "unknown"
+
+        self.taskId = taskId
+        self.serverId = serverId
+        self.serverName = (try? container.decodeIfPresent(String.self, forKey: .serverName)) ?? nil
+        self.serverOnline = (try? container.decodeIfPresent(Bool.self, forKey: .serverOnline)) ?? nil
+        self.title = title
+        self.status = status
+        self.round = (try? container.decodeIfPresent(Int.self, forKey: .round)) ?? nil
+        self.projectName = (try? container.decodeIfPresent(String.self, forKey: .projectName)) ?? nil
+        self.brainSession = (try? container.decodeIfPresent(String.self, forKey: .brainSession)) ?? nil
+        self.brainLabel = (try? container.decodeIfPresent(String.self, forKey: .brainLabel)) ?? nil
+        self.flags = (try? container.decodeIfPresent([String].self, forKey: .flags)) ?? nil
+        self.checklist = (try? container.decodeIfPresent(WatchGlobalTaskChecklist.self, forKey: .checklist)) ?? nil
+        self.liveSummary = (try? container.decodeIfPresent(String.self, forKey: .liveSummary)) ?? nil
+        self.updatedAt = (try? container.decodeIfPresent(Double.self, forKey: .updatedAt)) ?? nil
+        self.isTerminal = (try? container.decodeIfPresent(Bool.self, forKey: .isTerminal)) ?? nil
+        self.needsAttention = (try? container.decodeIfPresent(Bool.self, forKey: .needsAttention)) ?? nil
+    }
+}
+
+struct WatchGlobalTaskServerSummary: Codable, Equatable {
+    let id: String
+    let name: String
+    let online: Bool
+}
+
+struct WatchGlobalTasksResponse: Codable, Equatable {
+    let tasks: [WatchGlobalTaskRow]
+    let servers: [WatchGlobalTaskServerSummary]?
+    let ts: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case tasks, servers, ts
+    }
+
+    init(tasks: [WatchGlobalTaskRow], servers: [WatchGlobalTaskServerSummary]? = nil, ts: Double? = nil) {
+        self.tasks = tasks
+        self.servers = servers
+        self.ts = ts
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        var decodedTasks: [WatchGlobalTaskRow] = []
+        if var tasksArray = try? container.nestedUnkeyedContainer(forKey: .tasks) {
+            while !tasksArray.isAtEnd {
+                if let row = try? tasksArray.decode(WatchGlobalTaskRow.self) {
+                    decodedTasks.append(row)
+                } else {
+                    _ = try? tasksArray.decode(JSONValue.self)
+                }
+            }
+        }
+        self.tasks = decodedTasks
+        self.servers = (try? container.decodeIfPresent([WatchGlobalTaskServerSummary].self, forKey: .servers)) ?? nil
+        self.ts = (try? container.decodeIfPresent(Double.self, forKey: .ts)) ?? nil
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
+}
+
 enum JSONValue: Codable, Equatable {
     case string(String)
     case number(Double)

@@ -12,6 +12,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
     @Published private(set) var activeRoute: WatchRoute?
     @Published private(set) var servers: [WatchServerRow] = []
     @Published private(set) var sessionRows: [WatchSessionRow] = []
+    @Published private(set) var globalTasks: [WatchGlobalTaskRow] = []
     @Published private(set) var loadedSessionsServerId: String?
     @Published private(set) var selectedServerId: String?
     @Published private(set) var historyByRoute: [String: WatchHistoryViewState] = [:]
@@ -19,7 +20,10 @@ final class WatchSessionManager: NSObject, ObservableObject {
     @Published private(set) var isLoadingServers = false
     @Published private(set) var isLoadingSessions = false
 
+    private static let cachedGlobalTasksKey = "imcodes.watch.cachedGlobalTasks.v1"
+
     private let restClient = WatchRestClient()
+    private var isLoadingGlobalTasks = false
     private var pendingRoute: WatchRoute?
     private var routeTimeoutWorkItem: DispatchWorkItem?
 
@@ -44,6 +48,29 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
         if loadedSessionsServerId != nil { return sessionRows }
         return applicationContext.sessions
+    }
+
+    func displayTasks(for serverId: String? = nil) -> [WatchGlobalTaskRow] {
+        let targetServerId = serverId ?? selectedServerId
+        let filtered: [WatchGlobalTaskRow]
+        if let targetServerId {
+            let matching = globalTasks.filter { $0.serverId == targetServerId }
+            filtered = matching.isEmpty ? globalTasks : matching
+        } else {
+            filtered = globalTasks
+        }
+        return filtered.sorted { lhs, rhs in
+            let lhsTerminal = lhs.isTerminal ?? false
+            let rhsTerminal = rhs.isTerminal ?? false
+            if lhsTerminal != rhsTerminal { return !lhsTerminal }
+            let lhsAttention = lhs.needsAttention ?? false
+            let rhsAttention = rhs.needsAttention ?? false
+            if lhsAttention != rhsAttention { return lhsAttention }
+            let lhsTs = lhs.updatedAt ?? 0
+            let rhsTs = rhs.updatedAt ?? 0
+            if lhsTs != rhsTs { return lhsTs > rhsTs }
+            return lhs.taskId < rhs.taskId
+        }
     }
 
     func session(for route: WatchRoute) -> WatchSessionRow? {
@@ -75,6 +102,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     func ensureLoaded() async {
         guard canUseDirectApi else { return }
+        async let tasksStep: Void = loadGlobalTasks(force: false)
         if servers.isEmpty {
             await loadServers(force: false)
         }
@@ -84,6 +112,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
                 await loadSessions(serverId: selectedServerId, force: false)
             }
         }
+        _ = await tasksStep
     }
 
     func refresh() async {
@@ -92,16 +121,20 @@ final class WatchSessionManager: NSObject, ObservableObject {
             lastErrorMessage = "Open IM.codes on iPhone to sync first."
             return
         }
+        async let tasksStep: Void = loadGlobalTasks(force: true)
         await loadServers(force: true)
         if let selectedServerId {
             await loadSessions(serverId: selectedServerId, force: true)
         }
+        _ = await tasksStep
     }
 
-    /// Light refresh — reload sessions only (no servers). Used by auto-poll timer.
+    /// Light refresh — reload sessions and task statuses (no servers). Used by auto-poll timer.
     func refreshSessions() async {
         guard canUseDirectApi, let selectedServerId else { return }
+        async let tasksStep: Void = loadGlobalTasks(force: true)
         await loadSessions(serverId: selectedServerId, force: true)
+        _ = await tasksStep
     }
 
     func selectServer(_ serverId: String) async {
@@ -250,6 +283,10 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     private func hydrateCachedContext() {
+        if let cachedTaskData = UserDefaults.standard.data(forKey: Self.cachedGlobalTasksKey),
+           let decodedTasks = try? JSONDecoder().decode([WatchGlobalTaskRow].self, from: cachedTaskData) {
+            globalTasks = decodedTasks
+        }
         guard WCSession.isSupported() else { return }
         let cached = WCSession.default.receivedApplicationContext
         guard !cached.isEmpty else { return }
@@ -316,6 +353,23 @@ final class WatchSessionManager: NSObject, ObservableObject {
         } catch {
             isUsingFallbackSnapshot = true
             lastErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadGlobalTasks(force: Bool) async {
+        guard canUseDirectApi, let baseUrl = currentBaseUrl(), let apiKey = currentApiKey() else { return }
+        if isLoadingGlobalTasks && !force { return }
+        isLoadingGlobalTasks = true
+        defer { isLoadingGlobalTasks = false }
+
+        do {
+            let nextTasks = try await restClient.fetchGlobalTasks(baseUrl: baseUrl, apiKey: apiKey)
+            globalTasks = nextTasks
+            if let encoded = try? JSONEncoder().encode(nextTasks) {
+                UserDefaults.standard.set(encoded, forKey: Self.cachedGlobalTasksKey)
+            }
+        } catch {
+            // Task status visibility is additive; keep cached tasks without failing server/session loads.
         }
     }
 
