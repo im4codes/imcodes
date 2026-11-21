@@ -15,8 +15,9 @@ struct SessionDetailView: View {
     @State private var isHoldingVoice = false
     @State private var isCancelDrag = false
     @State private var voicePulse = false
-    @State private var initialScrollDone = false
+    @State private var hasScrolledInitialLoad = false
     @State private var prevItemCount = 0
+    @State private var prevLastItemId: String?
     @State private var isAtBottom = true
     @State private var unreadCount = 0
     @State private var scrollProxy: ScrollViewProxy?
@@ -44,32 +45,46 @@ struct SessionDetailView: View {
             }
             .onAppear {
                 scrollProxy = proxy
-                // Initial scroll — covers case where items are already seeded before onChange fires
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    if !initialScrollDone {
-                        initialScrollDone = true
-                        prevItemCount = historyState.items.count
+                prevItemCount = historyState.items.count
+                prevLastItemId = historyState.items.last?.id
+                if historyState.loadedOnce {
+                    hasScrolledInitialLoad = true
+                }
+                if historyState.items.count > 0 || historyState.loadedOnce {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                         proxy.scrollTo("replyField", anchor: .bottom)
                     }
                 }
             }
+            .onChange(of: historyState.loadedOnce) { loaded in
+                guard loaded, !hasScrolledInitialLoad else { return }
+                hasScrolledInitialLoad = true
+                prevItemCount = historyState.items.count
+                prevLastItemId = historyState.items.last?.id
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                    proxy.scrollTo("replyField", anchor: .bottom)
+                }
+            }
             .onChange(of: historyState.items.count) { newCount in
                 let added = newCount - prevItemCount
-                if !initialScrollDone {
-                    initialScrollDone = true
-                    prevItemCount = newCount
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                let currentLastId = historyState.items.last?.id
+                let isTailChange = currentLastId != prevLastItemId
+                prevItemCount = newCount
+                prevLastItemId = currentLastId
+                if !hasScrolledInitialLoad && historyState.loadedOnce {
+                    hasScrolledInitialLoad = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                         proxy.scrollTo("replyField", anchor: .bottom)
                     }
-                } else if added > 0 && added <= 3 && isAtBottom {
-                    prevItemCount = newCount
-                    proxy.scrollTo("replyField", anchor: .bottom)
-                } else if added > 0 && added <= 3 && !isAtBottom {
-                    prevItemCount = newCount
-                    unreadCount += added
-                    WKInterfaceDevice.current().play(.notification)
-                } else {
-                    prevItemCount = newCount
+                } else if !historyState.isLoadingOlder && added > 0 && isTailChange {
+                    if isAtBottom {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            proxy.scrollTo("replyField", anchor: .bottom)
+                        }
+                    } else {
+                        unreadCount += added
+                        WKInterfaceDevice.current().play(.notification)
+                    }
                 }
             }
         }
@@ -134,6 +149,19 @@ struct SessionDetailView: View {
         .onChange(of: route) { _ in
             ttsPlayer.stop()
             cancelHoldVoiceInput(restoreDraft: isHoldingVoice)
+            hasScrolledInitialLoad = false
+            prevItemCount = historyState.items.count
+            prevLastItemId = historyState.items.last?.id
+            isAtBottom = true
+            unreadCount = 0
+            if historyState.loadedOnce {
+                hasScrolledInitialLoad = true
+            }
+            if historyState.items.count > 0 || historyState.loadedOnce {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                    scrollProxy?.scrollTo("replyField", anchor: .bottom)
+                }
+            }
         }
         .onDisappear {
             ttsPlayer.stop()

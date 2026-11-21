@@ -2,9 +2,256 @@ import UIKit
 import WatchConnectivity
 import UserNotifications
 import StreamingSpeechPlugin
+import Speech
+import AVFoundation
 import os.log
 
 private let logger = Logger(subsystem: "com.im.codes", category: "WatchBridge")
+
+private final class BgSpeechStreamSession {
+    private static let pcmFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 16000,
+        channels: 1,
+        interleaved: true
+    )
+
+    let streamId: String
+    private let queue: DispatchQueue
+    private let recognizer: SFSpeechRecognizer
+    private let onUpdate: (WatchAsrUpdate) -> Void
+
+    private let lock = NSLock()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private var bgTaskId: UIBackgroundTaskIdentifier = .invalid
+    private var latestText = ""
+    private var finished = false
+    private var cancelled = false
+    private var finishTimeoutWorkItem: DispatchWorkItem?
+
+    init(
+        streamId: String,
+        recognizer: SFSpeechRecognizer,
+        queue: DispatchQueue,
+        onUpdate: @escaping (WatchAsrUpdate) -> Void
+    ) {
+        self.streamId = streamId
+        self.recognizer = recognizer
+        self.queue = queue
+        self.onUpdate = onUpdate
+    }
+
+    func start() {
+        acquireBackgroundTask(name: "IMCodesWatchBgAsr") { [weak self] in
+            self?.cancel()
+        }
+
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        req.requiresOnDeviceRecognition = false
+
+        lock.lock()
+        guard !cancelled, !finished else {
+            lock.unlock()
+            endBackgroundTask()
+            return
+        }
+        self.request = req
+        self.task = recognizer.recognitionTask(with: req) { [weak self] result, error in
+            self?.handleRecognitionCallback(result: result, error: error)
+        }
+        lock.unlock()
+    }
+
+    func append(pcm16: Data, isFinal: Bool) {
+        lock.lock()
+        let isDone = cancelled || finished
+        let activeReq = request
+        lock.unlock()
+        guard !isDone, let activeReq else { return }
+
+        let frameCount = AVAudioFrameCount(pcm16.count / 2)
+        if frameCount > 0,
+           let format = Self.pcmFormat,
+           let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount),
+           let dst = buffer.int16ChannelData?[0] {
+            buffer.frameLength = frameCount
+            pcm16.withUnsafeBytes { raw in
+                if let src = raw.bindMemory(to: Int16.self).baseAddress {
+                    dst.update(from: src, count: Int(frameCount))
+                }
+            }
+            activeReq.append(buffer)
+        }
+
+        if isFinal {
+            finish()
+        }
+    }
+
+    func finish() {
+        lock.lock()
+        if cancelled || finished {
+            lock.unlock()
+            return
+        }
+        let activeReq = request
+        if finishTimeoutWorkItem == nil {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.completeOnce(textOverride: nil, error: nil)
+            }
+            finishTimeoutWorkItem = work
+            queue.asyncAfter(deadline: .now() + 5.0, execute: work)
+        }
+        lock.unlock()
+        activeReq?.endAudio()
+    }
+
+    func cancel() {
+        lock.lock()
+        if cancelled || finished {
+            lock.unlock()
+            endBackgroundTask()
+            return
+        }
+        cancelled = true
+        finishTimeoutWorkItem?.cancel()
+        finishTimeoutWorkItem = nil
+        let activeReq = request
+        let activeTask = task
+        request = nil
+        task = nil
+        lock.unlock()
+
+        activeReq?.endAudio()
+        activeTask?.cancel()
+        endBackgroundTask()
+    }
+
+    private func handleRecognitionCallback(result: SFSpeechRecognitionResult?, error: Error?) {
+        if let result {
+            let transcript = result.bestTranscription.formattedString
+            lock.lock()
+            let shouldSkip = cancelled || finished
+            if !shouldSkip && !transcript.isEmpty {
+                latestText = transcript
+            }
+            lock.unlock()
+            guard !shouldSkip else { return }
+
+            if result.isFinal {
+                completeOnce(textOverride: transcript, error: nil)
+                return
+            }
+            onUpdate(WatchAsrUpdate(streamId: streamId, text: transcript, isFinal: false))
+        }
+
+        if let error {
+            completeOnce(textOverride: nil, error: error)
+        }
+    }
+
+    private func completeOnce(textOverride: String?, error: Error?) {
+        lock.lock()
+        if cancelled || finished {
+            lock.unlock()
+            endBackgroundTask()
+            return
+        }
+        finished = true
+        finishTimeoutWorkItem?.cancel()
+        finishTimeoutWorkItem = nil
+        let finalText: String
+        if let textOverride, !textOverride.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            finalText = textOverride
+        } else {
+            finalText = latestText
+        }
+        let activeReq = request
+        let activeTask = task
+        request = nil
+        task = nil
+        lock.unlock()
+
+        activeReq?.endAudio()
+        if error != nil {
+            activeTask?.cancel()
+        } else {
+            activeTask?.finish()
+        }
+
+        if let error, finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !Self.isBenignSpeechError(error) {
+            onUpdate(WatchAsrUpdate(
+                streamId: streamId,
+                text: "",
+                isFinal: true,
+                errorCode: "speech_recognition_failed",
+                errorMessage: error.localizedDescription
+            ))
+        } else {
+            onUpdate(WatchAsrUpdate(streamId: streamId, text: finalText, isFinal: true))
+        }
+        endBackgroundTask()
+    }
+
+    static func isBenignSpeechError(_ error: Error) -> Bool {
+        let nsErr = error as NSError
+        if nsErr.domain == NSCocoaErrorDomain && nsErr.code == NSUserCancelledError {
+            return true
+        }
+        // Apple Speech Assistant domain silent / cancelled codes (1110: no speech detected, 203: retry/empty, 209/216: cancelled)
+        if nsErr.domain == "kAFAssistantErrorDomain" && [203, 209, 216, 1110].contains(nsErr.code) {
+            return true
+        }
+        return false
+    }
+
+    private func acquireBackgroundTask(name: String, onExpire: @escaping () -> Void) {
+        let acquire = {
+            var id: UIBackgroundTaskIdentifier = .invalid
+            id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+                onExpire()
+                self?.endBackgroundTask(expectedId: id)
+            }
+            self.lock.lock()
+            if self.finished || self.cancelled {
+                self.lock.unlock()
+                if id != .invalid {
+                    UIApplication.shared.endBackgroundTask(id)
+                }
+                return
+            }
+            self.bgTaskId = id
+            self.lock.unlock()
+        }
+        if Thread.isMainThread {
+            acquire()
+        } else {
+            DispatchQueue.main.async(execute: acquire)
+        }
+    }
+
+    private func endBackgroundTask(expectedId: UIBackgroundTaskIdentifier? = nil) {
+        lock.lock()
+        let id = bgTaskId
+        if id == .invalid || (expectedId != nil && expectedId != id) {
+            lock.unlock()
+            return
+        }
+        bgTaskId = .invalid
+        lock.unlock()
+        let end = {
+            UIApplication.shared.endBackgroundTask(id)
+        }
+        if Thread.isMainThread {
+            end()
+        } else {
+            DispatchQueue.main.async(execute: end)
+        }
+    }
+}
 
 extension Notification.Name {
     static let watchCommand = Notification.Name("watchCommand")
@@ -13,7 +260,13 @@ extension Notification.Name {
 final class WatchBridge: NSObject, WCSessionDelegate {
     static let shared = WatchBridge()
 
+    private enum StreamBackend {
+        case mlx
+        case appleSpeech(BgSpeechStreamSession)
+    }
+
     private struct StreamBufferState {
+        var backend: StreamBackend = .mlx
         var nextExpectedSeq: UInt32 = 0
         var reordered: [UInt32: (isFinal: Bool, pcm16: Data)] = [:]
         var isStarted: Bool = false
@@ -30,8 +283,10 @@ final class WatchBridge: NSObject, WCSessionDelegate {
 
     private let session = WCSession.default
     private var didAttemptActivation = false
+    private var didRequestSpeechAuth = false
     private let asrQueue = DispatchQueue(label: "com.im.codes.watch-bridge.asr", qos: .userInitiated)
     private var activeStreams: [String: StreamBufferState] = [:]
+    private var activeBgFileTasks: [String: SFSpeechRecognitionTask] = [:]
     private var pendingAudioFiles: [PendingAudioFile] = []
 
     private override init() {
@@ -164,6 +419,132 @@ final class WatchBridge: NSObject, WCSessionDelegate {
         }
     }
 
+    private static func isAppBackgrounded() -> Bool {
+        if Thread.isMainThread {
+            return UIApplication.shared.applicationState == .background
+        }
+        return DispatchQueue.main.sync {
+            UIApplication.shared.applicationState == .background
+        }
+    }
+
+    private static func makeSpeechRecognizer(language: String?) -> SFSpeechRecognizer? {
+        if let raw = language?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            if let recognizer = SFSpeechRecognizer(locale: Locale(identifier: raw)) {
+                return recognizer
+            }
+        }
+        if let preferred = Locale.preferredLanguages.first,
+           let recognizer = SFSpeechRecognizer(locale: Locale(identifier: preferred)) {
+            return recognizer
+        }
+        return SFSpeechRecognizer()
+    }
+
+    private func prewarmSpeechAuthorizationIfNeeded() {
+        guard !didRequestSpeechAuth,
+              SFSpeechRecognizer.authorizationStatus() == .notDetermined else {
+            return
+        }
+        didRequestSpeechAuth = true
+        DispatchQueue.main.async {
+            SFSpeechRecognizer.requestAuthorization { _ in }
+        }
+    }
+
+    private func cancelAllActiveStreamsLocked() {
+        for (_, state) in activeStreams {
+            if case .appleSpeech(let bgSession) = state.backend {
+                bgSession.cancel()
+            }
+        }
+        activeStreams.removeAll()
+    }
+
+    private func startBackgroundSpeechStreamLocked(
+        streamId: String,
+        language: String?
+    ) -> Result<Void, WatchAsrError> {
+        guard !WatchAsrBridge.shared.isPhoneMicBusy else {
+            return .failure(.phoneMicBusy)
+        }
+        guard SFSpeechRecognizer.authorizationStatus() == .authorized,
+              let recognizer = Self.makeSpeechRecognizer(language: language),
+              recognizer.isAvailable else {
+            return .failure(.phoneBackgrounded)
+        }
+        WatchAsrBridge.shared.cancelExternalStream()
+        cancelAllActiveStreamsLocked()
+        let bgSession = BgSpeechStreamSession(
+            streamId: streamId,
+            recognizer: recognizer,
+            queue: asrQueue
+        ) { [weak self] update in
+            self?.sendWatchAsrResult(update)
+        }
+        bgSession.start()
+        activeStreams[streamId] = StreamBufferState(
+            backend: .appleSpeech(bgSession),
+            nextExpectedSeq: 0,
+            reordered: [:],
+            isStarted: true
+        )
+        return .success(())
+    }
+
+    private func startStreamBackendLocked(
+        streamId: String,
+        language: String?
+    ) -> Result<Void, WatchAsrError> {
+        guard !streamId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .failure(.invalidStreamId)
+        }
+        if Self.isAppBackgrounded() {
+            return startBackgroundSpeechStreamLocked(streamId: streamId, language: language)
+        }
+        prewarmSpeechAuthorizationIfNeeded()
+        let result = WatchAsrBridge.shared.startExternalStream(
+            streamId: streamId,
+            language: language
+        ) { [weak self] update in
+            self?.sendWatchAsrResult(update)
+        }
+        switch result {
+        case .success:
+            cancelAllActiveStreamsLocked()
+            activeStreams[streamId] = StreamBufferState(
+                backend: .mlx,
+                nextExpectedSeq: 0,
+                reordered: [:],
+                isStarted: true
+            )
+            return .success(())
+        case .failure(.phoneBackgrounded):
+            return startBackgroundSpeechStreamLocked(streamId: streamId, language: language)
+        case .failure(let err):
+            activeStreams.removeValue(forKey: streamId)
+            return .failure(err)
+        }
+    }
+
+    private func dispatchPcmChunkLocked(
+        streamId: String,
+        backend: StreamBackend,
+        pcm16: Data,
+        isFinal: Bool
+    ) {
+        switch backend {
+        case .mlx:
+            WatchAsrBridge.shared.appendExternalPcm16(
+                streamId: streamId,
+                data: pcm16,
+                isFinal: isFinal
+            )
+        case .appleSpeech(let bgSession):
+            bgSession.append(pcm16: pcm16, isFinal: isFinal)
+        }
+    }
+
     private func startWatchAsrStream(
         streamId: String,
         language: String?,
@@ -174,16 +555,9 @@ final class WatchBridge: NSObject, WCSessionDelegate {
                 replyHandler?(["ok": false, "errorCode": "bridge_unavailable", "error": "Watch bridge unavailable"])
                 return
             }
-            let result = WatchAsrBridge.shared.startExternalStream(
-                streamId: streamId,
-                language: language
-            ) { [weak self] update in
-                self?.sendWatchAsrResult(update)
-            }
+            let result = self.startStreamBackendLocked(streamId: streamId, language: language)
             switch result {
             case .success:
-                self.activeStreams.removeAll()
-                self.activeStreams[streamId] = StreamBufferState(nextExpectedSeq: 0, reordered: [:], isStarted: true)
                 replyHandler?(["ok": true, "streamId": streamId])
             case .failure(let err):
                 self.activeStreams.removeValue(forKey: streamId)
@@ -210,7 +584,15 @@ final class WatchBridge: NSObject, WCSessionDelegate {
     private func stopWatchAsrStream(streamId: String, cancel: Bool) {
         asrQueue.async { [weak self] in
             guard let self else { return }
-            self.activeStreams.removeValue(forKey: streamId)
+            let removed = self.activeStreams.removeValue(forKey: streamId)
+            if case .appleSpeech(let bgSession) = removed?.backend {
+                if cancel {
+                    bgSession.cancel()
+                } else {
+                    bgSession.finish()
+                }
+                return
+            }
             if cancel {
                 WatchAsrBridge.shared.cancelExternalStream(streamId: streamId)
             } else {
@@ -252,17 +634,8 @@ final class WatchBridge: NSObject, WCSessionDelegate {
             guard let self else { return }
             if self.activeStreams[parsed.streamId] == nil {
                 // If packets raced ahead of watchAsrStart, initialize stream state lazily.
-                let startResult = WatchAsrBridge.shared.startExternalStream(
-                    streamId: parsed.streamId,
-                    language: nil
-                ) { [weak self] update in
-                    self?.sendWatchAsrResult(update)
-                }
-                switch startResult {
-                case .success:
-                    self.activeStreams.removeAll()
-                    self.activeStreams[parsed.streamId] = StreamBufferState(nextExpectedSeq: 0, reordered: [:], isStarted: true)
-                case .failure(let err):
+                let startResult = self.startStreamBackendLocked(streamId: parsed.streamId, language: nil)
+                if case .failure(let err) = startResult {
                     self.sendWatchAsrResult(WatchAsrUpdate(
                         streamId: parsed.streamId,
                         text: "",
@@ -281,9 +654,10 @@ final class WatchBridge: NSObject, WCSessionDelegate {
             state.reordered[parsed.seq] = (parsed.isFinal, parsed.pcm16)
             while let nextChunk = state.reordered.removeValue(forKey: state.nextExpectedSeq) {
                 state.nextExpectedSeq &+= 1
-                WatchAsrBridge.shared.appendExternalPcm16(
+                self.dispatchPcmChunkLocked(
                     streamId: parsed.streamId,
-                    data: nextChunk.pcm16,
+                    backend: state.backend,
+                    pcm16: nextChunk.pcm16,
                     isFinal: nextChunk.isFinal
                 )
                 if nextChunk.isFinal {
@@ -296,9 +670,10 @@ final class WatchBridge: NSObject, WCSessionDelegate {
                 state.nextExpectedSeq = minSeq
                 while let nextChunk = state.reordered.removeValue(forKey: state.nextExpectedSeq) {
                     state.nextExpectedSeq &+= 1
-                    WatchAsrBridge.shared.appendExternalPcm16(
+                    self.dispatchPcmChunkLocked(
                         streamId: parsed.streamId,
-                        data: nextChunk.pcm16,
+                        backend: state.backend,
+                        pcm16: nextChunk.pcm16,
                         isFinal: nextChunk.isFinal
                     )
                     if nextChunk.isFinal {
@@ -357,7 +732,100 @@ final class WatchBridge: NSObject, WCSessionDelegate {
         ], replyHandler: nil, errorHandler: nil)
     }
 
-    private func processPendingOrImmediateAudioFile(_ item: PendingAudioFile) {
+    private func transcribeAudioFileInBackground(_ item: PendingAudioFile) -> Bool {
+        guard SFSpeechRecognizer.authorizationStatus() == .authorized,
+              let recognizer = Self.makeSpeechRecognizer(language: item.language),
+              recognizer.isAvailable else {
+            return false
+        }
+
+        let finishLock = NSLock()
+        var completed = false
+        var bgTaskId: UIBackgroundTaskIdentifier = .invalid
+        let endBgTask = {
+            finishLock.lock()
+            let id = bgTaskId
+            bgTaskId = .invalid
+            finishLock.unlock()
+            guard id != .invalid else { return }
+            DispatchQueue.main.async {
+                UIApplication.shared.endBackgroundTask(id)
+            }
+        }
+
+        let completeFileTask: (WatchAsrUpdate) -> Void = { [weak self] update in
+            finishLock.lock()
+            if completed {
+                finishLock.unlock()
+                return
+            }
+            completed = true
+            finishLock.unlock()
+
+            try? FileManager.default.removeItem(at: item.fileURL)
+            self?.asrQueue.async {
+                self?.activeBgFileTasks.removeValue(forKey: item.streamId)
+            }
+            self?.sendWatchAsrResult(update)
+            endBgTask()
+        }
+
+        bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "IMCodesWatchBgAsrFile") { [weak self] in
+            self?.asrQueue.async {
+                self?.activeBgFileTasks[item.streamId]?.cancel()
+            }
+            completeFileTask(WatchAsrUpdate(
+                streamId: item.streamId,
+                text: "",
+                isFinal: true,
+                errorCode: "background_task_expired",
+                errorMessage: "Background speech recognition expired"
+            ))
+        }
+
+        let request = SFSpeechURLRecognitionRequest(url: item.fileURL)
+        request.shouldReportPartialResults = false
+        request.requiresOnDeviceRecognition = false
+
+        var latestText = ""
+        let task = recognizer.recognitionTask(with: request) { result, error in
+            if let result {
+                let text = result.bestTranscription.formattedString
+                if !text.isEmpty {
+                    finishLock.lock()
+                    latestText = text
+                    finishLock.unlock()
+                }
+                if result.isFinal {
+                    completeFileTask(WatchAsrUpdate(streamId: item.streamId, text: text, isFinal: true))
+                    return
+                }
+            }
+            if let error {
+                finishLock.lock()
+                let capturedText = latestText
+                finishLock.unlock()
+                if !capturedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || BgSpeechStreamSession.isBenignSpeechError(error) {
+                    completeFileTask(WatchAsrUpdate(streamId: item.streamId, text: capturedText, isFinal: true))
+                } else {
+                    completeFileTask(WatchAsrUpdate(
+                        streamId: item.streamId,
+                        text: "",
+                        isFinal: true,
+                        errorCode: "speech_recognition_failed",
+                        errorMessage: error.localizedDescription
+                    ))
+                }
+            }
+        }
+        asrQueue.async { [weak self] in
+            self?.activeBgFileTasks[item.streamId] = task
+        }
+        return true
+    }
+
+    private func enqueueBackgroundPendingFile(_ item: PendingAudioFile) {
         if !WatchAsrBridge.shared.isModelAvailable {
             try? FileManager.default.removeItem(at: item.fileURL)
             sendWatchAsrResult(WatchAsrUpdate(
@@ -369,15 +837,33 @@ final class WatchBridge: NSObject, WCSessionDelegate {
             ))
             return
         }
+        asrQueue.async {
+            self.pendingAudioFiles.removeAll { $0.streamId == item.streamId }
+            self.pendingAudioFiles.append(item)
+        }
+        sendWatchAsrStatus(streamId: item.streamId, status: "queued_background")
+    }
 
+    private func processPendingOrImmediateAudioFile(_ item: PendingAudioFile) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if UIApplication.shared.applicationState == .background {
-                self.asrQueue.async {
-                    self.pendingAudioFiles.removeAll { $0.streamId == item.streamId }
-                    self.pendingAudioFiles.append(item)
+                if self.transcribeAudioFileInBackground(item) {
+                    return
                 }
-                self.sendWatchAsrStatus(streamId: item.streamId, status: "queued_background")
+                self.enqueueBackgroundPendingFile(item)
+                return
+            }
+
+            if !WatchAsrBridge.shared.isModelAvailable {
+                try? FileManager.default.removeItem(at: item.fileURL)
+                self.sendWatchAsrResult(WatchAsrUpdate(
+                    streamId: item.streamId,
+                    text: "",
+                    isFinal: true,
+                    errorCode: WatchAsrError.modelNotReady.code,
+                    errorMessage: WatchAsrError.modelNotReady.message
+                ))
                 return
             }
 
@@ -386,16 +872,18 @@ final class WatchBridge: NSObject, WCSessionDelegate {
                 fileURL: item.fileURL,
                 language: item.language
             ) { [weak self] update in
+                guard let self else { return }
                 if update.errorCode == WatchAsrError.phoneBackgrounded.code {
-                    self?.asrQueue.async {
-                        self?.pendingAudioFiles.removeAll { $0.streamId == item.streamId }
-                        self?.pendingAudioFiles.append(item)
+                    DispatchQueue.main.async {
+                        if self.transcribeAudioFileInBackground(item) {
+                            return
+                        }
+                        self.enqueueBackgroundPendingFile(item)
                     }
-                    self?.sendWatchAsrStatus(streamId: item.streamId, status: "queued_background")
                     return
                 }
                 try? FileManager.default.removeItem(at: item.fileURL)
-                self?.sendWatchAsrResult(update)
+                self.sendWatchAsrResult(update)
             }
         }
     }
