@@ -18,6 +18,7 @@ import * as input from '../src/components/VoiceInput.js';
 
 beforeEach(() => {
   localStorage.clear();
+  input.setVoiceRecognitionEngine('builtin');
   vi.stubGlobal('Capacitor', { isNativePlatform: () => true, isPluginAvailable: () => true });
   for (const bridge of [bridges.streaming, bridges.platform]) {
     bridge.listeners = {}; bridge.removals = [];
@@ -218,6 +219,9 @@ describe('multilingual plugin session ownership', () => {
     expect(bridges.streaming.start).not.toHaveBeenCalled();
     expect(bridges.platform.start).toHaveBeenCalledTimes(1);
     await input.stopListening();
+
+    // Reset cached downloading fallback before exercising the 15s primary start() timeout scenario.
+    input.setVoiceRecognitionEngine('builtin');
 
     // 2. When StreamingSpeech.start() times out at 15s, fallback must wait for StreamingSpeech.stop() before starting platform recognizer
     vi.useFakeTimers();
@@ -535,5 +539,88 @@ describe('voice recognition engine preference & cache switching', () => {
     expect(input.canSwitchVoiceEngine()).toBe(false);
     vi.stubGlobal('Capacitor', undefined);
     expect(input.canSwitchVoiceEngine()).toBe(false);
+  });
+
+  it('bounds stopListening() during unsettled start (!captureStarted) without stalling 20s and unlocks immediate retry', async () => {
+    vi.useFakeTimers();
+    try {
+      // Hung platform.start() + hung platform.stop() while !captureStarted
+      bridges.streaming.available.mockResolvedValueOnce({ available: false, downloading: true } as any);
+      bridges.platform.start.mockReturnValueOnce(new Promise(() => {}));
+      bridges.platform.stop.mockReturnValueOnce(new Promise(() => {}));
+
+      const startPending = input.startListening(vi.fn());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(bridges.platform.start).toHaveBeenCalledTimes(1);
+
+      // Release hold-to-talk before captureStarted becomes true -> stopListening must finish at NATIVE_UNSTARTED_STOP_DRAIN_MS (2s), NOT 20s
+      let stopSettled = false;
+      const stopPromise = input.stopListening().then(() => { stopSettled = true; });
+      await vi.advanceTimersByTimeAsync(input.NATIVE_UNSTARTED_STOP_DRAIN_MS);
+      await stopPromise;
+      expect(stopSettled).toBe(true);
+      await expect(startPending).resolves.toBe(false);
+
+      // Subsequent press must start cleanly without waiting 20s behind _pendingStop
+      bridges.platform.start.mockResolvedValueOnce(undefined);
+      await expect(input.startListening(vi.fn())).resolves.toBe(true);
+      expect(bridges.platform.start).toHaveBeenCalledTimes(2);
+      await input.stopListening();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still allows up to NATIVE_STOP_DRAIN_MS (20s) for normal stopListening after captureStarted', async () => {
+    vi.useFakeTimers();
+    try {
+      let releaseStop!: () => void;
+      const onResult = vi.fn();
+      await expect(input.startListening(onResult)).resolves.toBe(true);
+      bridges.streaming.stop.mockReturnValueOnce(new Promise<void>((resolve) => { releaseStop = resolve; }));
+
+      let stopSettled = false;
+      const stopPromise = input.stopListening().then(() => { stopSettled = true; });
+      await vi.advanceTimersByTimeAsync(16_000);
+      expect(stopSettled).toBe(false);
+
+      bridges.streaming.listeners.partialResults?.({ matches: ['late qwen3 final'], isFinal: true });
+      releaseStop();
+      await stopPromise;
+      expect(stopSettled).toBe(true);
+      expect(onResult).toHaveBeenLastCalledWith('late qwen3 final', true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('caches SpeechRecognition fallback while StreamingSpeech is downloading and surfaces fallback errors clearly', async () => {
+    // 1. First press probes StreamingSpeech (downloading) -> falls back to platform SpeechRecognition and caches it in _prewarmCache
+    bridges.streaming.available.mockResolvedValueOnce({ available: false, downloading: true, progress: 0.25 } as any);
+    bridges.platform.available.mockResolvedValueOnce({ available: true });
+    expect(await input.startListening(vi.fn())).toBe(true);
+    expect(bridges.streaming.requestPermissions).toHaveBeenCalledTimes(1);
+    expect(bridges.streaming.available).toHaveBeenCalledTimes(1);
+    expect(bridges.platform.requestPermissions).toHaveBeenCalledTimes(1);
+    expect(bridges.platform.available).toHaveBeenCalledTimes(1);
+    expect(bridges.platform.start).toHaveBeenCalledTimes(1);
+    await input.stopListening();
+
+    // 2. Second press reuses cached fallback without re-probing StreamingSpeech.available or SpeechRecognition.requestPermissions
+    expect(await input.startListening(vi.fn())).toBe(true);
+    expect(bridges.streaming.requestPermissions).toHaveBeenCalledTimes(1);
+    expect(bridges.streaming.available).toHaveBeenCalledTimes(1);
+    expect(bridges.platform.requestPermissions).toHaveBeenCalledTimes(1);
+    expect(bridges.platform.available).toHaveBeenCalledTimes(1);
+    expect(bridges.platform.start).toHaveBeenCalledTimes(2);
+    await input.stopListening();
+
+    // 3. Fallback availability error surfaces clearly rather than misleading 'Offline speech model unavailable'
+    input.setVoiceRecognitionEngine('builtin');
+    bridges.streaming.available.mockResolvedValueOnce({ available: false, downloading: true } as any);
+    bridges.platform.available.mockRejectedValueOnce(new Error('SFSpeechRecognizer unavailable on device'));
+    const onError = vi.fn();
+    expect(await input.startListening(vi.fn(), undefined, onError)).toBe(false);
+    expect(onError).toHaveBeenCalledWith('SFSpeechRecognizer unavailable on device');
   });
 });
