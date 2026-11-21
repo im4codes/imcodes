@@ -1,7 +1,20 @@
 import SwiftUI
 
+private enum WatchViewMode: String, CaseIterable {
+    case tasks
+    case sessions
+
+    var label: String {
+        switch self {
+        case .tasks: return "Tasks"
+        case .sessions: return "Sessions"
+        }
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject private var sessionManager: WatchSessionManager
+    @AppStorage("watchViewMode") private var viewMode: WatchViewMode = .tasks
     @State private var path: [WatchRoute] = []
     @State private var showServerPicker = false
     @State private var expandedSessions: Set<String> = []
@@ -12,6 +25,10 @@ struct ContentView: View {
 
     private var currentTasks: [WatchGlobalTaskRow] {
         sessionManager.displayTasks()
+    }
+
+    private var activeTaskCount: Int {
+        currentTasks.filter { $0.isTerminal != true }.count
     }
 
     private func isSubSessionRow(_ row: WatchSessionRow) -> Bool {
@@ -38,121 +55,214 @@ struct ContentView: View {
         return WatchRoute(serverId: task.serverId, sessionName: brainSession, title: brainTitle)
     }
 
+    private var modeSwitcher: some View {
+        HStack(spacing: 4) {
+            modeButton(for: .tasks, badge: activeTaskCount > 0 ? activeTaskCount : nil)
+            modeButton(for: .sessions, badge: !mainSessions.isEmpty ? mainSessions.count : nil)
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
+    }
+
+    private func modeButton(for mode: WatchViewMode, badge: Int?) -> some View {
+        let isSelected = viewMode == mode
+        return Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                viewMode = mode
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Text(mode.label)
+                    .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
+                    .lineLimit(1)
+                if let badge {
+                    Text("\(badge)")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 26)
+            .padding(.horizontal, 4)
+            .background(
+                Capsule()
+                    .fill(isSelected ? Color.accentColor.opacity(0.28) : Color.secondary.opacity(0.14))
+            )
+            .foregroundStyle(isSelected ? .primary : .secondary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var statusBanners: some View {
+        if sessionManager.isUsingFallbackSnapshot {
+            Text("Cached snapshot")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+
+        if let error = sessionManager.lastErrorMessage, !error.isEmpty {
+            Text(error)
+                .font(.caption2)
+                .foregroundStyle(.red)
+        }
+    }
+
+    @ViewBuilder
+    private var tasksModeContent: some View {
+        if currentTasks.isEmpty {
+            VStack(spacing: 8) {
+                statusBanners
+                if sessionManager.isLoadingGlobalTasks {
+                    ProgressView()
+                } else {
+                    Text("No tasks")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    if !mainSessions.isEmpty {
+                        Button("View Sessions") {
+                            viewMode = .sessions
+                        }
+                        .font(.caption2)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding()
+        } else {
+            List {
+                statusBanners
+
+                ForEach(currentTasks) { task in
+                    let route = brainRoute(for: task)
+                    if let route {
+                        Button {
+                            path = [route]
+                        } label: {
+                            TaskRowView(task: task, hasNavigation: true)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        TaskRowView(task: task, hasNavigation: false)
+                    }
+                }
+            }
+            .listStyle(.plain)
+        }
+    }
+
+    @ViewBuilder
+    private var sessionsModeContent: some View {
+        if mainSessions.isEmpty {
+            VStack(spacing: 8) {
+                statusBanners
+                if sessionManager.isLoadingSessions || sessionManager.isLoadingServers {
+                    ProgressView()
+                } else {
+                    Text("No sessions")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    if !currentTasks.isEmpty {
+                        Button("View Tasks") {
+                            viewMode = .tasks
+                        }
+                        .font(.caption2)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding()
+        } else {
+            List {
+                statusBanners
+
+                ForEach(mainSessions) { session in
+                    let subs = subSessions(for: session.sessionName)
+                    let isExpanded = expandedSessions.contains(session.sessionName)
+
+                    HStack(spacing: 0) {
+                        Button {
+                            path = [WatchRoute(serverId: session.serverId, sessionName: session.sessionName, title: session.title)]
+                        } label: {
+                            SessionRowView(session: session)
+                        }
+                        .buttonStyle(.plain)
+
+                        Spacer(minLength: 4)
+
+                        if !subs.isEmpty {
+                            Button {
+                                withAnimation {
+                                    if isExpanded { expandedSessions.remove(session.sessionName) }
+                                    else { expandedSessions.insert(session.sessionName) }
+                                }
+                            } label: {
+                                HStack(spacing: 2) {
+                                    Text("\(subs.count)")
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(.secondary)
+                                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                        .font(.system(size: 7))
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .frame(minWidth: 28, minHeight: 28)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .swipeActions(edge: .trailing) {
+                        if !subs.isEmpty {
+                            Button {
+                                withAnimation {
+                                    if isExpanded { expandedSessions.remove(session.sessionName) }
+                                    else { expandedSessions.insert(session.sessionName) }
+                                }
+                            } label: {
+                                Label(isExpanded ? "Fold" : "\(subs.count) sub", systemImage: isExpanded ? "chevron.up" : "chevron.down")
+                            }
+                            .tint(.blue)
+                        }
+                    }
+
+                    if isExpanded {
+                        ForEach(subs) { sub in
+                            Button {
+                                path = [WatchRoute(serverId: sub.serverId, sessionName: sub.sessionName, title: sub.title)]
+                            } label: {
+                                SessionRowView(session: sub)
+                                    .padding(.leading, 14)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .listStyle(.plain)
+        }
+    }
+
     var body: some View {
         NavigationStack(path: $path) {
             Group {
-                if currentSessions.isEmpty && currentTasks.isEmpty {
+                if sessionManager.currentApiKey() == nil && currentSessions.isEmpty && currentTasks.isEmpty {
                     VStack(spacing: 8) {
-                        if sessionManager.currentApiKey() == nil {
-                            Text("Open IM.codes on iPhone")
-                                .font(.footnote)
-                            Text("Login once to sync Watch access")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        } else if sessionManager.isLoadingSessions || sessionManager.isLoadingServers {
-                            ProgressView()
-                        } else {
-                            Text("No sessions")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
+                        Text("Open IM.codes on iPhone")
+                            .font(.footnote)
+                        Text("Login once to sync Watch access")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     .padding()
                 } else {
-                    List {
-                        if sessionManager.isUsingFallbackSnapshot {
-                            Text("Cached snapshot")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        if let error = sessionManager.lastErrorMessage, !error.isEmpty {
-                            Text(error)
-                                .font(.caption2)
-                                .foregroundStyle(.red)
-                        }
-
-                        if !currentTasks.isEmpty {
-                            Section("Tasks") {
-                                ForEach(currentTasks) { task in
-                                    let route = brainRoute(for: task)
-                                    if let route {
-                                        Button {
-                                            path = [route]
-                                        } label: {
-                                            TaskRowView(task: task, hasNavigation: true)
-                                        }
-                                        .buttonStyle(.plain)
-                                    } else {
-                                        TaskRowView(task: task, hasNavigation: false)
-                                    }
-                                }
-                            }
-                        }
-
-                        ForEach(mainSessions) { session in
-                            let subs = subSessions(for: session.sessionName)
-                            let isExpanded = expandedSessions.contains(session.sessionName)
-
-                            HStack(spacing: 0) {
-                                Button {
-                                    path = [WatchRoute(serverId: session.serverId, sessionName: session.sessionName, title: session.title)]
-                                } label: {
-                                    SessionRowView(session: session)
-                                }
-                                .buttonStyle(.plain)
-
-                                Spacer(minLength: 4)
-
-                                if !subs.isEmpty {
-                                    Button {
-                                        withAnimation {
-                                            if isExpanded { expandedSessions.remove(session.sessionName) }
-                                            else { expandedSessions.insert(session.sessionName) }
-                                        }
-                                    } label: {
-                                        HStack(spacing: 2) {
-                                            Text("\(subs.count)")
-                                                .font(.system(size: 9))
-                                                .foregroundStyle(.secondary)
-                                            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                                                .font(.system(size: 7))
-                                                .foregroundStyle(.tertiary)
-                                        }
-                                        .frame(minWidth: 28, minHeight: 28)
-                                        .contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .swipeActions(edge: .trailing) {
-                                if !subs.isEmpty {
-                                    Button {
-                                        withAnimation {
-                                            if isExpanded { expandedSessions.remove(session.sessionName) }
-                                            else { expandedSessions.insert(session.sessionName) }
-                                        }
-                                    } label: {
-                                        Label(isExpanded ? "Fold" : "\(subs.count) sub", systemImage: isExpanded ? "chevron.up" : "chevron.down")
-                                    }
-                                    .tint(.blue)
-                                }
-                            }
-
-                            if isExpanded {
-                                ForEach(subs) { sub in
-                                    Button {
-                                        path = [WatchRoute(serverId: sub.serverId, sessionName: sub.sessionName, title: sub.title)]
-                                    } label: {
-                                        SessionRowView(session: sub)
-                                            .padding(.leading, 14)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
+                    VStack(spacing: 2) {
+                        modeSwitcher
+                        switch viewMode {
+                        case .tasks:
+                            tasksModeContent
+                        case .sessions:
+                            sessionsModeContent
                         }
                     }
-                    .listStyle(.plain)
                 }
             }
             .navigationTitle("IM.codes")

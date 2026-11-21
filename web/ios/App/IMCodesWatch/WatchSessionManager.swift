@@ -19,11 +19,11 @@ final class WatchSessionManager: NSObject, ObservableObject {
     @Published private(set) var isUsingFallbackSnapshot = true
     @Published private(set) var isLoadingServers = false
     @Published private(set) var isLoadingSessions = false
+    @Published private(set) var isLoadingGlobalTasks = false
 
     private static let cachedGlobalTasksKey = "imcodes.watch.cachedGlobalTasks.v1"
 
     private let restClient = WatchRestClient()
-    private var isLoadingGlobalTasks = false
     private var pendingRoute: WatchRoute?
     private var routeTimeoutWorkItem: DispatchWorkItem?
 
@@ -40,14 +40,49 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     func displaySessions(for serverId: String? = nil) -> [WatchSessionRow] {
         let targetServerId = serverId ?? selectedServerId
+        let raw: [WatchSessionRow]
         if let targetServerId {
             if loadedSessionsServerId == targetServerId {
-                return sessionRows.filter { $0.serverId == targetServerId }
+                raw = sessionRows.filter { $0.serverId == targetServerId }
+            } else {
+                raw = applicationContext.sessions.filter { $0.serverId == targetServerId }
             }
-            return applicationContext.sessions.filter { $0.serverId == targetServerId }
+        } else if loadedSessionsServerId != nil {
+            raw = sessionRows
+        } else {
+            raw = applicationContext.sessions
         }
-        if loadedSessionsServerId != nil { return sessionRows }
-        return applicationContext.sessions
+        return Self.sortSessions(raw)
+    }
+
+    static func sortSessions(_ sessions: [WatchSessionRow]) -> [WatchSessionRow] {
+        sessions.sorted { lhs, rhs in
+            let lhsPinned = lhs.isPinned ?? false
+            let rhsPinned = rhs.isPinned ?? false
+            if lhsPinned != rhsPinned { return lhsPinned }
+
+            let lhsPriority = sessionStatePriority(lhs.state)
+            let rhsPriority = sessionStatePriority(rhs.state)
+            if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+
+            let lhsTs = lhs.effectivePreviewUpdatedAt ?? 0
+            let rhsTs = rhs.effectivePreviewUpdatedAt ?? 0
+            if lhsTs != rhsTs { return lhsTs > rhsTs }
+
+            let titleOrder = lhs.title.localizedCaseInsensitiveCompare(rhs.title)
+            if titleOrder != .orderedSame { return titleOrder == .orderedAscending }
+
+            return lhs.sessionName < rhs.sessionName
+        }
+    }
+
+    private static func sessionStatePriority(_ state: WatchSessionState) -> Int {
+        switch state {
+        case .working: return 0
+        case .error: return 1
+        case .idle: return 2
+        case .stopped: return 3
+        }
     }
 
     func displayTasks(for serverId: String? = nil) -> [WatchGlobalTaskRow] {
@@ -63,13 +98,27 @@ final class WatchSessionManager: NSObject, ObservableObject {
             let lhsTerminal = lhs.isTerminal ?? false
             let rhsTerminal = rhs.isTerminal ?? false
             if lhsTerminal != rhsTerminal { return !lhsTerminal }
-            let lhsAttention = lhs.needsAttention ?? false
-            let rhsAttention = rhs.needsAttention ?? false
-            if lhsAttention != rhsAttention { return lhsAttention }
+            let lhsRank = taskActiveSortRank(lhs)
+            let rhsRank = taskActiveSortRank(rhs)
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
             let lhsTs = lhs.updatedAt ?? 0
             let rhsTs = rhs.updatedAt ?? 0
             if lhsTs != rhsTs { return lhsTs > rhsTs }
             return lhs.taskId < rhs.taskId
+        }
+    }
+
+    private func taskActiveSortRank(_ task: WatchGlobalTaskRow) -> Int {
+        if task.needsAttention ?? false { return 0 }
+        switch task.status {
+        case "working", "in_audit", "awaiting_audit", "rework":
+            return 1
+        case "passed":
+            return 2
+        case "queued", "paused":
+            return 3
+        default:
+            return 4
         }
     }
 
