@@ -1616,7 +1616,8 @@
     "engine_system": "系统原生",
     "mic_select_label": "麦克风",
     "mic_auto": "自动（物理麦克风）",
-    "mic_auto_prefix": "自动"
+    "mic_auto_prefix": "自动",
+    "loading_model": "正在加载语音模型…"
   },
   "p2p": {
     "final_original_request_reminder": "在完成讨论综合后，务必直接落实并完整回应用户的原始请求，不要只停留在讨论总结。\n用户的原始请求是：\"{{request}}\"",

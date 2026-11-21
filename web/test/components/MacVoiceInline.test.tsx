@@ -30,6 +30,7 @@ const voiceState = vi.hoisted(() => ({
   onAudioLevel: vi.fn((cb: VoiceLevelCb) => {
     voiceState.onLevel = cb;
   }),
+  onModelLoading: vi.fn(),
   primeVoiceGesture: vi.fn(() => true),
   cancelVoiceGesturePrime: vi.fn(),
 }));

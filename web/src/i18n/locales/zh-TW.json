@@ -1616,7 +1616,8 @@
     "engine_system": "系統原生",
     "mic_select_label": "麥克風",
     "mic_auto": "自動（實體麥克風）",
-    "mic_auto_prefix": "自動"
+    "mic_auto_prefix": "自動",
+    "loading_model": "正在載入語音模型…"
   },
   "p2p": {
     "final_original_request_reminder": "在完成討論綜合後，務必直接落實並完整回應使用者的原始請求，不要只停留在討論總結。\n使用者的原始請求是：「{{request}}」",

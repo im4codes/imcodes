@@ -48,6 +48,7 @@ export interface PcAppVoicePermissions {
 }
 
 export type PcAppVoiceEvent =
+  | { type: 'loading'; variant?: string }
   | { type: 'start' }
   | { type: 'level'; value: number }
   | { type: 'result'; text: string; isFinal: boolean }
@@ -832,7 +833,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     let loggedFirstLevel = false;
     let loggedFirstResult = false;
     const emitSafe = (payload: PcAppVoiceEvent) => {
-      if (payload.type === 'level' && !loggedFirstLevel && payload.value > 0.01) {
+      if (payload.type === 'loading') {
+        appendVoiceLog(`helper model loading variant=${payload.variant ?? '-'}`);
+      } else if (payload.type === 'level' && !loggedFirstLevel && payload.value > 0.01) {
         loggedFirstLevel = true;
         appendVoiceLog(`first level value=${payload.value.toFixed(4)}`);
       } else if (payload.type === 'result') {

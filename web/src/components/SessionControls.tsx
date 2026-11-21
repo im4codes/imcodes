@@ -2255,6 +2255,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceOverlayAutoStart, setVoiceOverlayAutoStart] = useState(true);
   const [inlineVoiceActive, setInlineVoiceActive] = useState(false);
   const [inlineVoiceRecognizing, setInlineVoiceRecognizing] = useState(false);
+  const [voiceModelLoading, setVoiceModelLoading] = useState(false);
   const [inlineVoiceLevel, setInlineVoiceLevel] = useState(0);
   const [inlineVoicePermissionTarget, setInlineVoicePermissionTarget] = useState<'mic' | 'speech' | null>(null);
   const inlineVoiceActiveRef = useRef(false);
@@ -6247,6 +6248,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return finalizeSend(payload, options);
   }, [clearSendWarning, closeQuickSuggestions, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
 
+  const setVoiceInputModelLoadingHandler = useCallback(
+    (cb: ((loading: boolean, variant?: string) => void) | null) => {
+      if (Object.prototype.hasOwnProperty.call(VoiceInput, 'onModelLoading')) {
+        VoiceInput.onModelLoading?.(cb);
+      }
+    },
+    [],
+  );
+
   const stopInlineVoice = useCallback((options?: {
     abort?: boolean;
     restoreCaret?: boolean;
@@ -6271,9 +6281,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setInlineVoiceActive(false);
       setInlineVoiceRecognizing(false);
       setInlineVoiceLevel(0);
+      setVoiceModelLoading(false);
     }
     if (wasActive) {
       VoiceInput.onAudioLevel(null);
+      setVoiceInputModelLoadingHandler(null);
     }
     const caretTarget = inlineVoiceSegmentRef.current.caretAfterSegment;
     detachInlineVoiceRobotHost(inlineVoiceRobotHostRef.current);
@@ -6497,7 +6509,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setInlineVoiceActive(false);
     setInlineVoiceRecognizing(false);
     setInlineVoiceLevel(0);
+    setVoiceModelLoading(false);
     VoiceInput.onAudioLevel(null);
+    setVoiceInputModelLoadingHandler(null);
     // Detach the robot badge without rewriting root text so browser-inserted edits stay intact.
     detachInlineVoiceRobotHost(inlineVoiceRobotHostRef.current);
     if (wasActive) {
@@ -6547,8 +6561,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setInlineVoiceActive(true);
     setInlineVoiceRecognizing(false);
     setInlineVoiceLevel(0);
+    setVoiceModelLoading(false);
     setInlineVoicePermissionTarget(null);
     primeVoiceInputGesture({ deferAudioPause: false });
+
+    setVoiceInputModelLoadingHandler((loading) => {
+      if (!mountedRef.current || inlineVoiceTokenRef.current !== token || !inlineVoiceActiveRef.current) return;
+      setVoiceModelLoading(loading);
+    });
 
     VoiceInput.onAudioLevel((rawLevel) => {
       if (!mountedRef.current || inlineVoiceTokenRef.current !== token || !inlineVoiceActiveRef.current) return;
@@ -6822,11 +6842,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
     );
     VoiceInput.onAudioLevel(null);
+    setVoiceInputModelLoadingHandler(null);
     if (mountedRef.current) {
       setVoiceHoldPending(false);
       setVoiceHoldLiveAudio(false);
       setVoiceHoldRecognizing(false);
       setVoiceHoldActive(false);
+      setVoiceModelLoading(false);
     }
   }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers]);
 
@@ -7365,6 +7387,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     }, VOICE_HOLD_START_TIMEOUT_MS);
 
+    setVoiceInputModelLoadingHandler((loading) => {
+      if (
+        !mountedRef.current
+        || voiceHoldTxRef.current !== tx
+        || tx.settled
+        || tx.error !== null
+        || (tx.phase !== 'starting' && tx.phase !== 'recording')
+      ) return;
+      setVoiceModelLoading(loading);
+    });
+
     VoiceInput.onAudioLevel((rawLevel) => {
       if (
         !mountedRef.current
@@ -7776,6 +7809,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (voiceHoldActiveRef.current) {
         voiceHoldActiveRef.current = false;
         VoiceInput.onAudioLevel(null);
+        setVoiceInputModelLoadingHandler(null);
+        setVoiceModelLoading(false);
         void VoiceInput.stopListening({ abort: true });
       }
     };
@@ -10364,6 +10399,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       {sendWarning && (
         <div style={{ padding: '4px 12px', fontSize: 12, color: '#fbbf24', background: 'rgba(251,191,36,0.12)', borderRadius: 4, margin: '0 8px 4px', border: '1px solid rgba(251,191,36,0.25)' }}>
           {sendWarning}
+        </div>
+      )}
+
+      {voiceModelLoading && (
+        <div
+          data-testid="voice-model-loading-chip"
+          class="voice-model-loading-chip"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="voice-model-loading-dot" aria-hidden="true" />
+          <span>{t('voice.loading_model')}</span>
         </div>
       )}
 

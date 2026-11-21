@@ -1616,7 +1616,8 @@
     "engine_system": "System Speech",
     "mic_select_label": "Microphone",
     "mic_auto": "Auto (Physical)",
-    "mic_auto_prefix": "Auto"
+    "mic_auto_prefix": "Auto",
+    "loading_model": "Loading speech model…"
   },
   "p2p": {
     "final_original_request_reminder": "After synthesizing the discussion, directly address and fulfill the user's original request instead of stopping at a discussion summary.\nThe original user request is: \"{{request}}\"",

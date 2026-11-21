@@ -1616,7 +1616,8 @@
     "engine_system": "システム標準",
     "mic_select_label": "マイク",
     "mic_auto": "自動（物理マイク）",
-    "mic_auto_prefix": "自動"
+    "mic_auto_prefix": "自動",
+    "loading_model": "音声モデルを読み込み中…"
   },
   "p2p": {
     "final_original_request_reminder": "議論の要約だけで終わらせず、議論を統合した後は必ず元のユーザー依頼に直接対応してください。\n元のユーザー依頼: \"{{request}}\"",

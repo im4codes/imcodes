@@ -191,7 +191,9 @@ function createPcAppSpeechRecognition(bridge: PcAppBridge): NativeSpeechRecognit
     if (ipcUnsub || typeof voice.subscribe !== 'function') return;
     ipcUnsub = voice.subscribe((ev: PcAppVoiceEvent) => {
       if (!ev || typeof ev.type !== 'string') return;
-      if (ev.type === 'start') {
+      if (ev.type === 'loading') {
+        dispatch('listeningState', { status: 'loading', ...(ev.variant ? { variant: ev.variant } : {}) });
+      } else if (ev.type === 'start') {
         dispatch('listeningState', { status: 'started' });
       } else if (ev.type === 'result') {
         dispatch('partialResults', { matches: [ev.text], isFinal: ev.isFinal });
@@ -406,8 +408,16 @@ let _prewarmInFlight: {
   epoch: number;
 } | null = null;
 let _onLevel: ((level: number) => void) | null = null;
+let _onModelLoading: ((loading: boolean, variant?: string) => void) | null = null;
+let _modelLoadingActive = false;
 let _onError: ((error: string) => void) | null = null;
 let _lastError: string | null = null;
+
+function setModelLoadingState(loading: boolean, variant?: string): void {
+  if (!loading && !_modelLoadingActive) return;
+  _modelLoadingActive = loading;
+  _onModelLoading?.(loading, variant);
+}
 
 function clearPrewarmCaches(): void {
   _prewarmCache = null;
@@ -510,6 +520,7 @@ function isRecognitionDownloading(
 
 function reportOwnerError(owner: CaptureOwner | null, error: string): void {
   if (!isOwnerCurrent(owner)) return;
+  setModelLoadingState(false);
   clearPrewarmCaches();
   _lastError = error;
   (owner!.onError ?? _onError)?.(error);
@@ -518,6 +529,7 @@ function reportOwnerError(owner: CaptureOwner | null, error: string): void {
 function retireOwner(owner: CaptureOwner | null): void {
   if (!owner || owner.retired) return;
   if (_activeOwner === owner) {
+    setModelLoadingState(false);
     _listening = false;
     _activeOwner = null;
   }
@@ -584,6 +596,7 @@ async function attachSessionListeners(
   const registrations: Array<readonly [any, (data: any) => void]> = [
     ['partialResults', (data: { matches?: string[]; isFinal?: boolean }) => {
       if (!isSessionLive() || session.final || !data.matches?.length) return;
+      setModelLoadingState(false);
       const text = data.matches[0];
       const final = data.isFinal === true;
       // Native owns committed + unfixed text and emits a cumulative snapshot,
@@ -603,13 +616,19 @@ async function attachSessionListeners(
       if (!isSessionLive() || session.primed || generation !== _generation) return;
       _onLevel?.(data.level ?? 0);
     }],
-    ['listeningState', (data: { status?: string }) => {
+    ['listeningState', (data: { status?: string; variant?: string }) => {
       if (!isSessionLive() || generation !== _generation) return;
+      if (data.status === 'loading') {
+        setModelLoadingState(true, typeof data.variant === 'string' ? data.variant : undefined);
+        return;
+      }
       if (data.status === 'started') {
+        setModelLoadingState(false);
         session.captureStarted = true;
         setOwnerListening(session.owner, true);
         return;
       }
+      setModelLoadingState(false);
       if (session.primed) {
         const hadCapture = session.captureStarted || session.text !== null;
         const bufferedText = session.text;
@@ -2042,6 +2061,7 @@ export async function startListening(
 export async function stopListening(options?: StopListeningOptions): Promise<void> {
   const abort = options?.abort === true;
   _lastStopIntent = ++_intentSeq;
+  setModelLoadingState(false);
   if (!isAvailable()) return;
 
   if (!isNative()) {
@@ -2194,6 +2214,14 @@ export async function stopListening(options?: StopListeningOptions): Promise<voi
 /** Register a callback for real-time audio level (0..1). Call before startListening. */
 export function onAudioLevel(cb: ((level: number) => void) | null): void {
   _onLevel = cb;
+}
+
+/** Register a callback for speech model loading/warming-up state before capture starts. */
+export function onModelLoading(cb: ((loading: boolean, variant?: string) => void) | null): void {
+  _onModelLoading = cb;
+  if (!cb) {
+    _modelLoadingActive = false;
+  }
 }
 
 /** Register a callback for recognition / permission / startup errors. */

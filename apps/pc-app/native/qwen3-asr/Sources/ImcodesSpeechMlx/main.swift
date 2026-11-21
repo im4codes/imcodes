@@ -414,6 +414,7 @@ final class QwenStreamingSession {
         var loadedModel: Qwen3ASRModel?
         var loadError: Error?
         let loadSem = DispatchSemaphore(value: 0)
+        emitJson(["type": "loading", "variant": variant])
         decodeQueue.async {
             do {
                 loadedModel = try Qwen3ASRModel.loadLocal(from: modelDir, modelId: modelId)

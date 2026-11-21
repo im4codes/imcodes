@@ -39,6 +39,7 @@ export interface PcAppVoicePermissions {
 }
 
 export type PcAppVoiceEvent =
+  | { type: 'loading'; variant?: string }
   | { type: 'start' }
   | { type: 'level'; value: number }
   | { type: 'result'; text: string; isFinal: boolean }

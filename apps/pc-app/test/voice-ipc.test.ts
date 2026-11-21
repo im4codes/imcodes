@@ -251,8 +251,9 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       ['listen', '--locale', 'en-US'],
     );
 
-    ctx.spawned.stdout.emit('data', '{"type":"start"}\n{"type":"level","value":0.4}\n{"type":"result","text":"hello world","isFinal":false}\n');
+    ctx.spawned.stdout.emit('data', '{"type":"loading","variant":"0.6b"}\n{"type":"start"}\n{"type":"level","value":0.4}\n{"type":"result","text":"hello world","isFinal":false}\n');
     expect(ctx.sentEvents).toEqual([
+      { type: 'loading', variant: '0.6b' },
       { type: 'start' },
       { type: 'level', value: 0.4 },
       { type: 'result', text: 'hello world', isFinal: false },

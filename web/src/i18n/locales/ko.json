@@ -1616,7 +1616,8 @@
     "engine_system": "시스템 기본",
     "mic_select_label": "마이크",
     "mic_auto": "자동(물리 마이크)",
-    "mic_auto_prefix": "자동"
+    "mic_auto_prefix": "자동",
+    "loading_model": "음성 모델 불러오는 중…"
   },
   "p2p": {
     "final_original_request_reminder": "토론 요약으로 끝내지 말고, 논의를 종합한 뒤에는 반드시 원래 사용자 요청을 직접 완전히 처리하세요.\n원래 사용자 요청: \"{{request}}\"",

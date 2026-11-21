@@ -132,8 +132,17 @@ describe('PC App inline voice dictation and quick permission grant', () => {
       expect(fake.bridge.voice!.startListening).toHaveBeenCalledTimes(1);
     });
     expect(document.body.querySelector('.voice-overlay')).toBeNull();
+    expect(screen.queryByTestId('voice-model-loading-chip')).toBeNull();
+
+    // MLX helper emits 'loading' while warming model -> loading chip appears, then clears on 'start'
+    fake.emit({ type: 'loading', variant: '1.7b' });
+    const loadingChip = await screen.findByTestId('voice-model-loading-chip');
+    expect(loadingChip.textContent).toContain('voice.loading_model');
 
     fake.emit({ type: 'start' });
+    await waitFor(() => {
+      expect(screen.queryByTestId('voice-model-loading-chip')).toBeNull();
+    });
     fake.emit({ type: 'result', text: 'hello pc app', isFinal: false });
     await waitFor(() => {
       expect(readComposerElementText(input)).toBe('hello pc app');
@@ -142,6 +151,18 @@ describe('PC App inline voice dictation and quick permission grant', () => {
     fireEvent.click(micBtn);
     await waitFor(() => {
       expect(fake.bridge.voice!.stopListening).toHaveBeenCalled();
+    });
+
+    // Boundary: stopping while model is still loading clears the loading chip immediately
+    fireEvent.click(micBtn);
+    await waitFor(() => {
+      expect(fake.bridge.voice!.startListening).toHaveBeenCalledTimes(2);
+    });
+    fake.emit({ type: 'loading', variant: '0.6b' });
+    await screen.findByTestId('voice-model-loading-chip');
+    fireEvent.click(micBtn);
+    await waitFor(() => {
+      expect(screen.queryByTestId('voice-model-loading-chip')).toBeNull();
     });
   });
 
