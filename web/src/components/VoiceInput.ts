@@ -322,7 +322,7 @@ export const NATIVE_PREWARM_CALL_TIMEOUT_MS = 3_500;
 /** Upper bound for interactive native OS permission requests. */
 export const NATIVE_PERMISSION_TIMEOUT_MS = 15_000;
 /** Upper bound for native `recognition.start()` before falling back or failing out of `'starting'`. */
-export const NATIVE_START_TIMEOUT_MS = 8_000;
+export const NATIVE_START_TIMEOUT_MS = 15_000;
 /** Upper bound for normal native `stop()` drain (>15s so legitimate slow drains pass without timing out). */
 export const NATIVE_STOP_DRAIN_MS = 20_000;
 /** Upper bound waiting for Web Speech `onstart`/`onaudiostart`/`onresult` after `rec.start()`. */
@@ -481,15 +481,21 @@ function canSessionStopRecognition(
 function stopRecognitionOnceIfOwned(
   session: NativeSession,
   targetRecognition: NativeSpeechRecognition,
-): void {
-  if (!canSessionStopRecognition(session, targetRecognition)) return;
+): Promise<void> {
+  if (!canSessionStopRecognition(session, targetRecognition)) return Promise.resolve();
   let stopped = _stoppedSessionRecognitions.get(session);
   if (!stopped) {
     stopped = new WeakSet<NativeSpeechRecognition>();
     _stoppedSessionRecognitions.set(session, stopped);
   }
   stopped.add(targetRecognition);
-  void Promise.resolve(targetRecognition.stop()).catch(() => {});
+  return Promise.resolve(targetRecognition.stop()).catch(() => {});
+}
+
+function isRecognitionAvailabilityReady(
+  status: { available?: boolean; downloading?: boolean } | null | undefined,
+): boolean {
+  return Boolean(status?.available) && !status?.downloading;
 }
 
 function reportOwnerError(owner: CaptureOwner | null, error: string): void {
@@ -860,7 +866,7 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
         NATIVE_PREWARM_CALL_TIMEOUT_MS,
         'Availability check timed out',
       ).catch(() => ({ available: false }));
-      let effective: NativeSpeechRecognition | null = available?.available ? recognition : null;
+      let effective: NativeSpeechRecognition | null = isRecognitionAvailabilityReady(available) ? recognition : null;
       if (!effective && (permissionGranted || requestPermission)) {
         effective = await resolveUsableFallbackRecognizer(recognition, requestPermission);
         if (effective) {
@@ -1021,7 +1027,7 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
           retireOwner(session.owner);
           return false;
         }
-        if (!available?.available) {
+        if (!isRecognitionAvailabilityReady(available)) {
           keepPrimaryListeners = false;
           await cleanupSessionListeners(session);
           const fallback = await resolveUsableFallbackRecognizer(recognition);
@@ -1100,14 +1106,25 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
         return false;
       }
       clearPrewarmCaches();
-      if (startErr instanceof VoiceTimeoutError) {
-        stopRecognitionOnceIfOwned(session, recognition);
-      }
+      const timedOutPrimary = startErr instanceof VoiceTimeoutError;
+      const stopPrimaryPromise = timedOutPrimary
+        ? stopRecognitionOnceIfOwned(session, recognition)
+        : null;
       const startMsg = startErr instanceof Error ? startErr.message : String(startErr ?? '');
       if (!/permission|denied|not allowed/i.test(startMsg)) {
         const fallback = await resolveUsableFallbackRecognizer(recognition);
         if (fallback && isSessionStarting()) {
           console.warn('[voice] custom offline speech start failed, falling back to platform recognizer:', startMsg);
+          await withTimeout(
+            stopPrimaryPromise ?? stopRecognitionOnceIfOwned(session, recognition),
+            NATIVE_PREWARM_CALL_TIMEOUT_MS,
+            'Timed out stopping failed recognizer before fallback',
+          ).catch(() => {});
+          if (!isSessionStarting()) {
+            await cleanupSessionListeners(session);
+            if (_nativeSession === session) _nativeSession = null;
+            return false;
+          }
           await cleanupSessionListeners(session);
           recognition = fallback;
           session.recognition = fallback;

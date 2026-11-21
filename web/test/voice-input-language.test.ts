@@ -207,6 +207,38 @@ describe('multilingual plugin session ownership', () => {
       }
     }
   });
+
+  it('uses a 15s native start timeout, falls back immediately while downloading, and awaits primary stop before starting fallback', async () => {
+    expect(input.NATIVE_START_TIMEOUT_MS).toBe(15_000);
+
+    // 1. When StreamingSpeech reports downloading=true / available=false, fall back immediately without waiting on StreamingSpeech.start()
+    bridges.streaming.available.mockResolvedValueOnce({ available: false, downloading: true, progress: 0.42 } as any);
+    bridges.platform.available.mockResolvedValueOnce({ available: true });
+    expect(await input.startListening(vi.fn())).toBe(true);
+    expect(bridges.streaming.start).not.toHaveBeenCalled();
+    expect(bridges.platform.start).toHaveBeenCalledTimes(1);
+    await input.stopListening();
+
+    // 2. When StreamingSpeech.start() times out at 15s, fallback must wait for StreamingSpeech.stop() before starting platform recognizer
+    vi.useFakeTimers();
+    try {
+      let releasePrimaryStop!: () => void;
+      bridges.streaming.start.mockReturnValueOnce(new Promise(() => {}));
+      bridges.streaming.stop.mockReturnValueOnce(new Promise<void>((resolve) => { releasePrimaryStop = resolve; }));
+      bridges.platform.available.mockResolvedValueOnce({ available: true });
+
+      const startPromise = input.startListening(vi.fn());
+      await vi.advanceTimersByTimeAsync(input.NATIVE_START_TIMEOUT_MS);
+      await vi.waitFor(() => expect(bridges.streaming.stop).toHaveBeenCalledTimes(1));
+      expect(bridges.platform.start).toHaveBeenCalledTimes(1);
+
+      releasePrimaryStop();
+      await expect(startPromise).resolves.toBe(true);
+      expect(bridges.platform.start).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 function read(relative: string): string { return readFileSync(new URL(relative, import.meta.url), 'utf8'); }

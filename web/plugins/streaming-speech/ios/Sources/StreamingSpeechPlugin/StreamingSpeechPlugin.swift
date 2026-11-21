@@ -810,7 +810,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
 
     private func warmUpRecognizerOnWorkerIfIdle() {
         coordinator.worker.async { [weak self] in
-            guard let self = self, let recognizer = self.ensureRecognizer() else { return }
+            guard let self = self,
+                  !self.coordinator.isBackgrounded,
+                  !self.coordinator.hasActiveCapture,
+                  let recognizer = self.ensureRecognizer() else { return }
             recognizer.warmupMetalIfNeeded { [weak self] in
                 guard let self = self else { return false }
                 return !self.coordinator.isBackgrounded && !self.coordinator.hasActiveCapture
@@ -919,13 +922,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             let backgrounded = UIApplication.shared.applicationState == .background
             self.coordinator.setBackgrounded(backgrounded)
             if !backgrounded && self.modelAvailable {
-                self.coordinator.worker.async { [weak self] in
-                    guard let self = self, let recognizer = self.ensureRecognizer() else { return }
-                    recognizer.warmupMetalIfNeeded { [weak self] in
-                        guard let self = self else { return false }
-                        return !self.coordinator.isBackgrounded && !self.coordinator.hasActiveCapture
-                    }
-                }
+                self.warmUpRecognizerOnWorkerIfIdle()
             }
             self.audioQueue.async { [weak self] in
                 self?.prewarmAudioOnAudioQueue()
@@ -1184,7 +1181,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             }
             self.cancelWarmupWatchdog()
             self.warmupWatchdog = watchdog
-            DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: watchdog)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0, execute: watchdog)
 
             self.audioQueue.async { [weak self] in
                 guard let self = self else { return }
