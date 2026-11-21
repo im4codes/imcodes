@@ -1652,6 +1652,609 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
     }
 }
 
+// MARK: - Shared Recognizer Store & Watch External ASR Bridge
+
+final class SharedSpeechRecognizerStore {
+    static let shared = SharedSpeechRecognizerStore()
+    private let lock = NSLock()
+    private var cachedRecognizer: SpeechRecognizer?
+    private var phoneCaptureActive = false
+
+    private init() {}
+
+    var modelRoot: URL? {
+        Bundle.module.resourceURL?.appendingPathComponent("ios-models", isDirectory: true)
+    }
+
+    var hasRequiredModelFiles: Bool {
+        guard let root = modelRoot else { return false }
+        return ["config.json", "model.safetensors", "vocab.json", "merges.txt", "tokenizer_config.json", "hotwords.txt"].allSatisfy {
+            FileManager.default.isReadableFile(atPath: root.appendingPathComponent($0).path)
+        }
+    }
+
+    var modelAvailable: Bool {
+        SpeechRecognizer.isMetalSupported && hasRequiredModelFiles
+    }
+
+    func ensureRecognizer() -> SpeechRecognizer? {
+        lock.lock(); defer { lock.unlock() }
+        if let existing = cachedRecognizer { return existing }
+        guard modelAvailable, let root = modelRoot, let created = SpeechRecognizer(root: root) else { return nil }
+        cachedRecognizer = created
+        return created
+    }
+
+    func clearInferenceCaches() {
+        lock.lock()
+        let existing = cachedRecognizer
+        lock.unlock()
+        existing?.model.clearInferenceCaches()
+        Qwen3ASRModel.clearMetalCache()
+    }
+
+    func setPhoneCaptureActive(_ active: Bool) {
+        lock.lock()
+        phoneCaptureActive = active
+        lock.unlock()
+    }
+
+    var isPhoneCaptureActive: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return phoneCaptureActive
+    }
+}
+
+public struct WatchAsrUpdate: Equatable {
+    public let streamId: String
+    public let text: String
+    public let isFinal: Bool
+    public let errorCode: String?
+    public let errorMessage: String?
+
+    public init(
+        streamId: String,
+        text: String,
+        isFinal: Bool,
+        errorCode: String? = nil,
+        errorMessage: String? = nil
+    ) {
+        self.streamId = streamId
+        self.text = text
+        self.isFinal = isFinal
+        self.errorCode = errorCode
+        self.errorMessage = errorMessage
+    }
+}
+
+public enum WatchAsrError: Error, Equatable {
+    case invalidStreamId
+    case modelNotReady
+    case phoneMicBusy
+    case phoneBackgrounded
+    case invalidAudioFormat
+
+    public var code: String {
+        switch self {
+        case .invalidStreamId: return "invalid_stream_id"
+        case .modelNotReady: return "model_not_ready"
+        case .phoneMicBusy: return "phone_mic_busy"
+        case .phoneBackgrounded: return "phone_backgrounded"
+        case .invalidAudioFormat: return "invalid_audio_format"
+        }
+    }
+
+    public var message: String {
+        switch self {
+        case .invalidStreamId: return "Invalid Watch audio stream id"
+        case .modelNotReady: return "Offline speech model is not ready on iPhone"
+        case .phoneMicBusy: return "iPhone microphone session is active"
+        case .phoneBackgrounded: return "Open IM.codes on iPhone for live transcription"
+        case .invalidAudioFormat: return "Unsupported Watch audio format (expected 16kHz mono PCM16)"
+        }
+    }
+}
+
+/// Public Swift bridge allowing host app extensions (such as WatchConnectivity)
+/// to stream 16kHz mono PCM16 audio through the shared resident Qwen3-ASR engine
+/// while serializing GPU/capture ownership with the iPhone Capacitor plugin.
+public final class WatchAsrBridge {
+    public static let shared = WatchAsrBridge()
+
+    private struct ActiveExternalStream {
+        let streamId: String
+        let owner: UInt64
+        let coordinator: SpeechCoordinator
+        let onUpdate: (WatchAsrUpdate) -> Void
+        var cancelled: Bool
+    }
+
+    private let lock = NSLock()
+    private let emitQueue = DispatchQueue(label: "com.imcodes.watch-asr.emit", qos: .userInitiated)
+    private var activeStream: ActiveExternalStream?
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleWillResignOrBackground),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleWillResignOrBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    public var isModelAvailable: Bool {
+        SharedSpeechRecognizerStore.shared.modelAvailable
+    }
+
+    public var isPhoneMicBusy: Bool {
+        SharedSpeechRecognizerStore.shared.isPhoneCaptureActive
+    }
+
+    private static func isAppBackgroundedOnMain() -> Bool {
+        if Thread.isMainThread {
+            return UIApplication.shared.applicationState == .background
+        }
+        return DispatchQueue.main.sync {
+            UIApplication.shared.applicationState == .background
+        }
+    }
+
+    @objc private func handleWillResignOrBackground() {
+        lock.lock()
+        let coordinator = activeStream?.coordinator
+        lock.unlock()
+        coordinator?.setBackgrounded(true)
+    }
+
+    @objc private func handleDidBecomeActive() {
+        lock.lock()
+        let coordinator = activeStream?.coordinator
+        lock.unlock()
+        coordinator?.setBackgrounded(false)
+    }
+
+    @discardableResult
+    public func startExternalStream(
+        streamId: String,
+        language: String? = nil,
+        onUpdate: @escaping (WatchAsrUpdate) -> Void
+    ) -> Result<Void, WatchAsrError> {
+        guard !streamId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .failure(.invalidStreamId)
+        }
+        guard !SharedSpeechRecognizerStore.shared.isPhoneCaptureActive else {
+            return .failure(.phoneMicBusy)
+        }
+        guard !Self.isAppBackgroundedOnMain() else {
+            return .failure(.phoneBackgrounded)
+        }
+        guard SharedSpeechRecognizerStore.shared.modelAvailable else {
+            return .failure(.modelNotReady)
+        }
+
+        // Supersede any abandoned Watch stream cleanly.
+        cancelExternalStream()
+
+        let resolvedLanguage = Qwen3LanguageMapper.resolve(language)
+        var capturedOwner: UInt64 = 0
+        let coordinator = SpeechCoordinator(
+            worker: SpeechCoordinator.sharedMlxWorker,
+            emitQueue: emitQueue
+        ) { [weak self] event in
+            self?.handleCoordinatorEvent(event, streamId: streamId, owner: capturedOwner)
+        }
+
+        let owner = coordinator.beginStart(
+            warmupSamples: 0,
+            makeDecode: {
+                guard let recognizer = SharedSpeechRecognizerStore.shared.ensureRecognizer(),
+                      let decoder = SpeechDecoder(recognizer: recognizer, language: resolvedLanguage) else {
+                    return nil
+                }
+                return SpeechCoordinator.Decoder(
+                    decode: { samples, prefixTokens, shouldContinue in
+                        decoder.decode(samples: samples, prefixTokens: prefixTokens, shouldContinue: shouldContinue)
+                    },
+                    rollbackPrefix: { tokens, rollbackCount in
+                        decoder.rollbackPrefix(tokens, rollbackCount: rollbackCount)
+                    }
+                )
+            },
+            onStartReady: {},
+            onSetupFailureTeardown: { [weak self] in
+                self?.cancelExternalStream(
+                    streamId: streamId,
+                    reason: WatchAsrError.modelNotReady.message,
+                    code: WatchAsrError.modelNotReady.code
+                )
+            }
+        )
+        capturedOwner = owner
+
+        lock.lock()
+        activeStream = ActiveExternalStream(
+            streamId: streamId,
+            owner: owner,
+            coordinator: coordinator,
+            onUpdate: onUpdate,
+            cancelled: false
+        )
+        lock.unlock()
+
+        coordinator.setBackgrounded(Self.isAppBackgroundedOnMain())
+        coordinator.markStarted(owner: owner)
+        return .success(())
+    }
+
+    public func appendExternalPcm16(streamId: String, data: Data, isFinal: Bool) {
+        lock.lock()
+        guard let current = activeStream, current.streamId == streamId, !current.cancelled else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        let samples = Self.decodePcm16LittleEndian(data)
+        if !samples.isEmpty {
+            current.coordinator.offerSamples(
+                samples,
+                owner: current.owner,
+                onOverloadTeardown: { [weak self] in
+                    self?.cancelExternalStream(
+                        streamId: streamId,
+                        reason: "Offline speech processing overloaded",
+                        code: "asr_overload"
+                    )
+                }
+            )
+        }
+
+        if isFinal {
+            current.coordinator.endCapture(stopAudio: {})
+            SpeechCoordinator.sharedMlxWorker.async {
+                SharedSpeechRecognizerStore.shared.clearInferenceCaches()
+            }
+        }
+    }
+
+    public func cancelExternalStream(
+        streamId: String? = nil,
+        reason: String? = nil,
+        code: String? = nil
+    ) {
+        lock.lock()
+        guard var current = activeStream else {
+            lock.unlock()
+            return
+        }
+        if let streamId, current.streamId != streamId {
+            lock.unlock()
+            return
+        }
+        current.cancelled = true
+        activeStream = nil
+        lock.unlock()
+
+        current.coordinator.endCapture(stopAudio: {})
+        SpeechCoordinator.sharedMlxWorker.async {
+            SharedSpeechRecognizerStore.shared.clearInferenceCaches()
+        }
+
+        if let reason, !reason.isEmpty {
+            let update = WatchAsrUpdate(
+                streamId: current.streamId,
+                text: "",
+                isFinal: true,
+                errorCode: code ?? "asr_cancelled",
+                errorMessage: reason
+            )
+            emitQueue.async {
+                current.onUpdate(update)
+            }
+        }
+    }
+
+    public func transcribeExternalFile(
+        streamId: String,
+        fileURL: URL,
+        language: String? = nil,
+        completion: @escaping (WatchAsrUpdate) -> Void
+    ) {
+        guard !streamId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            completion(WatchAsrUpdate(
+                streamId: streamId,
+                text: "",
+                isFinal: true,
+                errorCode: WatchAsrError.invalidStreamId.code,
+                errorMessage: WatchAsrError.invalidStreamId.message
+            ))
+            return
+        }
+        guard !SharedSpeechRecognizerStore.shared.isPhoneCaptureActive else {
+            completion(WatchAsrUpdate(
+                streamId: streamId,
+                text: "",
+                isFinal: true,
+                errorCode: WatchAsrError.phoneMicBusy.code,
+                errorMessage: WatchAsrError.phoneMicBusy.message
+            ))
+            return
+        }
+        guard !Self.isAppBackgroundedOnMain() else {
+            completion(WatchAsrUpdate(
+                streamId: streamId,
+                text: "",
+                isFinal: true,
+                errorCode: WatchAsrError.phoneBackgrounded.code,
+                errorMessage: WatchAsrError.phoneBackgrounded.message
+            ))
+            return
+        }
+        guard SharedSpeechRecognizerStore.shared.modelAvailable else {
+            completion(WatchAsrUpdate(
+                streamId: streamId,
+                text: "",
+                isFinal: true,
+                errorCode: WatchAsrError.modelNotReady.code,
+                errorMessage: WatchAsrError.modelNotReady.message
+            ))
+            return
+        }
+        guard let rawData = try? Data(contentsOf: fileURL),
+              let extracted = Self.extractPcm16FromWavOrRaw(rawData),
+              extracted.sampleRate == SpeechWindow.sampleRate,
+              extracted.channels == 1 else {
+            completion(WatchAsrUpdate(
+                streamId: streamId,
+                text: "",
+                isFinal: true,
+                errorCode: WatchAsrError.invalidAudioFormat.code,
+                errorMessage: WatchAsrError.invalidAudioFormat.message
+            ))
+            return
+        }
+
+        let samples = Self.decodePcm16LittleEndian(extracted.pcm16)
+        guard !samples.isEmpty else {
+            completion(WatchAsrUpdate(streamId: streamId, text: "", isFinal: true))
+            return
+        }
+
+        let resolvedLanguage = Qwen3LanguageMapper.resolve(language)
+        SpeechCoordinator.sharedMlxWorker.async {
+            guard !SharedSpeechRecognizerStore.shared.isPhoneCaptureActive else {
+                self.emitQueue.async {
+                    completion(WatchAsrUpdate(
+                        streamId: streamId,
+                        text: "",
+                        isFinal: true,
+                        errorCode: WatchAsrError.phoneMicBusy.code,
+                        errorMessage: WatchAsrError.phoneMicBusy.message
+                    ))
+                }
+                return
+            }
+            guard !Self.isAppBackgroundedOnMain() else {
+                self.emitQueue.async {
+                    completion(WatchAsrUpdate(
+                        streamId: streamId,
+                        text: "",
+                        isFinal: true,
+                        errorCode: WatchAsrError.phoneBackgrounded.code,
+                        errorMessage: WatchAsrError.phoneBackgrounded.message
+                    ))
+                }
+                return
+            }
+            guard let recognizer = SharedSpeechRecognizerStore.shared.ensureRecognizer(),
+                  let decoder = SpeechDecoder(recognizer: recognizer, language: resolvedLanguage) else {
+                self.emitQueue.async {
+                    completion(WatchAsrUpdate(
+                        streamId: streamId,
+                        text: "",
+                        isFinal: true,
+                        errorCode: WatchAsrError.modelNotReady.code,
+                        errorMessage: WatchAsrError.modelNotReady.message
+                    ))
+                }
+                return
+            }
+
+            defer {
+                SharedSpeechRecognizerStore.shared.clearInferenceCaches()
+            }
+
+            var gain = SpeechGain()
+            var window = SpeechWindow()
+            let chunkSize = SpeechWindow.sampleRate * 2 // 2s chunks matching Qwen3-ASR stride
+            var offset = 0
+            do {
+                while offset < samples.count {
+                    let end = min(samples.count, offset + chunkSize)
+                    let slice = Array(samples[offset..<end])
+                    let processed = gain.process(slice)
+                    let isLast = end >= samples.count
+                    try window.append(
+                        processed.samples,
+                        speech: processed.anyVoiced || !window.samples.isEmpty,
+                        trailingSilence: processed.trailingUnvoicedSamples,
+                        activeSamples: processed.voicedSamples,
+                        noiseFloorRMS: processed.noiseFloorRMS,
+                        final: isLast,
+                        shouldEmitNonFinal: { !isLast && !Self.isAppBackgroundedOnMain() },
+                        shouldContinue: { !Self.isAppBackgroundedOnMain() },
+                        rollbackPrefix: { tokens, rollbackCount in
+                            decoder.rollbackPrefix(tokens, rollbackCount: rollbackCount)
+                        },
+                        decode: { segSamples, prefixTokens in
+                            decoder.decode(samples: segSamples, prefixTokens: prefixTokens) {
+                                !Self.isAppBackgroundedOnMain()
+                            }
+                        }
+                    ) { _ in }
+                    offset = end
+                }
+                let finalText = try window.finish(
+                    shouldContinue: { !Self.isAppBackgroundedOnMain() },
+                    rollbackPrefix: { tokens, rollbackCount in
+                        decoder.rollbackPrefix(tokens, rollbackCount: rollbackCount)
+                    }
+                ) { segSamples, prefixTokens in
+                    decoder.decode(samples: segSamples, prefixTokens: prefixTokens) {
+                        !Self.isAppBackgroundedOnMain()
+                    }
+                }
+                self.emitQueue.async {
+                    completion(WatchAsrUpdate(streamId: streamId, text: finalText, isFinal: true))
+                }
+            } catch SpeechWindow.Failure.cancelled {
+                self.emitQueue.async {
+                    completion(WatchAsrUpdate(
+                        streamId: streamId,
+                        text: window.text,
+                        isFinal: true,
+                        errorCode: WatchAsrError.phoneBackgrounded.code,
+                        errorMessage: WatchAsrError.phoneBackgrounded.message
+                    ))
+                }
+            } catch {
+                self.emitQueue.async {
+                    completion(WatchAsrUpdate(
+                        streamId: streamId,
+                        text: window.text,
+                        isFinal: true,
+                        errorCode: "asr_decode_failed",
+                        errorMessage: "Offline speech file decoding failed"
+                    ))
+                }
+            }
+        }
+    }
+
+    private func handleCoordinatorEvent(_ event: SpeechCoordinator.Event, streamId: String, owner: UInt64) {
+        lock.lock()
+        guard let current = activeStream,
+              current.streamId == streamId,
+              current.owner == owner,
+              !current.cancelled else {
+            lock.unlock()
+            return
+        }
+        let callback = current.onUpdate
+        switch event {
+        case .partial(let text):
+            lock.unlock()
+            callback(WatchAsrUpdate(streamId: streamId, text: text, isFinal: false))
+        case .final(let text):
+            activeStream = nil
+            lock.unlock()
+            callback(WatchAsrUpdate(streamId: streamId, text: text, isFinal: true))
+        case .error(let message):
+            activeStream = nil
+            lock.unlock()
+            callback(WatchAsrUpdate(
+                streamId: streamId,
+                text: "",
+                isFinal: true,
+                errorCode: "asr_error",
+                errorMessage: message
+            ))
+        case .started, .stopped, .audioLevel:
+            lock.unlock()
+        }
+    }
+
+    public static func decodePcm16LittleEndian(_ data: Data) -> [Float] {
+        let sampleCount = data.count / MemoryLayout<Int16>.size
+        guard sampleCount > 0 else { return [] }
+        var out = [Float]()
+        out.reserveCapacity(sampleCount)
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            let bytePtr = base.assumingMemoryBound(to: UInt8.self)
+            for i in 0..<sampleCount {
+                let offset = i * 2
+                let lo = UInt16(bytePtr[offset])
+                let hi = UInt16(bytePtr[offset + 1]) << 8
+                let sample = Int16(bitPattern: lo | hi)
+                out.append(Float(sample) / 32768.0)
+            }
+        }
+        return out
+    }
+
+    public static func extractPcm16FromWavOrRaw(_ data: Data) -> (sampleRate: Int, channels: Int, pcm16: Data)? {
+        guard data.count >= 12,
+              String(data: data.subdata(in: 0..<4), encoding: .ascii) == "RIFF",
+              String(data: data.subdata(in: 8..<12), encoding: .ascii) == "WAVE" else {
+            guard !data.isEmpty else { return nil }
+            return (SpeechWindow.sampleRate, 1, data)
+        }
+
+        func readUInt16LE(_ offset: Int) -> UInt16 {
+            UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
+        }
+        func readUInt32LE(_ offset: Int) -> UInt32 {
+            UInt32(data[offset])
+                | (UInt32(data[offset + 1]) << 8)
+                | (UInt32(data[offset + 2]) << 16)
+                | (UInt32(data[offset + 3]) << 24)
+        }
+
+        var offset = 12
+        var sampleRate: Int?
+        var channels: Int?
+        var bitsPerSample: Int?
+        var audioFormat: UInt16?
+        var pcmData: Data?
+
+        while offset + 8 <= data.count {
+            let chunkId = String(data: data.subdata(in: offset..<(offset + 4)), encoding: .ascii) ?? ""
+            let chunkSize = Int(readUInt32LE(offset + 4))
+            let payloadStart = offset + 8
+            guard chunkSize >= 0, payloadStart <= data.count else { break }
+            let payloadEnd = min(data.count, payloadStart + chunkSize)
+
+            if chunkId == "fmt " && payloadEnd - payloadStart >= 16 {
+                audioFormat = readUInt16LE(payloadStart)
+                channels = Int(readUInt16LE(payloadStart + 2))
+                sampleRate = Int(readUInt32LE(payloadStart + 4))
+                bitsPerSample = Int(readUInt16LE(payloadStart + 14))
+            } else if chunkId == "data" {
+                pcmData = data.subdata(in: payloadStart..<payloadEnd)
+            }
+
+            let paddedSize = chunkSize + (chunkSize & 1)
+            offset = payloadStart + paddedSize
+        }
+
+        guard audioFormat == 1,
+              bitsPerSample == 16,
+              let sr = sampleRate,
+              let ch = channels,
+              let pcm = pcmData else {
+            return nil
+        }
+        return (sr, ch, pcm)
+    }
+}
+
 // Resident MLX Metal GPU Qwen3-ASR recognizer; all decode calls stay on the
 // plugin's serial worker and remain guarded against background Metal submission.
 final class SpeechRecognizer {
@@ -2513,608 +3116,5 @@ struct SpeechInbox {
         )
         pending = []; speech = false; trailingSilence = 0; activeSamples = 0
         return batch
-    }
-}
-
-// MARK: - Shared Recognizer Store & Watch External ASR Bridge
-
-final class SharedSpeechRecognizerStore {
-    static let shared = SharedSpeechRecognizerStore()
-    private let lock = NSLock()
-    private var cachedRecognizer: SpeechRecognizer?
-    private var phoneCaptureActive = false
-
-    private init() {}
-
-    var modelRoot: URL? {
-        Bundle.module.resourceURL?.appendingPathComponent("ios-models", isDirectory: true)
-    }
-
-    var hasRequiredModelFiles: Bool {
-        guard let root = modelRoot else { return false }
-        return ["config.json", "model.safetensors", "vocab.json", "merges.txt", "tokenizer_config.json", "hotwords.txt"].allSatisfy {
-            FileManager.default.isReadableFile(atPath: root.appendingPathComponent($0).path)
-        }
-    }
-
-    var modelAvailable: Bool {
-        SpeechRecognizer.isMetalSupported && hasRequiredModelFiles
-    }
-
-    func ensureRecognizer() -> SpeechRecognizer? {
-        lock.lock(); defer { lock.unlock() }
-        if let existing = cachedRecognizer { return existing }
-        guard modelAvailable, let root = modelRoot, let created = SpeechRecognizer(root: root) else { return nil }
-        cachedRecognizer = created
-        return created
-    }
-
-    func clearInferenceCaches() {
-        lock.lock()
-        let existing = cachedRecognizer
-        lock.unlock()
-        existing?.model.clearInferenceCaches()
-        Qwen3ASRModel.clearMetalCache()
-    }
-
-    func setPhoneCaptureActive(_ active: Bool) {
-        lock.lock()
-        phoneCaptureActive = active
-        lock.unlock()
-    }
-
-    var isPhoneCaptureActive: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return phoneCaptureActive
-    }
-}
-
-public struct WatchAsrUpdate: Equatable {
-    public let streamId: String
-    public let text: String
-    public let isFinal: Bool
-    public let errorCode: String?
-    public let errorMessage: String?
-
-    public init(
-        streamId: String,
-        text: String,
-        isFinal: Bool,
-        errorCode: String? = nil,
-        errorMessage: String? = nil
-    ) {
-        self.streamId = streamId
-        self.text = text
-        self.isFinal = isFinal
-        self.errorCode = errorCode
-        self.errorMessage = errorMessage
-    }
-}
-
-public enum WatchAsrError: Error, Equatable {
-    case invalidStreamId
-    case modelNotReady
-    case phoneMicBusy
-    case phoneBackgrounded
-    case invalidAudioFormat
-
-    public var code: String {
-        switch self {
-        case .invalidStreamId: return "invalid_stream_id"
-        case .modelNotReady: return "model_not_ready"
-        case .phoneMicBusy: return "phone_mic_busy"
-        case .phoneBackgrounded: return "phone_backgrounded"
-        case .invalidAudioFormat: return "invalid_audio_format"
-        }
-    }
-
-    public var message: String {
-        switch self {
-        case .invalidStreamId: return "Invalid Watch audio stream id"
-        case .modelNotReady: return "Offline speech model is not ready on iPhone"
-        case .phoneMicBusy: return "iPhone microphone session is active"
-        case .phoneBackgrounded: return "Open IM.codes on iPhone for live transcription"
-        case .invalidAudioFormat: return "Unsupported Watch audio format (expected 16kHz mono PCM16)"
-        }
-    }
-}
-
-/// Public Swift bridge allowing host app extensions (such as WatchConnectivity)
-/// to stream 16kHz mono PCM16 audio through the shared resident Qwen3-ASR engine
-/// while serializing GPU/capture ownership with the iPhone Capacitor plugin.
-public final class WatchAsrBridge {
-    public static let shared = WatchAsrBridge()
-
-    private struct ActiveExternalStream {
-        let streamId: String
-        let owner: UInt64
-        let coordinator: SpeechCoordinator
-        let onUpdate: (WatchAsrUpdate) -> Void
-        var cancelled: Bool
-    }
-
-    private let lock = NSLock()
-    private let emitQueue = DispatchQueue(label: "com.imcodes.watch-asr.emit", qos: .userInitiated)
-    private var activeStream: ActiveExternalStream?
-
-    private init() {
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleWillResignOrBackground),
-            name: UIApplication.willResignActiveNotification,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleWillResignOrBackground),
-            name: UIApplication.didEnterBackgroundNotification,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleDidBecomeActive),
-            name: UIApplication.didBecomeActiveNotification,
-            object: nil
-        )
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-    }
-
-    public var isModelAvailable: Bool {
-        SharedSpeechRecognizerStore.shared.modelAvailable
-    }
-
-    public var isPhoneMicBusy: Bool {
-        SharedSpeechRecognizerStore.shared.isPhoneCaptureActive
-    }
-
-    private static func isAppBackgroundedOnMain() -> Bool {
-        if Thread.isMainThread {
-            return UIApplication.shared.applicationState == .background
-        }
-        return DispatchQueue.main.sync {
-            UIApplication.shared.applicationState == .background
-        }
-    }
-
-    @objc private func handleWillResignOrBackground() {
-        lock.lock()
-        let coordinator = activeStream?.coordinator
-        lock.unlock()
-        coordinator?.setBackgrounded(true)
-    }
-
-    @objc private func handleDidBecomeActive() {
-        lock.lock()
-        let coordinator = activeStream?.coordinator
-        lock.unlock()
-        coordinator?.setBackgrounded(false)
-    }
-
-    @discardableResult
-    public func startExternalStream(
-        streamId: String,
-        language: String? = nil,
-        onUpdate: @escaping (WatchAsrUpdate) -> Void
-    ) -> Result<Void, WatchAsrError> {
-        guard !streamId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .failure(.invalidStreamId)
-        }
-        guard !SharedSpeechRecognizerStore.shared.isPhoneCaptureActive else {
-            return .failure(.phoneMicBusy)
-        }
-        guard !Self.isAppBackgroundedOnMain() else {
-            return .failure(.phoneBackgrounded)
-        }
-        guard SharedSpeechRecognizerStore.shared.modelAvailable else {
-            return .failure(.modelNotReady)
-        }
-
-        // Supersede any abandoned Watch stream cleanly.
-        cancelExternalStream()
-
-        let resolvedLanguage = Qwen3LanguageMapper.resolve(language)
-        var capturedOwner: UInt64 = 0
-        let coordinator = SpeechCoordinator(
-            worker: SpeechCoordinator.sharedMlxWorker,
-            emitQueue: emitQueue
-        ) { [weak self] event in
-            self?.handleCoordinatorEvent(event, streamId: streamId, owner: capturedOwner)
-        }
-
-        let owner = coordinator.beginStart(
-            warmupSamples: 0,
-            makeDecode: {
-                guard let recognizer = SharedSpeechRecognizerStore.shared.ensureRecognizer(),
-                      let decoder = SpeechDecoder(recognizer: recognizer, language: resolvedLanguage) else {
-                    return nil
-                }
-                return SpeechCoordinator.Decoder(
-                    decode: { samples, prefixTokens, shouldContinue in
-                        decoder.decode(samples: samples, prefixTokens: prefixTokens, shouldContinue: shouldContinue)
-                    },
-                    rollbackPrefix: { tokens, rollbackCount in
-                        decoder.rollbackPrefix(tokens, rollbackCount: rollbackCount)
-                    }
-                )
-            },
-            onStartReady: {},
-            onSetupFailureTeardown: { [weak self] in
-                self?.cancelExternalStream(
-                    streamId: streamId,
-                    reason: WatchAsrError.modelNotReady.message,
-                    code: WatchAsrError.modelNotReady.code
-                )
-            }
-        )
-        capturedOwner = owner
-
-        lock.lock()
-        activeStream = ActiveExternalStream(
-            streamId: streamId,
-            owner: owner,
-            coordinator: coordinator,
-            onUpdate: onUpdate,
-            cancelled: false
-        )
-        lock.unlock()
-
-        coordinator.setBackgrounded(Self.isAppBackgroundedOnMain())
-        coordinator.markStarted(owner: owner)
-        return .success(())
-    }
-
-    public func appendExternalPcm16(streamId: String, data: Data, isFinal: Bool) {
-        lock.lock()
-        guard let current = activeStream, current.streamId == streamId, !current.cancelled else {
-            lock.unlock()
-            return
-        }
-        lock.unlock()
-
-        let samples = Self.decodePcm16LittleEndian(data)
-        if !samples.isEmpty {
-            current.coordinator.offerSamples(
-                samples,
-                owner: current.owner,
-                onOverloadTeardown: { [weak self] in
-                    self?.cancelExternalStream(
-                        streamId: streamId,
-                        reason: "Offline speech processing overloaded",
-                        code: "asr_overload"
-                    )
-                }
-            )
-        }
-
-        if isFinal {
-            current.coordinator.endCapture(stopAudio: {})
-            SpeechCoordinator.sharedMlxWorker.async {
-                SharedSpeechRecognizerStore.shared.clearInferenceCaches()
-            }
-        }
-    }
-
-    public func cancelExternalStream(
-        streamId: String? = nil,
-        reason: String? = nil,
-        code: String? = nil
-    ) {
-        lock.lock()
-        guard var current = activeStream else {
-            lock.unlock()
-            return
-        }
-        if let streamId, current.streamId != streamId {
-            lock.unlock()
-            return
-        }
-        current.cancelled = true
-        activeStream = nil
-        lock.unlock()
-
-        current.coordinator.endCapture(stopAudio: {})
-        SpeechCoordinator.sharedMlxWorker.async {
-            SharedSpeechRecognizerStore.shared.clearInferenceCaches()
-        }
-
-        if let reason, !reason.isEmpty {
-            let update = WatchAsrUpdate(
-                streamId: current.streamId,
-                text: "",
-                isFinal: true,
-                errorCode: code ?? "asr_cancelled",
-                errorMessage: reason
-            )
-            emitQueue.async {
-                current.onUpdate(update)
-            }
-        }
-    }
-
-    public func transcribeExternalFile(
-        streamId: String,
-        fileURL: URL,
-        language: String? = nil,
-        completion: @escaping (WatchAsrUpdate) -> Void
-    ) {
-        guard !streamId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            completion(WatchAsrUpdate(
-                streamId: streamId,
-                text: "",
-                isFinal: true,
-                errorCode: WatchAsrError.invalidStreamId.code,
-                errorMessage: WatchAsrError.invalidStreamId.message
-            ))
-            return
-        }
-        guard !SharedSpeechRecognizerStore.shared.isPhoneCaptureActive else {
-            completion(WatchAsrUpdate(
-                streamId: streamId,
-                text: "",
-                isFinal: true,
-                errorCode: WatchAsrError.phoneMicBusy.code,
-                errorMessage: WatchAsrError.phoneMicBusy.message
-            ))
-            return
-        }
-        guard !Self.isAppBackgroundedOnMain() else {
-            completion(WatchAsrUpdate(
-                streamId: streamId,
-                text: "",
-                isFinal: true,
-                errorCode: WatchAsrError.phoneBackgrounded.code,
-                errorMessage: WatchAsrError.phoneBackgrounded.message
-            ))
-            return
-        }
-        guard SharedSpeechRecognizerStore.shared.modelAvailable else {
-            completion(WatchAsrUpdate(
-                streamId: streamId,
-                text: "",
-                isFinal: true,
-                errorCode: WatchAsrError.modelNotReady.code,
-                errorMessage: WatchAsrError.modelNotReady.message
-            ))
-            return
-        }
-        guard let rawData = try? Data(contentsOf: fileURL),
-              let extracted = Self.extractPcm16FromWavOrRaw(rawData),
-              extracted.sampleRate == SpeechWindow.sampleRate,
-              extracted.channels == 1 else {
-            completion(WatchAsrUpdate(
-                streamId: streamId,
-                text: "",
-                isFinal: true,
-                errorCode: WatchAsrError.invalidAudioFormat.code,
-                errorMessage: WatchAsrError.invalidAudioFormat.message
-            ))
-            return
-        }
-
-        let samples = Self.decodePcm16LittleEndian(extracted.pcm16)
-        guard !samples.isEmpty else {
-            completion(WatchAsrUpdate(streamId: streamId, text: "", isFinal: true))
-            return
-        }
-
-        let resolvedLanguage = Qwen3LanguageMapper.resolve(language)
-        SpeechCoordinator.sharedMlxWorker.async {
-            guard !SharedSpeechRecognizerStore.shared.isPhoneCaptureActive else {
-                self.emitQueue.async {
-                    completion(WatchAsrUpdate(
-                        streamId: streamId,
-                        text: "",
-                        isFinal: true,
-                        errorCode: WatchAsrError.phoneMicBusy.code,
-                        errorMessage: WatchAsrError.phoneMicBusy.message
-                    ))
-                }
-                return
-            }
-            guard !Self.isAppBackgroundedOnMain() else {
-                self.emitQueue.async {
-                    completion(WatchAsrUpdate(
-                        streamId: streamId,
-                        text: "",
-                        isFinal: true,
-                        errorCode: WatchAsrError.phoneBackgrounded.code,
-                        errorMessage: WatchAsrError.phoneBackgrounded.message
-                    ))
-                }
-                return
-            }
-            guard let recognizer = SharedSpeechRecognizerStore.shared.ensureRecognizer(),
-                  let decoder = SpeechDecoder(recognizer: recognizer, language: resolvedLanguage) else {
-                self.emitQueue.async {
-                    completion(WatchAsrUpdate(
-                        streamId: streamId,
-                        text: "",
-                        isFinal: true,
-                        errorCode: WatchAsrError.modelNotReady.code,
-                        errorMessage: WatchAsrError.modelNotReady.message
-                    ))
-                }
-                return
-            }
-
-            defer {
-                SharedSpeechRecognizerStore.shared.clearInferenceCaches()
-            }
-
-            var gain = SpeechGain()
-            var window = SpeechWindow()
-            let chunkSize = SpeechWindow.sampleRate * 2 // 2s chunks matching Qwen3-ASR stride
-            var offset = 0
-            do {
-                while offset < samples.count {
-                    let end = min(samples.count, offset + chunkSize)
-                    let slice = Array(samples[offset..<end])
-                    let processed = gain.process(slice)
-                    let isLast = end >= samples.count
-                    try window.append(
-                        processed.samples,
-                        speech: processed.anyVoiced || !window.samples.isEmpty,
-                        trailingSilence: processed.trailingUnvoicedSamples,
-                        activeSamples: processed.voicedSamples,
-                        noiseFloorRMS: processed.noiseFloorRMS,
-                        final: isLast,
-                        shouldEmitNonFinal: { !isLast && !Self.isAppBackgroundedOnMain() },
-                        shouldContinue: { !Self.isAppBackgroundedOnMain() },
-                        rollbackPrefix: { tokens, rollbackCount in
-                            decoder.rollbackPrefix(tokens, rollbackCount: rollbackCount)
-                        },
-                        decode: { segSamples, prefixTokens in
-                            decoder.decode(samples: segSamples, prefixTokens: prefixTokens) {
-                                !Self.isAppBackgroundedOnMain()
-                            }
-                        }
-                    ) { _ in }
-                    offset = end
-                }
-                let finalText = try window.finish(
-                    shouldContinue: { !Self.isAppBackgroundedOnMain() },
-                    rollbackPrefix: { tokens, rollbackCount in
-                        decoder.rollbackPrefix(tokens, rollbackCount: rollbackCount)
-                    }
-                ) { segSamples, prefixTokens in
-                    decoder.decode(samples: segSamples, prefixTokens: prefixTokens) {
-                        !Self.isAppBackgroundedOnMain()
-                    }
-                }
-                self.emitQueue.async {
-                    completion(WatchAsrUpdate(streamId: streamId, text: finalText, isFinal: true))
-                }
-            } catch SpeechWindow.Failure.cancelled {
-                self.emitQueue.async {
-                    completion(WatchAsrUpdate(
-                        streamId: streamId,
-                        text: window.text,
-                        isFinal: true,
-                        errorCode: WatchAsrError.phoneBackgrounded.code,
-                        errorMessage: WatchAsrError.phoneBackgrounded.message
-                    ))
-                }
-            } catch {
-                self.emitQueue.async {
-                    completion(WatchAsrUpdate(
-                        streamId: streamId,
-                        text: window.text,
-                        isFinal: true,
-                        errorCode: "asr_decode_failed",
-                        errorMessage: "Offline speech file decoding failed"
-                    ))
-                }
-            }
-        }
-    }
-
-    private func handleCoordinatorEvent(_ event: SpeechCoordinator.Event, streamId: String, owner: UInt64) {
-        lock.lock()
-        guard let current = activeStream,
-              current.streamId == streamId,
-              current.owner == owner,
-              !current.cancelled else {
-            lock.unlock()
-            return
-        }
-        let callback = current.onUpdate
-        switch event {
-        case .partial(let text):
-            lock.unlock()
-            callback(WatchAsrUpdate(streamId: streamId, text: text, isFinal: false))
-        case .final(let text):
-            activeStream = nil
-            lock.unlock()
-            callback(WatchAsrUpdate(streamId: streamId, text: text, isFinal: true))
-        case .error(let message):
-            activeStream = nil
-            lock.unlock()
-            callback(WatchAsrUpdate(
-                streamId: streamId,
-                text: "",
-                isFinal: true,
-                errorCode: "asr_error",
-                errorMessage: message
-            ))
-        case .started, .stopped, .audioLevel:
-            lock.unlock()
-        }
-    }
-
-    public static func decodePcm16LittleEndian(_ data: Data) -> [Float] {
-        let sampleCount = data.count / MemoryLayout<Int16>.size
-        guard sampleCount > 0 else { return [] }
-        var out = [Float]()
-        out.reserveCapacity(sampleCount)
-        data.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            let bytePtr = base.assumingMemoryBound(to: UInt8.self)
-            for i in 0..<sampleCount {
-                let offset = i * 2
-                let lo = UInt16(bytePtr[offset])
-                let hi = UInt16(bytePtr[offset + 1]) << 8
-                let sample = Int16(bitPattern: lo | hi)
-                out.append(Float(sample) / 32768.0)
-            }
-        }
-        return out
-    }
-
-    public static func extractPcm16FromWavOrRaw(_ data: Data) -> (sampleRate: Int, channels: Int, pcm16: Data)? {
-        guard data.count >= 12,
-              String(data: data.subdata(in: 0..<4), encoding: .ascii) == "RIFF",
-              String(data: data.subdata(in: 8..<12), encoding: .ascii) == "WAVE" else {
-            guard !data.isEmpty else { return nil }
-            return (SpeechWindow.sampleRate, 1, data)
-        }
-
-        func readUInt16LE(_ offset: Int) -> UInt16 {
-            UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
-        }
-        func readUInt32LE(_ offset: Int) -> UInt32 {
-            UInt32(data[offset])
-                | (UInt32(data[offset + 1]) << 8)
-                | (UInt32(data[offset + 2]) << 16)
-                | (UInt32(data[offset + 3]) << 24)
-        }
-
-        var offset = 12
-        var sampleRate: Int?
-        var channels: Int?
-        var bitsPerSample: Int?
-        var audioFormat: UInt16?
-        var pcmData: Data?
-
-        while offset + 8 <= data.count {
-            let chunkId = String(data: data.subdata(in: offset..<(offset + 4)), encoding: .ascii) ?? ""
-            let chunkSize = Int(readUInt32LE(offset + 4))
-            let payloadStart = offset + 8
-            guard chunkSize >= 0, payloadStart <= data.count else { break }
-            let payloadEnd = min(data.count, payloadStart + chunkSize)
-
-            if chunkId == "fmt " && payloadEnd - payloadStart >= 16 {
-                audioFormat = readUInt16LE(payloadStart)
-                channels = Int(readUInt16LE(payloadStart + 2))
-                sampleRate = Int(readUInt32LE(payloadStart + 4))
-                bitsPerSample = Int(readUInt16LE(payloadStart + 14))
-            } else if chunkId == "data" {
-                pcmData = data.subdata(in: payloadStart..<payloadEnd)
-            }
-
-            let paddedSize = chunkSize + (chunkSize & 1)
-            offset = payloadStart + paddedSize
-        }
-
-        guard audioFormat == 1,
-              bitsPerSample == 16,
-              let sr = sampleRate,
-              let ch = channels,
-              let pcm = pcmData else {
-            return nil
-        }
-        return (sr, ch, pcm)
     }
 }
