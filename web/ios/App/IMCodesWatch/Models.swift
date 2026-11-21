@@ -17,6 +17,7 @@ struct WatchServerRow: Identifiable, Codable, Equatable {
     let id: String
     var name: String
     var baseUrl: String
+    var isPinned: Bool? = nil
 }
 
 struct WatchRecentTextRow: Identifiable, Codable, Equatable {

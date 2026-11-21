@@ -139,7 +139,7 @@ describe('Watch routes', () => {
     });
   });
 
-  it('GET /api/watch/servers returns visible servers with baseUrl', async () => {
+  it('GET /api/watch/servers returns visible servers with baseUrl and isPinned', async () => {
     mockGetFullServersByUserId.mockResolvedValue([
       { id: 'srv-1', name: 'Alpha' },
       { id: 'srv-2', name: 'Beta' },
@@ -151,8 +151,35 @@ describe('Watch routes', () => {
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({
       servers: [
-        { id: 'srv-1', name: 'Alpha', baseUrl: 'https://app.im.codes' },
-        { id: 'srv-2', name: 'Beta', baseUrl: 'https://app.im.codes' },
+        { id: 'srv-1', name: 'Alpha', baseUrl: 'https://app.im.codes', isPinned: false },
+        { id: 'srv-2', name: 'Beta', baseUrl: 'https://app.im.codes', isPinned: false },
+      ],
+    });
+  });
+
+  it('GET /api/watch/servers sorts pinned servers first in server_pinned order, then server_order, then original order', async () => {
+    mockGetFullServersByUserId.mockResolvedValue([
+      { id: 'srv-a', name: 'Alpha' },
+      { id: 'srv-b', name: 'Beta' },
+      { id: 'srv-c', name: 'Gamma' },
+      { id: 'srv-d', name: 'Delta' },
+    ]);
+    mockGetUserPref.mockImplementation(async (_db: unknown, _userId: string, key: string) => {
+      if (key === 'server_pinned') return JSON.stringify(JSON.stringify({ v: ['srv-c', 'srv-a'], t: 10 }));
+      if (key === 'server_order') return JSON.stringify({ v: ['srv-d', 'srv-b'], t: 9 });
+      return null;
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/servers');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      servers: [
+        { id: 'srv-c', name: 'Gamma', baseUrl: 'https://app.im.codes', isPinned: true },
+        { id: 'srv-a', name: 'Alpha', baseUrl: 'https://app.im.codes', isPinned: true },
+        { id: 'srv-d', name: 'Delta', baseUrl: 'https://app.im.codes', isPinned: false },
+        { id: 'srv-b', name: 'Beta', baseUrl: 'https://app.im.codes', isPinned: false },
       ],
     });
   });

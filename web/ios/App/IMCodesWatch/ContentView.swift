@@ -32,6 +32,7 @@ struct ContentView: View {
     @AppStorage("watchViewMode") private var viewMode: WatchViewMode = .tasks
     @State private var path: [WatchRoute] = []
     @State private var showServerPicker = false
+    @State private var showTaskServerFilter = false
     @State private var showAddSessionSheet = false
     @State private var expandedSessions: Set<String> = []
 
@@ -112,8 +113,19 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private var serverPickerToolbarButton: some View {
-        if sessionManager.displayServers.count > 1 {
+    private var trailingToolbarButton: some View {
+        if viewMode == .tasks {
+            if !sessionManager.displayServers.isEmpty {
+                Button {
+                    showTaskServerFilter = true
+                } label: {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                        .font(.caption2)
+                        .foregroundStyle(sessionManager.selectedTaskServerIds != nil ? .cyan : .primary)
+                }
+                .accessibilityLabel("Filter devices")
+            }
+        } else if sessionManager.displayServers.count > 1 {
             Button {
                 showServerPicker = true
             } label: {
@@ -150,6 +162,12 @@ struct ContentView: View {
                     Text("No tasks")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                    if !sessionManager.globalTasks.isEmpty && !sessionManager.displayServers.isEmpty {
+                        Button("Filter Devices") {
+                            showTaskServerFilter = true
+                        }
+                        .font(.caption2)
+                    }
                     if !mainSessions.isEmpty || requiresServerSelection {
                         Button("View Sessions") {
                             viewMode = .sessions
@@ -193,6 +211,11 @@ struct ContentView: View {
                             Task { await sessionManager.selectServer(server.id) }
                         } label: {
                             HStack {
+                                if server.isPinned ?? false {
+                                    Image(systemName: "pin.fill")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(.orange)
+                                }
                                 Text(server.name)
                                     .font(.caption)
                                     .lineLimit(1)
@@ -351,14 +374,14 @@ struct ContentView: View {
                         modeToggleButton
                     }
                     ToolbarItem(placement: .topBarTrailing) {
-                        serverPickerToolbarButton
+                        trailingToolbarButton
                     }
                 } else {
                     ToolbarItem(placement: .cancellationAction) {
                         modeToggleButton
                     }
                     ToolbarItem(placement: .confirmationAction) {
-                        serverPickerToolbarButton
+                        trailingToolbarButton
                     }
                 }
             }
@@ -369,11 +392,43 @@ struct ContentView: View {
                         Task { await sessionManager.selectServer(server.id) }
                     } label: {
                         HStack {
+                            if server.isPinned ?? false {
+                                Image(systemName: "pin.fill")
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(.orange)
+                            }
                             Text(server.name).font(.caption)
                             Spacer()
                             if sessionManager.selectedServerId == server.id {
                                 Image(systemName: "checkmark")
                                     .font(.caption2)
+                            }
+                        }
+                    }
+                }
+            }
+            .sheet(isPresented: $showTaskServerFilter) {
+                List {
+                    Section("Devices") {
+                        ForEach(sessionManager.displayServers) { server in
+                            let checked = sessionManager.isTaskServerVisible(server.id)
+                            Button {
+                                sessionManager.toggleTaskServerVisibility(server.id)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: checked ? "checkmark.square.fill" : "square")
+                                        .font(.caption2)
+                                        .foregroundStyle(checked ? .cyan : .secondary)
+                                    if server.isPinned ?? false {
+                                        Image(systemName: "pin.fill")
+                                            .font(.system(size: 8))
+                                            .foregroundStyle(.orange)
+                                    }
+                                    Text(server.name)
+                                        .font(.caption)
+                                        .lineLimit(1)
+                                    Spacer()
+                                }
                             }
                         }
                     }

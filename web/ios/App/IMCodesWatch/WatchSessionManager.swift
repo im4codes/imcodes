@@ -15,6 +15,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
     @Published private(set) var globalTasks: [WatchGlobalTaskRow] = []
     @Published private(set) var loadedSessionsServerId: String?
     @Published private(set) var selectedServerId: String?
+    @Published private(set) var selectedTaskServerIds: Set<String>?
     @Published private(set) var manualSessionsByServer: [String: Set<String>] = [:]
     @Published private(set) var historyByRoute: [String: WatchHistoryViewState] = [:]
     @Published private(set) var isUsingFallbackSnapshot = true
@@ -24,6 +25,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     private static let cachedGlobalTasksKey = "imcodes.watch.cachedGlobalTasks.v1"
     private static let selectedServerIdKey = "watchSelectedServerId"
+    private static let selectedTaskServerIdsKey = "watchSelectedTaskServerIds"
     private static let manualSessionsKeyPrefix = "watchManualSessions:"
     private static let cachedSessionsKeyPrefix = "watchCachedSessions:"
     private static let autoShowAllMainSessionLimit = 5
@@ -36,6 +38,12 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        if UserDefaults.standard.object(forKey: Self.selectedTaskServerIdsKey) != nil {
+            let saved = UserDefaults.standard.stringArray(forKey: Self.selectedTaskServerIdsKey) ?? []
+            selectedTaskServerIds = Set(saved)
+        } else {
+            selectedTaskServerIds = nil
+        }
         hydrateCachedContext()
         bootstrapFromContext(applicationContext, triggerReload: false)
         if let selectedServerId {
@@ -44,8 +52,47 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     var displayServers: [WatchServerRow] {
-        if !servers.isEmpty { return servers }
-        return applicationContext.servers
+        let raw = !servers.isEmpty ? servers : applicationContext.servers
+        return Self.sortServers(raw)
+    }
+
+    static func sortServers(_ servers: [WatchServerRow]) -> [WatchServerRow] {
+        servers.enumerated().sorted { lhs, rhs in
+            let lhsPinned = lhs.element.isPinned ?? false
+            let rhsPinned = rhs.element.isPinned ?? false
+            if lhsPinned != rhsPinned { return lhsPinned }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    private var defaultVisibleTaskServerIds: Set<String> {
+        let pinnedIds = displayServers.compactMap { ($0.isPinned ?? false) ? $0.id : nil }
+        if !pinnedIds.isEmpty {
+            return Set(pinnedIds)
+        }
+        return Set(displayServers.map(\.id))
+    }
+
+    func isTaskServerVisible(_ serverId: String) -> Bool {
+        if let selectedTaskServerIds {
+            return selectedTaskServerIds.contains(serverId)
+        }
+        let pinnedIds = displayServers.compactMap { ($0.isPinned ?? false) ? $0.id : nil }
+        if !pinnedIds.isEmpty {
+            return pinnedIds.contains(serverId)
+        }
+        return true
+    }
+
+    func toggleTaskServerVisibility(_ serverId: String) {
+        var next = selectedTaskServerIds ?? defaultVisibleTaskServerIds
+        if next.contains(serverId) {
+            next.remove(serverId)
+        } else {
+            next.insert(serverId)
+        }
+        selectedTaskServerIds = next
+        UserDefaults.standard.set(Array(next).sorted(), forKey: Self.selectedTaskServerIdsKey)
     }
 
     private static func manualSessionsKey(for serverId: String) -> String {
@@ -146,13 +193,11 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     func displayTasks(for serverId: String? = nil) -> [WatchGlobalTaskRow] {
-        let targetServerId = serverId ?? selectedServerId
         let filtered: [WatchGlobalTaskRow]
-        if let targetServerId {
-            let matching = globalTasks.filter { $0.serverId == targetServerId }
-            filtered = matching.isEmpty ? globalTasks : matching
+        if let serverId {
+            filtered = globalTasks.filter { $0.serverId == serverId && isTaskServerVisible($0.serverId) }
         } else {
-            filtered = globalTasks
+            filtered = globalTasks.filter { isTaskServerVisible($0.serverId) }
         }
         return filtered.sorted { lhs, rhs in
             let lhsTerminal = lhs.isTerminal ?? false

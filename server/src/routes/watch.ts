@@ -335,10 +335,15 @@ function structuredTimelineCursor(response: Record<string, unknown>): Record<str
 }
 
 
-async function loadTabPreferences(db: Env['DB'], userId: string): Promise<{ order: string[]; pinned: Set<string> }> {
+async function loadOrderedAndPinnedPrefs(
+  db: Env['DB'],
+  userId: string,
+  orderKey: string,
+  pinnedKey: string,
+): Promise<{ order: string[]; pinnedList: string[]; pinned: Set<string> }> {
   const [rawOrder, rawPinned] = await Promise.all([
-    getUserPref(db, userId, 'tab_order'),
-    getUserPref(db, userId, 'tab_pinned'),
+    getUserPref(db, userId, orderKey),
+    getUserPref(db, userId, pinnedKey),
   ]);
 
   const parseList = (raw: string | null): string[] => {
@@ -358,10 +363,42 @@ async function loadTabPreferences(db: Env['DB'], userId: string): Promise<{ orde
     }
   };
 
+  const pinnedList = parseList(rawPinned);
   return {
     order: parseList(rawOrder),
-    pinned: new Set(parseList(rawPinned)),
+    pinnedList,
+    pinned: new Set(pinnedList),
   };
+}
+
+async function loadTabPreferences(db: Env['DB'], userId: string): Promise<{ order: string[]; pinned: Set<string> }> {
+  const { order, pinned } = await loadOrderedAndPinnedPrefs(db, userId, 'tab_order', 'tab_pinned');
+  return { order, pinned };
+}
+
+function orderWatchServers<T extends { id: string }>(
+  servers: readonly T[],
+  order: readonly string[],
+  pinnedList: readonly string[],
+  pinned: ReadonlySet<string>,
+): T[] {
+  const pinnedIndex = new Map(pinnedList.map((id, idx) => [id, idx]));
+  const orderIndex = new Map(order.map((id, idx) => [id, idx]));
+  const origIndex = new Map(servers.map((srv, idx) => [srv.id, idx]));
+  return [...servers].sort((a, b) => {
+    const aPinned = pinned.has(a.id);
+    const bPinned = pinned.has(b.id);
+    if (aPinned !== bPinned) return aPinned ? -1 : 1;
+    if (aPinned && bPinned) {
+      return (pinnedIndex.get(a.id) ?? 0) - (pinnedIndex.get(b.id) ?? 0);
+    }
+    const aOrder = orderIndex.get(a.id);
+    const bOrder = orderIndex.get(b.id);
+    if (aOrder != null && bOrder != null) return aOrder - bOrder;
+    if (aOrder != null) return -1;
+    if (bOrder != null) return 1;
+    return (origIndex.get(a.id) ?? 0) - (origIndex.get(b.id) ?? 0);
+  });
 }
 
 function orderMainSessions<T extends { sessionName: string; isPinned?: boolean | null }>(sessions: T[], order: string[], pinned: Set<string>): T[] {
@@ -381,13 +418,18 @@ function orderMainSessions<T extends { sessionName: string; isPinned?: boolean |
 
 watchRoutes.get('/watch/servers', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
-  const servers = await getFullServersByUserId(c.env.DB, userId);
+  const [servers, serverPrefs] = await Promise.all([
+    getFullServersByUserId(c.env.DB, userId),
+    loadOrderedAndPinnedPrefs(c.env.DB, userId, 'server_order', 'server_pinned'),
+  ]);
+  const ordered = orderWatchServers(servers, serverPrefs.order, serverPrefs.pinnedList, serverPrefs.pinned);
   const baseUrl = resolveBaseUrl(c.req.url, c.env.SERVER_URL);
   return c.json({
-    servers: servers.map((server) => ({
+    servers: ordered.map((server) => ({
       id: server.id,
       name: server.name,
       baseUrl,
+      isPinned: serverPrefs.pinned.has(server.id),
     })),
   });
 });
