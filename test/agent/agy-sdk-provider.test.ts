@@ -1518,7 +1518,26 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(afterResume.context_usage_estimated).toBe(true);
     expect(afterResume.input_tokens).toBeGreaterThan(500);
 
-    // If an in-process native reading IS already loaded and a new compaction has no subsequent PLANNER_RESPONSE, it resets.
+    // Pre-compaction native reading + new compaction + tokenless post-compaction PLANNER_RESPONSE MUST still reset to summary estimate.
+    state.contextUsage.normalize({ input_tokens: 3324, cache_read_tokens: 209320 });
+    expect(state.contextUsage.hasNativeOccupancy).toBe(true);
+    writeFileSync(
+      path.join(logsDir, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 10, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:00:00Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }),
+        JSON.stringify({ step_index: 11, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T00:01:00Z', content: 'after compaction' }),
+        JSON.stringify({ step_index: 15, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:01:30Z', content: '# Resuming from a compaction\n' + 'compact '.repeat(300) }),
+        JSON.stringify({ step_index: 16, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T00:01:40Z', content: 'tokenless post compaction' }),
+      ].join('\n') + '\n',
+    );
+    expect(await provider.checkSessionCompaction(sid)).toBe(true);
+    const afterPreCompactionNative = state.contextUsage.normalize({});
+    expect(afterPreCompactionNative.context_usage_estimated).toBe(true);
+    expect(afterPreCompactionNative.cache_read_input_tokens).toBe(0);
+    expect(afterPreCompactionNative.input_tokens).toBeGreaterThan(300);
+    expect(afterPreCompactionNative.input_tokens).toBeLessThan(2000);
+
+    // Terminal compaction row with no subsequent PLANNER_RESPONSE also resets cleanly.
     state.contextUsage.normalize({ input_tokens: 12000, cache_read_tokens: 80000 });
     expect(state.contextUsage.hasNativeOccupancy).toBe(true);
     writeFileSync(
@@ -1526,12 +1545,15 @@ describe('AgySdkProvider (fake agy process)', () => {
       [
         JSON.stringify({ step_index: 10, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:00:00Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }),
         JSON.stringify({ step_index: 11, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T00:01:00Z', content: 'after compaction' }),
+        JSON.stringify({ step_index: 15, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:01:30Z', content: '# Resuming from a compaction\n' + 'compact '.repeat(300) }),
+        JSON.stringify({ step_index: 16, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T00:01:40Z', content: 'tokenless post compaction' }),
         JSON.stringify({ step_index: 20, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:02:00Z', content: '# Resuming from a compaction\nfresh' }),
       ].join('\n') + '\n',
     );
     expect(await provider.checkSessionCompaction(sid)).toBe(true);
     const afterNewCompact = state.contextUsage.normalize({});
     expect(afterNewCompact.context_usage_estimated).toBe(true);
+    expect(afterNewCompact.cache_read_input_tokens).toBe(0);
     expect(afterNewCompact.input_tokens).toBeLessThan(1000);
   });
 });
