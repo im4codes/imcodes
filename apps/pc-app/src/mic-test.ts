@@ -568,7 +568,7 @@ export function buildMicTestOverlayScript(localeRaw: string): string {
   refreshDevices();
   refreshModelStatus();
   if (typeof voice.getSpeechModelStatus === 'function') {
-    modelPollTimer = setInterval(refreshModelStatus, 1000);
+    modelPollTimer = setInterval(refreshModelStatus, 400);
   }
   return { mounted: true };
 })();`;

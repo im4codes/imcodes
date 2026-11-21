@@ -858,4 +858,80 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     expect(await voiceNoWrite.startListening({ locale: 'en-US' })).toEqual({ ok: true });
     await voiceNoWrite.dispose();
   });
+
+  it('notifies speech model download status at 1% increments without per-chunk spam while keeping selectedModel=system', async () => {
+    const payload = Buffer.alloc(100, 65);
+    const sha = createHash('sha256').update(payload).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'aufklarer/test-pct-0.6b',
+        revision: 'rev06',
+        files: [{ filename: 'weights.bin', expectedSize: payload.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'aufklarer/test-pct-1.7b',
+        revision: 'rev17',
+        files: [{ filename: 'weights.bin', expectedSize: payload.length, expectedSha256: sha }],
+      },
+    };
+
+    const statuses: Array<{ state: string; progress: number; selectedModel: string; downloadingModel?: string | null }> = [];
+    const ctx = setupController({
+      micStatus: 'granted',
+      mlxHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech-mlx',
+      isMlxSupported: () => true,
+      manifests,
+      mirrorOrigins: ['https://hf-mirror.com'],
+      onSpeechModelStatusChanged: (st) => {
+        statuses.push({
+          state: st.state,
+          progress: st.progress,
+          selectedModel: st.selectedModel,
+          downloadingModel: st.downloadingModel,
+        });
+      },
+      fetchModel: async () => {
+        const stream = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            // Emit 1 byte (1%), then duplicate 1% bucket edge, then 2%, 3%, then rest
+            controller.enqueue(payload.subarray(0, 1));
+            await new Promise((r) => setTimeout(r, 2));
+            // Enqueue 1-byte chunks hitting 2% and 3%
+            controller.enqueue(payload.subarray(1, 2));
+            await new Promise((r) => setTimeout(r, 2));
+            controller.enqueue(payload.subarray(2, 3));
+            await new Promise((r) => setTimeout(r, 2));
+            controller.enqueue(payload.subarray(3, 15));
+            await new Promise((r) => setTimeout(r, 2));
+            controller.enqueue(payload.subarray(15));
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'content-length': String(payload.length) },
+        });
+      },
+    });
+
+    await ctx.voice.setSpeechModel('qwen3-0.6b');
+    await vi.waitFor(async () => {
+      const st = await ctx.voice.getSpeechModelStatus();
+      expect(st.state).toBe('ready');
+    });
+
+    const dlPercents = statuses
+      .filter((s) => s.state === 'downloading')
+      .map((s) => Math.floor(s.progress * 100));
+    expect(dlPercents).toEqual(expect.arrayContaining([1, 2, 3, 15]));
+    expect(new Set(dlPercents).size).toBe(dlPercents.length);
+    const midDownload = statuses.find((s) => s.state === 'downloading' && Math.floor(s.progress * 100) === 2);
+    expect(midDownload?.selectedModel).toBe('system');
+    expect(midDownload?.downloadingModel).toBe('qwen3-0.6b');
+    await ctx.voice.dispose();
+  });
 });

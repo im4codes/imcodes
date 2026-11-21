@@ -428,7 +428,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
   const notifyStatusChanged = (force = false) => {
     const status = computeStatusSync();
-    const bucket = status.state === 'downloading' ? Math.floor(status.progress * 10) : -1;
+    const bucket = status.state === 'downloading' ? Math.floor(status.progress * 100) : -1;
     if (
       !force
       && status.state === lastProgressNotifiedState

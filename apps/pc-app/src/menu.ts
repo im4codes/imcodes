@@ -256,17 +256,24 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     if (!speechStatus) {
       return t('menu.voice.statusIdle');
     }
+    const downloadingChoice = speechStatus.downloadingModel ?? null;
+    const downloadingEntry = downloadingChoice ? speechStatus.models?.[downloadingChoice] : undefined;
+    if (speechStatus.state === 'downloading' || downloadingEntry?.state === 'downloading') {
+      const rawProgress = downloadingEntry?.state === 'downloading'
+        ? downloadingEntry.progress
+        : speechStatus.progress;
+      return t('menu.voice.statusDownloading', {
+        progress: Math.round(rawProgress * 100),
+      });
+    }
+    if (speechStatus.state === 'failed') {
+      return t('menu.voice.statusFailed');
+    }
     switch (speechStatus.state) {
-      case 'downloading':
-        return t('menu.voice.statusDownloading', {
-          progress: Math.round(speechStatus.progress * 100),
-        });
       case 'ready':
         return activeSelectedModel !== 'system'
           ? t('menu.voice.statusReady')
           : t('menu.voice.statusIdle');
-      case 'failed':
-        return t('menu.voice.statusFailed');
       case 'unsupported':
         return t('menu.voice.statusUnsupported');
       case 'idle':

@@ -1084,6 +1084,42 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     });
     expect(stopListeningMock).toHaveBeenCalledWith({ abort: true });
 
+    // Confirm menu item uses the exact 400ms download status polling interval inside floating overlay
+    expect(injectedScript).toContain('setInterval(refreshModelStatus, 400)');
+    expect(findMenuItem(
+      buildAppMenuTemplate({
+        platform: 'darwin',
+        appName: 'IM.codes',
+        locale: 'en',
+        servers: [],
+        activeOrigin: null,
+        speechModelStatus: {
+          selectedModel: 'system',
+          activeBackend: 'system',
+          state: 'idle',
+          progress: 0,
+          downloadedBytes: 0,
+          totalBytes: 1000,
+          mlxSupported: true,
+          downloadingModel: 'qwen3-0.6b',
+          models: {
+            'qwen3-0.6b': { state: 'downloading', progress: 0.37, downloadedBytes: 370, totalBytes: 1000, modelDir: '/tmp/06' },
+            'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 2000, modelDir: '/tmp/17' },
+          },
+        },
+        onSelectServer: () => {},
+        onAddServer: () => {},
+        onRemoveServer: () => {},
+        onReload: () => {},
+        onForceReload: () => {},
+        onToggleDevTools: () => {},
+        onClearSession: () => {},
+        onBindFallback: () => {},
+        onOpenDocs: () => {},
+      }),
+      'voice:status',
+    )?.label).toBe('Status: Downloading (37%)…');
+
     // Closing overlay via × unsubscribes, stops active test listening, and removes DOM node
     elements.get('imcodes-mic-test-close')!.dispatchEvent('click');
     expect(elements.get(MIC_TEST_OVERLAY_ID)).toBeUndefined();
