@@ -1187,8 +1187,16 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     expect(pasteBody).toContain('retDown.flags = []');
     expect(pasteBody).toContain('retUp.flags = []');
     expect(pasteBody).toContain('waitForModifierRelease()');
-    expect(pasteBody).toContain('if !trusted && postedCount == 0');
-    expect(pasteBody).toContain('emitJson(["type": "ok", "length": utf16.count, "trusted": trusted])');
+    expect(pasteBody).toContain('if !trusted {');
+    expect(pasteBody).toContain('emitJson(["type": "error", "code": "accessibility_denied"])');
+    expect(pasteBody).toContain('emitJson(["type": "ok", "length": utf16.count, "trusted": true])');
+    expect(pasteBody).not.toContain('"trusted": trusted');
+
+    const detectorStart = swiftSrc.indexOf('final class ShiftDoubleTapDetector');
+    const detectorBody = swiftSrc.slice(detectorStart, swiftSrc.indexOf('final class ModifierMonitor', detectorStart));
+    expect(detectorBody).toContain('private let tapWindowSeconds: TimeInterval = 0.28');
+    expect(detectorBody).toContain('private let maxHoldSeconds: TimeInterval = 0.60');
+    expect(detectorBody).toContain('DispatchQueue.main.asyncAfter(deadline: .now() + tapWindowSeconds, execute: work)');
 
     const voiceIpcSrc = readFileSync(path.resolve(__dirname, '../src/voice-ipc.ts'), 'utf8');
     expect(voiceIpcSrc).toContain("'codesign'");

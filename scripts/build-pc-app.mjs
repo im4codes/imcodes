@@ -35,7 +35,7 @@ import {
   validateBundledTmuxLayout,
   verifyBundledTmux,
 } from './build-macos-bundled-tmux.mjs';
-import { createPcAppElectronBuilderConfig, PC_APP_DIR } from '../apps/pc-app/electron-builder.config.mjs';
+import { createPcAppElectronBuilderConfig, PC_APP_DIR, resolveMacosSigningOptions } from '../apps/pc-app/electron-builder.config.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(SCRIPT_DIR, '..');
@@ -132,6 +132,11 @@ export function resolveElectronBuilderMacAppPath(outDir, arch, productName = 'IM
 
 const MACOS_SPEECH_HELPER_IDENTIFIER = 'codes.im.pc';
 
+function hasDeveloperIdSigningEnv(env = process.env) {
+  return resolveMacosSigningOptions(env).mode !== 'ad-hoc'
+    || Boolean(env.MACOS_CODESIGN_IDENTITY?.trim());
+}
+
 function adHocSignMacosSpeechHelper(execFn, binPath) {
   try {
     execFn('codesign', ['--force', '--sign', '-', '-i', MACOS_SPEECH_HELPER_IDENTIFIER, binPath], {
@@ -143,6 +148,36 @@ function adHocSignMacosSpeechHelper(execFn, binPath) {
     }
     throw err;
   }
+}
+
+/**
+ * Re-sign `Contents/Resources/imcodes-speech` with `Identifier=codes.im.pc` and re-seal the outer
+ * ad-hoc `.app` bundle after `electron-builder` overwrites extraResources with a hashed identifier.
+ * Skipped when Developer ID signing (`IMCODES_MACOS_SIGNING_IDENTITY`/`CSC_NAME`/`CSC_LINK`/
+ * `MACOS_CODESIGN_IDENTITY`) is active.
+ */
+export function resealMacosAppSpeechHelper(
+  appPath,
+  {
+    env = process.env,
+    execFn = execFileSync,
+  } = {},
+) {
+  if (hasDeveloperIdSigningEnv(env)) {
+    return { resealed: false, reason: 'developer_id_signing' };
+  }
+  const absApp = resolve(appPath);
+  const speechBin = join(absApp, 'Contents', 'Resources', 'imcodes-speech');
+  if (!existsSync(speechBin)) {
+    return { resealed: false, reason: 'speech_helper_missing' };
+  }
+  execFn('codesign', ['--force', '--sign', '-', '-i', MACOS_SPEECH_HELPER_IDENTIFIER, speechBin], {
+    stdio: 'pipe',
+  });
+  execFn('codesign', ['--force', '--sign', '-', absApp], {
+    stdio: 'pipe',
+  });
+  return { resealed: true, speechBin, identifier: MACOS_SPEECH_HELPER_IDENTIFIER };
 }
 
 /**
@@ -709,6 +744,9 @@ export async function runBuildPcApp(opts, deps = {}) {
 
   if (opts.platform === 'darwin') {
     const appPath = opts.appPath || resolveElectronBuilderMacAppPath(opts.outDir, opts.arch);
+    if (existsSync(join(appPath, 'Contents', 'Info.plist')) || deps.execFn) {
+      resealMacosAppSpeechHelper(appPath, { env: childEnv, execFn: execTscFn });
+    }
     const verification = verifyMacAppFn(appPath, { requireNotarized: opts.requireNotarize });
     return {
       platform: 'darwin',

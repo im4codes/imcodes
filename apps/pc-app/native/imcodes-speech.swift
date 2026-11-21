@@ -668,8 +668,8 @@ final class SpeechSession {
 // MARK: - Global Single/Double-Tap Shift Hotkey Monitor
 
 final class ShiftDoubleTapDetector {
-  private let tapWindowSeconds: TimeInterval = 0.35
-  private let maxHoldSeconds: TimeInterval = 0.35
+  private let tapWindowSeconds: TimeInterval = 0.28
+  private let maxHoldSeconds: TimeInterval = 0.60
   private let debounceSeconds: TimeInterval = 0.25
 
   private let lock = NSLock()
@@ -760,7 +760,7 @@ final class ShiftDoubleTapDetector {
         self.onEmit("single_tap")
       }
       pendingSingleTapWork = work
-      DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + tapWindowSeconds, execute: work)
+      DispatchQueue.main.asyncAfter(deadline: .now() + tapWindowSeconds, execute: work)
     }
   }
 
@@ -1122,6 +1122,10 @@ func runPasteCommand(args: [String]) -> Int32 {
 
   let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
   let trusted = AXIsProcessTrustedWithOptions(options)
+  if !trusted {
+    emitJson(["type": "error", "code": "accessibility_denied"])
+    return 1
+  }
 
   let text: String
   if let argText {
@@ -1137,12 +1141,11 @@ func runPasteCommand(args: [String]) -> Int32 {
 
   let utf16 = Array(text.utf16)
   if utf16.isEmpty && !sendEnter {
-    emitJson(["type": "ok", "length": 0, "trusted": trusted])
+    emitJson(["type": "ok", "length": 0, "trusted": true])
     return 0
   }
 
   var offset = 0
-  var postedCount = 0
   let chunkSize = 16
   while offset < utf16.count {
     let end = min(offset + chunkSize, utf16.count)
@@ -1158,7 +1161,6 @@ func runPasteCommand(args: [String]) -> Int32 {
       }
       down.post(tap: .cghidEventTap)
       up.post(tap: .cghidEventTap)
-      postedCount += 1
     }
     offset = end
     if offset < utf16.count {
@@ -1176,16 +1178,10 @@ func runPasteCommand(args: [String]) -> Int32 {
       retUp.flags = []
       retDown.post(tap: .cghidEventTap)
       retUp.post(tap: .cghidEventTap)
-      postedCount += 1
     }
   }
 
-  if !trusted && postedCount == 0 {
-    emitJson(["type": "error", "code": "accessibility_denied"])
-    return 1
-  }
-
-  emitJson(["type": "ok", "length": utf16.count, "trusted": trusted])
+  emitJson(["type": "ok", "length": utf16.count, "trusted": true])
   return 0
 }
 

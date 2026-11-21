@@ -43,6 +43,7 @@ import {
   buildPcAppNodeExeEnv,
   DEFAULT_SPEECH_MLX_PKG_DIR,
   parseBuildPcAppArgs,
+  resealMacosAppSpeechHelper,
   resolveElectronBuilderMacAppPath,
   runBuildPcApp,
   stagePcAppResources,
@@ -659,5 +660,58 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
         },
       }),
     ).toThrow(/codesign failed/);
+  });
+
+  it('resealMacosAppSpeechHelper preserves codes.im.pc on ad-hoc .app bundles and skips Developer ID builds', () => {
+    const work = makeTempDir();
+    const appPath = join(work, 'IM.codes.app');
+    const speechBin = join(appPath, 'Contents', 'Resources', 'imcodes-speech');
+    mkdirSync(join(appPath, 'Contents', 'Resources'), { recursive: true });
+    writeFileSync(speechBin, '#!/bin/sh\necho ok\n', { mode: 0o755 });
+
+    const adHocCalls: Array<{ cmd: string; args: string[] }> = [];
+    const resAdHoc = resealMacosAppSpeechHelper(appPath, {
+      env: {},
+      execFn: (cmd: string, args: string[]) => {
+        adHocCalls.push({ cmd, args });
+        return Buffer.alloc(0);
+      },
+    });
+    expect(resAdHoc).toEqual({
+      resealed: true,
+      speechBin,
+      identifier: 'codes.im.pc',
+    });
+    expect(adHocCalls).toEqual([
+      {
+        cmd: 'codesign',
+        args: ['--force', '--sign', '-', '-i', 'codes.im.pc', speechBin],
+      },
+      {
+        cmd: 'codesign',
+        args: ['--force', '--sign', '-', appPath],
+      },
+    ]);
+
+    const devIdCalls: Array<{ cmd: string; args: string[] }> = [];
+    expect(
+      resealMacosAppSpeechHelper(appPath, {
+        env: { CSC_NAME: 'Developer ID Application: Example' },
+        execFn: (cmd: string, args: string[]) => {
+          devIdCalls.push({ cmd, args });
+          return Buffer.alloc(0);
+        },
+      }),
+    ).toEqual({ resealed: false, reason: 'developer_id_signing' });
+    expect(
+      resealMacosAppSpeechHelper(appPath, {
+        env: { MACOS_CODESIGN_IDENTITY: 'Developer ID Application: Example' },
+        execFn: (cmd: string, args: string[]) => {
+          devIdCalls.push({ cmd, args });
+          return Buffer.alloc(0);
+        },
+      }),
+    ).toEqual({ resealed: false, reason: 'developer_id_signing' });
+    expect(devIdCalls).toHaveLength(0);
   });
 });

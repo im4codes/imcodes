@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { PC_APP_BUNDLE_ID, resolveMacosSigningOptions } from '../electron-builder.config.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(SCRIPT_DIR, '..', '..', '..');
@@ -69,6 +70,20 @@ export async function runAfterSign(context, deps = {}) {
   const appPath = resolveMacosAppBundlePath(context);
   if (!checkExists(appPath)) {
     throw new Error(`afterSign expected signed .app bundle at ${appPath}`);
+  }
+
+  // Restore `-i codes.im.pc` on ad-hoc builds before `.dmg` creation (electron-builder overwrites
+  // extraResources binary identifiers with a content hash during signing). Never touch Developer ID builds.
+  const hasDeveloperIdEnv =
+    resolveMacosSigningOptions(env).mode !== 'ad-hoc' || Boolean(env.MACOS_CODESIGN_IDENTITY?.trim());
+  const packagedSpeechBin = join(appPath, 'Contents', 'Resources', 'imcodes-speech');
+  if (!hasDeveloperIdEnv && checkExists(packagedSpeechBin)) {
+    execFn('codesign', ['--force', '--sign', '-', '-i', PC_APP_BUNDLE_ID, packagedSpeechBin], {
+      stdio: 'pipe',
+    });
+    execFn('codesign', ['--force', '--sign', '-', appPath], {
+      stdio: 'pipe',
+    });
   }
 
   const notary = resolveMacosNotaryState(env);
