@@ -2025,4 +2025,24 @@ describe('styles.css regression contracts', () => {
     expect(overlayRule).toMatch(/transform:\s*translateX\(-50%\)/);
     expect(overlayRule).toMatch(/pointer-events:\s*none/);
   });
+
+  it('styles .chat-sel-menu and .chat-sel-btn with frosted-glass cyan accents and danger/copied variants', () => {
+    const topLevelCss = `{\n${cssWithoutComments}\n}`;
+    const menuRule = cssWithoutComments.match(/^\.chat-sel-menu\s*\{[^}]*\}/m)?.[0] ?? '';
+    expect(menuRule).toMatch(/background:\s*rgba\(15,\s*23,\s*42,\s*0\.88\)/);
+    expect(menuRule).toMatch(/backdrop-filter:\s*blur\(14px\)/);
+    expect(menuRule).toMatch(/border:\s*1px solid rgba\(56,\s*189,\s*248,\s*0\.22\)/);
+    expect(menuRule).toMatch(/border-radius:\s*10px/);
+
+    const btnRule = cssWithoutComments.match(/^\.chat-sel-btn\s*\{[^}]*\}/m)?.[0] ?? '';
+    expect(btnRule).toMatch(/display:\s*inline-flex/);
+    expect(btnRule).toMatch(/align-items:\s*center/);
+    expect(btnRule).toMatch(/border-radius:\s*7px/);
+
+    const dangerRule = extractDirectStyleRule(topLevelCss, /\.chat-sel-btn-danger\s*/) ?? '';
+    expect(dangerRule).toMatch(/color:\s*#fca5a5/);
+
+    const copiedRule = extractDirectStyleRule(topLevelCss, /\.chat-sel-btn\.copied\s*/) ?? '';
+    expect(copiedRule).toMatch(/color:\s*#86efac/);
+  });
 });

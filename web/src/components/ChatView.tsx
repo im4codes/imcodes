@@ -4824,6 +4824,40 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // Touch gesture mode is based on pointer coarseness only. Narrow desktop
   // windows still need native selection and the Copy/Quote popup.
   const isTouchDevice = useTouchChatGestures();
+  const renderMenuIcon = (kind: 'copy' | 'copied' | 'speak' | 'stop' | 'quote' | 'quoteAll' | 'pin' | 'unpin' | 'delete') => {
+    const props = {
+      class: 'chat-sel-btn-icon',
+      viewBox: '0 0 24 24',
+      width: '13',
+      height: '13',
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': '1.9',
+      'stroke-linecap': 'round' as const,
+      'stroke-linejoin': 'round' as const,
+      'aria-hidden': 'true' as const,
+    };
+    switch (kind) {
+      case 'copied':
+        return <svg {...props}><polyline points="20 6 9 17 4 12" /></svg>;
+      case 'copy':
+        return <svg {...props}><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>;
+      case 'speak':
+        return <svg {...props}><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" /><path d="M15.54 8.46a5 5 0 0 1 0 7.07" /></svg>;
+      case 'stop':
+        return <svg {...props}><rect x="6" y="6" width="12" height="12" rx="2" /></svg>;
+      case 'quote':
+        return <svg {...props}><path d="M9 17H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h4v8" /><path d="M21 17h-4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h4v8" /></svg>;
+      case 'quoteAll':
+        return <svg {...props}><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>;
+      case 'pin':
+        return <svg {...props}><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16h14v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>;
+      case 'unpin':
+        return <svg {...props}><line x1="2" y1="2" x2="22" y2="22" /><path d="M12 17v5" /><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16h11" /><path d="M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89" /></svg>;
+      case 'delete':
+        return <svg {...props}><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /></svg>;
+    }
+  };
   const getActionMenuContainerRect = useCallback(() => {
     const container = scrollRef.current;
     if (!container) return null;
@@ -5662,6 +5696,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                 });
               }}
             >
+              {renderMenuIcon(copied ? 'copied' : 'copy')}
               {copied ? t('common.copied') : t('common.copy')}
             </button>
             {(() => {
@@ -5683,6 +5718,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                     if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                   }}
                 >
+                  {renderMenuIcon(isCtxSpeaking ? 'stop' : 'speak')}
                   {isCtxSpeaking ? t('chat.tts_stop') : t('chat.tts_speak')}
                 </button>
               );
@@ -5696,6 +5732,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   window.getSelection()?.removeAllRanges();
                 }}
               >
+                {renderMenuIcon('quote')}
                 {t('common.quote', 'Quote')}
               </button>
             )}
@@ -5719,6 +5756,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                 });
               }}
             >
+              {renderMenuIcon(copied ? 'copied' : 'copy')}
               {copied ? t('common.copied') : t('common.copy')}
             </button>
             {(() => {
@@ -5740,6 +5778,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                     if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                   }}
                 >
+                  {renderMenuIcon(isCtxSpeaking ? 'stop' : 'speak')}
                   {isCtxSpeaking ? t('chat.tts_stop') : t('chat.tts_speak')}
                 </button>
               );
@@ -5754,6 +5793,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
               >
+                {renderMenuIcon('quote')}
                 {t('common.quote', 'Quote')}
               </button>
               <button
@@ -5764,6 +5804,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
               >
+                {renderMenuIcon('quoteAll')}
                 {t('common.quote_block', 'Quote All')}
               </button>
               </>
@@ -5787,13 +5828,13 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
               >
+                {renderMenuIcon(contextMenuPin ? 'unpin' : 'pin')}
                 {contextMenuPin ? t('messagePins.unpin') : t('messagePins.pin')}
               </button>
             )}
             {ctxMenu.eventId && ws && sessionId && (
               <button
-                class="chat-sel-btn"
-                style={{ color: '#e5484d' }}
+                class="chat-sel-btn chat-sel-btn-danger"
                 onClick={() => {
                   const eid = ctxMenu.eventId;
                   if (!eid || !sessionId || !ws) return;
@@ -5804,6 +5845,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
               >
+                {renderMenuIcon('delete')}
                 {t('chat.delete_message')}
               </button>
             )}

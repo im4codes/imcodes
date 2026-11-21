@@ -8105,7 +8105,38 @@ html.native-ios-mac .chat-dl-btn {
 @keyframes thinking-pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
 .chat-bubble-content { white-space: pre-wrap; word-break: break-word; }
 .chat-bubble-time { font-size: 10px; color: #64748b; margin-top: 2px; }
-.chat-sel-menu { position: absolute; z-index: 20; pointer-events: auto; display: flex; flex-wrap: wrap; gap: 4px; max-width: calc(100% - 16px); box-sizing: border-box; }
+@keyframes ctx-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.chat-sel-menu {
+  position: absolute;
+  z-index: 20;
+  pointer-events: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px;
+  max-width: calc(100% - 16px);
+  box-sizing: border-box;
+  padding: 4px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.88);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+  border: 1px solid rgba(56, 189, 248, 0.22);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55), 0 0 18px rgba(56, 189, 248, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  animation: ctx-menu-in 0.14s cubic-bezier(0.16, 1, 0.3, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-sel-menu { animation: none; }
+}
 /* Touch-pointer layout: disable native text selection/callout in chat so our
    custom long-press timer handles Copy/Quote. This intentionally does NOT use
    viewport width: desktop users can run narrow windows and still need native
@@ -8133,9 +8164,58 @@ html.mobile-nav-gesture-active .chat-view {
   -webkit-touch-callout: none !important;
   -webkit-tap-highlight-color: transparent;
 }
-.chat-sel-btn { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; font-size: 13px; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-family: inherit; white-space: nowrap; box-shadow: 0 4px 12px rgba(0,0,0,0.4); transition: background 0.15s; }
-.chat-sel-btn:hover { background: #334155; }
-.chat-sel-btn.copied { background: #166534; border-color: #16a34a; color: #86efac; }
+.chat-sel-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(30, 41, 59, 0.55);
+  border: 1px solid transparent;
+  color: #cbd5e1;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.25;
+  padding: 5px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
+}
+.chat-sel-btn:hover {
+  background: rgba(56, 189, 248, 0.14);
+  border-color: rgba(56, 189, 248, 0.32);
+  color: #f1f5f9;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.12);
+}
+.chat-sel-btn:active {
+  transform: scale(0.96);
+}
+.chat-sel-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.chat-sel-btn-icon {
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+.chat-sel-btn:hover .chat-sel-btn-icon {
+  opacity: 1;
+}
+.chat-sel-btn.copied {
+  background: rgba(22, 101, 52, 0.72);
+  border-color: rgba(74, 222, 128, 0.45);
+  color: #86efac;
+  box-shadow: 0 0 10px rgba(34, 197, 94, 0.18);
+}
+.chat-sel-btn-danger {
+  color: #fca5a5;
+}
+.chat-sel-btn-danger:hover {
+  background: rgba(239, 68, 68, 0.16);
+  border-color: rgba(248, 113, 113, 0.36);
+  color: #fecaca;
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.14);
+}
 .chat-scroll-btn { position: absolute; bottom: 12px; right: 12px; width: 36px; height: 36px; border-radius: 50%; background: #334155; color: #e2e8f0; border: 1px solid #475569; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; z-index: 10; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
 .chat-scroll-btn:hover { background: #475569; }
 .chat-snapshot-toggle { background: none; border: none; color: #64748b; cursor: pointer; font-size: 11px; font-family: inherit; padding: 2px 4px; }
@@ -23007,7 +23087,8 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 :is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card,
 :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card,
 :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-edge-indicator,
-:is(html.native-ios-mac, html.native-mac-desktop) .chat-tts-settings-popover {
+:is(html.native-ios-mac, html.native-mac-desktop) .chat-tts-settings-popover,
+:is(html.native-ios-mac, html.native-mac-desktop) .chat-sel-menu {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }
@@ -23023,6 +23104,10 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 :is(html.native-ios-mac, html.native-mac-desktop) .peer-audit-overlay,
 :is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop {
   background: rgba(2, 6, 23, 0.88);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .chat-sel-menu {
+  background: rgba(15, 23, 42, 0.96);
 }
 
 :is(html.native-ios-mac, html.native-mac-desktop) .voice-overlay-backdrop,
