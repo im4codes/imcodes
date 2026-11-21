@@ -262,6 +262,48 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     await stopPromise;
   });
 
+  it('surfaces bounded helper stderr on non-zero helper_exited and omits empty message', async () => {
+    const ctx = setupController({
+      micStatus: 'granted',
+      helperRequestJson: JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+    });
+    const ev: PcAppIpcInvokeEventLike = {
+      sender: ctx.mainWc,
+      senderFrame: { url: 'https://app.im.codes/session/1' },
+    };
+
+    expect(await ctx.handlers.get(PC_APP_VOICE_CHANNELS.startListening)!(ev, {})).toEqual({ ok: true });
+    ctx.spawned.stderr.emit('data', `${'prefix-'.repeat(100)}audio tap failed\n`);
+    ctx.spawned.emit('exit', 1);
+
+    expect(ctx.sentEvents).toHaveLength(2);
+    const errEvent = ctx.sentEvents[0]!;
+    expect(errEvent.type).toBe('error');
+    if (errEvent.type === 'error') {
+      expect(errEvent.code).toBe('helper_exited');
+      expect(errEvent.message).toBeDefined();
+      expect(errEvent.message!.length).toBeLessThanOrEqual(512);
+      expect(errEvent.message).toContain('audio tap failed');
+    }
+    expect(ctx.sentEvents[1]).toEqual({ type: 'end' });
+
+    const ctxEmpty = setupController({
+      micStatus: 'granted',
+      helperRequestJson: JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+    });
+    const evEmpty: PcAppIpcInvokeEventLike = {
+      sender: ctxEmpty.mainWc,
+      senderFrame: { url: 'https://app.im.codes/session/1' },
+    };
+    expect(await ctxEmpty.handlers.get(PC_APP_VOICE_CHANNELS.startListening)!(evEmpty, {})).toEqual({ ok: true });
+    ctxEmpty.spawned.stderr.emit('data', '   \n  ');
+    ctxEmpty.spawned.emit('exit', 2);
+    expect(ctxEmpty.sentEvents).toEqual([
+      { type: 'error', code: 'helper_exited' },
+      { type: 'end' },
+    ]);
+  });
+
   it('handles win32 safely without invoking darwin-only media/Swift APIs', async () => {
     const ctx = setupController({ platform: 'win32' });
     const ev: PcAppIpcInvokeEventLike = {

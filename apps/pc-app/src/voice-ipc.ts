@@ -541,10 +541,18 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     activeChild = child;
 
     let stdoutBuffer = '';
+    let stderrBuffer = '';
     const emitSafe = (payload: PcAppVoiceEvent) => {
       if (!deps.getCurrentTrustedOrigin()) return;
       deps.sendToRenderer(PC_APP_VOICE_CHANNELS.event, payload);
     };
+
+    child.stderr?.on('data', (chunk: Buffer | string) => {
+      stderrBuffer += String(chunk);
+      if (stderrBuffer.length > 512) {
+        stderrBuffer = stderrBuffer.slice(-512);
+      }
+    });
 
     child.stdout?.on('data', (chunk: Buffer | string) => {
       stdoutBuffer += String(chunk);
@@ -569,7 +577,12 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       if (activeChild === child) {
         activeChild = null;
         if (code && code !== 0) {
-          emitSafe({ type: 'error', code: 'helper_exited' });
+          const message = stderrBuffer.trim();
+          emitSafe({
+            type: 'error',
+            code: 'helper_exited',
+            ...(message ? { message } : {}),
+          });
         }
         emitSafe({ type: 'end' });
       }

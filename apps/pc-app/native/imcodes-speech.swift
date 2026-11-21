@@ -146,7 +146,7 @@ final class SpeechSession {
     req.shouldReportPartialResults = true
     request = req
 
-    inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+    inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
       guard let self = self else { return }
       req.append(buffer)
       self.maybeEmitLevel(buffer: buffer)
@@ -221,17 +221,32 @@ final class SpeechSession {
     if now.timeIntervalSince(lastLevelEmit) < 0.09 {
       return
     }
-    lastLevelEmit = now
-    guard let channelData = buffer.floatChannelData?[0] else { return }
     let frameLength = Int(buffer.frameLength)
     if frameLength <= 0 { return }
-    var sum: Float = 0
-    for i in 0..<frameLength {
-      let s = channelData[i]
-      sum += s * s
+    var sum: Double = 0
+    if let channelData = buffer.floatChannelData?[0] {
+      for i in 0..<frameLength {
+        let s = Double(channelData[i])
+        sum += s * s
+      }
+    } else if let int16Data = buffer.int16ChannelData?[0] {
+      let scale = Double(Int16.max)
+      for i in 0..<frameLength {
+        let s = Double(int16Data[i]) / scale
+        sum += s * s
+      }
+    } else if let int32Data = buffer.int32ChannelData?[0] {
+      let scale = Double(Int32.max)
+      for i in 0..<frameLength {
+        let s = Double(int32Data[i]) / scale
+        sum += s * s
+      }
+    } else {
+      return
     }
-    let rms = sqrt(sum / Float(frameLength))
-    let normalized = min(1.0, Double(rms * 4.0))
+    lastLevelEmit = now
+    let rms = sqrt(sum / Double(frameLength))
+    let normalized = min(1.0, rms * 4.0)
     emitJson(["type": "level", "value": normalized])
   }
 
