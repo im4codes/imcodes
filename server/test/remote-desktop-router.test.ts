@@ -1376,6 +1376,73 @@ describe('RemoteDesktopRouter', () => {
     });
   });
 
+  it('evicts stale browserDetached routes for the user before enforcing MAX_PER_USER or machine limits while still rejecting live limits', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_800_000_000_000);
+      const f = fixture({ access: validAccess(Date.now()) });
+
+      // 1. User fills MAX_PER_USER (2) on two separate sockets, then both drop -> detached.
+      const sock1 = {} as WebSocket;
+      const sock2 = {} as WebSocket;
+      const authOld = await authorize(f, sock1, 'owner-user', 'request_detach01');
+      vi.setSystemTime(1_800_000_005_000);
+      const authNew = await authorize(f, sock2, 'owner-user', 'request_detach02');
+
+      f.router.dropSocket(sock1);
+      f.router.dropSocket(sock2);
+      expect(f.router.stats().active).toBe(2);
+
+      // Fresh start for same user evicts only the oldest detached route (`authOld`), admits new session,
+      // and preserves `authNew` so resume still succeeds.
+      const sock3 = {} as WebSocket;
+      const authFresh = await authorize(f, sock3, 'owner-user', 'request_detach03');
+      expect(f.daemonMessages).toContainEqual(expect.objectContaining({
+        type: REMOTE_DESKTOP_MSG.STOP,
+        sessionId: authOld.sessionId,
+      }));
+      expect(f.daemonMessages).not.toContainEqual(expect.objectContaining({
+        type: REMOTE_DESKTOP_MSG.STOP,
+        sessionId: authNew.sessionId,
+      }));
+      expect(authFresh.sessionId).not.toBe(authOld.sessionId);
+
+      // Newer un-evicted detached route remains resumable.
+      const sockResume = {} as WebSocket;
+      await f.router.handleBrowser(sockResume, 'owner-user', {
+        type: REMOTE_DESKTOP_MSG.RESUME,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        ...authNew,
+      });
+      expect(f.messages(sockResume).at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.RESUMED,
+        sessionId: authNew.sessionId,
+      });
+
+      // Now user has MAX_PER_USER LIVE routes (`authFresh` + `authNew`); another start still fails with SESSION_LIMIT.
+      const sockLiveRejected = {} as WebSocket;
+      await f.router.handleBrowser(sockLiveRejected, 'owner-user', { ...start, requestId: 'request_detach04' });
+      expect(f.messages(sockLiveRejected).at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.ERROR,
+        error: REMOTE_DESKTOP_ERROR.SESSION_LIMIT,
+      });
+
+      // Fill remaining machine capacity with other users' live routes -> another user with no detached routes gets SESSION_LIMIT.
+      await authorize(f, {} as WebSocket, 'other-user-1', 'request_detach05');
+      await authorize(f, {} as WebSocket, 'other-user-2', 'request_detach06');
+      expect(f.router.stats().active).toBe(REMOTE_DESKTOP_LIMITS.MAX_PER_MACHINE);
+
+      const otherUserOverLimit = {} as WebSocket;
+      await f.router.handleBrowser(otherUserOverLimit, 'other-user-3', { ...start, requestId: 'request_detach07' });
+      expect(f.messages(otherUserOverLimit).at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.ERROR,
+        error: REMOTE_DESKTOP_ERROR.SESSION_LIMIT,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('charges each daemon signal once against the shared machine budget', async () => {
     const f = fixture();
     const sessions = await Promise.all(Array.from(

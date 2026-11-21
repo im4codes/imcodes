@@ -227,7 +227,7 @@ import { ControlledNodeQuickMenu } from './components/ControlledNodeQuickMenu.js
 import { RemoteDesktopWorkspace } from './components/RemoteDesktopWorkspace.js';
 import { RemoteDesktopWall, REMOTE_DESKTOP_WALL_WINDOW_ID } from './components/RemoteDesktopWall.js';
 import { RemoteDesktopGuestAccess } from './components/RemoteDesktopGuestAccess.js';
-import { RemoteDesktopConnectionManager } from './remote-desktop-connection-manager.js';
+import { RemoteDesktopConnectionManager, remoteDesktopHostKey } from './remote-desktop-connection-manager.js';
 import { openRemoteDesktopWallWindow } from './remote-desktop-window.js';
 import {
   REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
@@ -3291,8 +3291,12 @@ function InternalMainApp() {
   remoteDesktopWorkspaceRef.current = remoteDesktopWorkspace;
   const [remoteDesktopWorkspaceMinimized, setRemoteDesktopWorkspaceMinimized] = useState(false);
   const [remoteDesktopWallOpen, setRemoteDesktopWallOpen] = useState(false);
+  const remoteDesktopWallOpenRef = useRef(remoteDesktopWallOpen);
+  remoteDesktopWallOpenRef.current = remoteDesktopWallOpen;
   const [remoteDesktopWallMinimized, setRemoteDesktopWallMinimized] = useState(false);
   const [remoteDesktopWallHostKeys, setRemoteDesktopWallHostKeys] = useState<readonly string[]>([]);
+  const remoteDesktopWallHostKeysRef = useRef(remoteDesktopWallHostKeys);
+  remoteDesktopWallHostKeysRef.current = remoteDesktopWallHostKeys;
   const [remoteDesktopGuestAccess, setRemoteDesktopGuestAccess] = useState<{ publicNodeId?: string } | null>(null);
   const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
   const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
@@ -3312,6 +3316,19 @@ function InternalMainApp() {
   }, [ensureDesktopWindow, selectedServerId]);
 
   const openRemoteDesktop = useCallback((machine: MachineListItem) => {
+    const hostKey = remoteDesktopHostKey(machine);
+    if (
+      hostKey
+      && !remoteDesktopWorkspaceRef.current.hosts[hostKey]
+      && remoteDesktopWallOpenRef.current
+      && remoteDesktopWallHostKeysRef.current.includes(hostKey)
+    ) {
+      setRemoteDesktopWallMinimized(false);
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall, {
+        kind: DESKTOP_WINDOW_KINDS.remoteDesktopWall,
+      }, { bringToFront: true });
+      return;
+    }
     setRemoteDesktopWorkspace((current) => openRemoteDesktopWorkspaceHost(current, machine));
     setRemoteDesktopWorkspaceMinimized(false);
     ensureDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID, {
@@ -8229,8 +8246,6 @@ function InternalMainApp() {
   remoteDesktopWorkspaceOpenRef.current = remoteDesktopWorkspace.open;
   const remoteDesktopWorkspaceMinimizedRef = useRef(remoteDesktopWorkspaceMinimized);
   remoteDesktopWorkspaceMinimizedRef.current = remoteDesktopWorkspaceMinimized;
-  const remoteDesktopWallOpenRef = useRef(remoteDesktopWallOpen);
-  remoteDesktopWallOpenRef.current = remoteDesktopWallOpen;
   const remoteDesktopWallMinimizedRef = useRef(remoteDesktopWallMinimized);
   remoteDesktopWallMinimizedRef.current = remoteDesktopWallMinimized;
   const returnToMainWindow = useCallback(() => {

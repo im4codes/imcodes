@@ -1116,20 +1116,15 @@ export class RemoteDesktopRouter {
       this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.INVALID_REQUEST, false);
       return;
     }
-    if (this.routesBySession.size >= REMOTE_DESKTOP_LIMITS.MAX_PER_MACHINE
-      || this.routesBySession.size >= REMOTE_DESKTOP_LIMITS.MAX_PEER_CONNECTIONS_PER_WORKER
-      || this.routesBySession.size >= REMOTE_DESKTOP_LIMITS.MAX_TURN_ALLOCATIONS_PER_MACHINE) {
-      this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.SESSION_LIMIT, true);
-      return;
+    let counts = this.countActiveRoutes(socket, userId);
+    if (this.machineRouteLimitReached(counts.total)
+      || counts.userCount >= REMOTE_DESKTOP_LIMITS.MAX_PER_USER) {
+      await this.evictDetachedRoutesForLimits(socket, userId);
+      counts = this.countActiveRoutes(socket, userId);
     }
-    let socketCount = 0;
-    let userCount = 0;
-    for (const route of this.routesBySession.values()) {
-      if (route.socket === socket) socketCount++;
-      if (route.userId === userId) userCount++;
-    }
-    if (socketCount >= REMOTE_DESKTOP_LIMITS.MAX_PER_BROWSER
-      || userCount >= REMOTE_DESKTOP_LIMITS.MAX_PER_USER) {
+    if (this.machineRouteLimitReached(counts.total)
+      || counts.socketCount >= REMOTE_DESKTOP_LIMITS.MAX_PER_BROWSER
+      || counts.userCount >= REMOTE_DESKTOP_LIMITS.MAX_PER_USER) {
       this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.SESSION_LIMIT, true);
       return;
     }
@@ -1176,9 +1171,13 @@ export class RemoteDesktopRouter {
     }
     // Serialize the DB await with the bounded machine registry so concurrent
     // starts cannot oversubscribe peer/encoder/TURN resources.
-    if (this.routesBySession.size >= REMOTE_DESKTOP_LIMITS.MAX_PER_MACHINE
-      || this.routesBySession.size >= REMOTE_DESKTOP_LIMITS.MAX_PEER_CONNECTIONS_PER_WORKER
-      || this.routesBySession.size >= REMOTE_DESKTOP_LIMITS.MAX_TURN_ALLOCATIONS_PER_MACHINE) {
+    if (this.machineRouteLimitReached(this.routesBySession.size)) {
+      await this.evictDetachedRoutesForLimits(socket, userId);
+    }
+    const postAccessCounts = this.countActiveRoutes(socket, userId);
+    if (this.machineRouteLimitReached(postAccessCounts.total)
+      || postAccessCounts.socketCount >= REMOTE_DESKTOP_LIMITS.MAX_PER_BROWSER
+      || postAccessCounts.userCount >= REMOTE_DESKTOP_LIMITS.MAX_PER_USER) {
       this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.SESSION_LIMIT, true);
       return;
     }
@@ -2088,8 +2087,53 @@ export class RemoteDesktopRouter {
     this.deleteRoute(route);
   }
 
+  private countActiveRoutes(socket: WebSocket, userId: string): {
+    total: number;
+    socketCount: number;
+    userCount: number;
+  } {
+    let socketCount = 0;
+    let userCount = 0;
+    for (const route of this.routesBySession.values()) {
+      if (route.socket === socket) socketCount++;
+      if (route.userId === userId) userCount++;
+    }
+    return { total: this.routesBySession.size, socketCount, userCount };
+  }
+
+  private machineRouteLimitReached(total: number): boolean {
+    return total >= REMOTE_DESKTOP_LIMITS.MAX_PER_MACHINE
+      || total >= REMOTE_DESKTOP_LIMITS.MAX_PEER_CONNECTIONS_PER_WORKER
+      || total >= REMOTE_DESKTOP_LIMITS.MAX_TURN_ALLOCATIONS_PER_MACHINE;
+  }
+
+  private async evictDetachedRoutesForLimits(socket: WebSocket, userId: string): Promise<void> {
+    const detachedForUser = [...this.routesBySession.values()]
+      .filter((route) => route.browserDetached && route.userId === userId)
+      .sort((a, b) => a.createdAt - b.createdAt);
+    if (detachedForUser.length === 0) return;
+
+    const closePromises: Promise<void>[] = [];
+    for (const stale of detachedForUser) {
+      const counts = this.countActiveRoutes(socket, userId);
+      const overUser = counts.userCount >= REMOTE_DESKTOP_LIMITS.MAX_PER_USER;
+      const overMachine = this.machineRouteLimitReached(counts.total);
+      if (!overUser && !overMachine) break;
+      this.stopDaemon(stale);
+      closePromises.push(this.closeRegisteredRoute(stale));
+      this.deleteRoute(stale);
+      this.audit(REMOTE_DESKTOP_AUDIT_EVENT.STOPPED, stale, {
+        browserDisconnected: true,
+        evictedForNewStart: true,
+      });
+    }
+    if (closePromises.length > 0) {
+      await Promise.all(closePromises);
+    }
+  }
+
   private deleteRoute(route: RemoteDesktopRoute): void {
-    this.closeRegisteredRoute(route);
+    void this.closeRegisteredRoute(route);
     if (route.browserReconnectTimer) clearTimeout(route.browserReconnectTimer);
     route.browserReconnectTimer = null;
     clearTimeout(route.negotiationTimer);
@@ -2105,12 +2149,12 @@ export class RemoteDesktopRouter {
     this.publishCollaborationCounts();
   }
 
-  private closeRegisteredRoute(route: RemoteDesktopRoute): void {
-    if (route.registryCloseStarted) return;
+  private closeRegisteredRoute(route: RemoteDesktopRoute): Promise<void> {
+    if (route.registryCloseStarted) return Promise.resolve();
     route.registryCloseStarted = true;
     const db = this.hooks.database();
-    if (!db) return;
-    void this.routeRegistry.close(db, {
+    if (!db) return Promise.resolve();
+    return this.routeRegistry.close(db, {
       ...route.registryIdentity,
       routeId: route.sessionId,
       now: this.now(),
