@@ -3,6 +3,16 @@ import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isSameActiveOrigin } from './security.js';
+import {
+  choiceToSpeechVariant,
+  isValidSpeechModelChoice,
+  PcAppSpeechModelDownloader,
+  PcAppSpeechModelStore,
+  type PcAppSpeechModelChoice,
+  type PcAppSpeechModelManifest,
+  type PcAppSpeechModelStatus,
+  type PcAppSpeechVariant,
+} from './speech-models.js';
 
 export const PC_APP_VOICE_CHANNELS = Object.freeze({
   getPermissions: 'imcodes:pc-voice:get-permissions',
@@ -10,6 +20,9 @@ export const PC_APP_VOICE_CHANNELS = Object.freeze({
   openPrivacySettings: 'imcodes:pc-voice:open-privacy-settings',
   startListening: 'imcodes:pc-voice:start',
   stopListening: 'imcodes:pc-voice:stop',
+  getSpeechModel: 'imcodes:pc-voice:get-speech-model',
+  setSpeechModel: 'imcodes:pc-voice:set-speech-model',
+  getSpeechModelStatus: 'imcodes:pc-voice:get-speech-model-status',
   event: 'imcodes:pc-voice:event',
 } as const);
 
@@ -45,9 +58,12 @@ export interface PcAppIpcMainLike {
 
 export interface PcAppVoiceControllerDeps {
   platform: NodeJS.Platform;
+  arch?: string;
   userDataDir: string;
+  speechModelsDir?: string;
   resourcesPath?: string;
   speechHelperPath?: string;
+  mlxHelperPath?: string;
   isMainWebContents: (sender: unknown) => boolean;
   getCurrentTrustedOrigin: () => string | null;
   getActiveOrigin: () => string | null;
@@ -61,6 +77,14 @@ export interface PcAppVoiceControllerDeps {
   runHelperAsync?: (binPath: string, args: string[]) => Promise<string>;
   spawnHelper?: (binPath: string, args: string[]) => ChildProcess;
   buildDevHelper?: (outPath: string) => string | null;
+  isMlxSupported?: boolean | (() => Promise<boolean> | boolean);
+  fetchModel?: typeof fetch;
+  mirrorOrigins?: readonly string[] | null;
+  customMirrors?: readonly string[] | string | null;
+  manifests?: Record<PcAppSpeechVariant, PcAppSpeechModelManifest>;
+  locale?: string;
+  timeZone?: string;
+  onSpeechModelStatusChanged?: (status: PcAppSpeechModelStatus) => void;
 }
 
 const MAC_PRIVACY_URLS: Record<PcAppPrivacyTarget, string> = {
@@ -133,6 +157,171 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let activeChild: ChildProcess | null = null;
   let activeStopTimer: ReturnType<typeof setTimeout> | null = null;
   let cachedDevHelperPath: string | null = null;
+  let cachedMlxSupport: boolean | null = null;
+  let lastProgressNotifiedBucket = -1;
+  let lastProgressNotifiedState: PcAppSpeechModelStatus['state'] | null = null;
+
+  const modelStore = new PcAppSpeechModelStore(deps.userDataDir);
+  let selectedModel: PcAppSpeechModelChoice = modelStore.load();
+  let modelDownloadState: PcAppSpeechModelStatus['state'] = 'idle';
+  let modelDownloadProgress = 0;
+  let modelDownloadedBytes = 0;
+  let modelTotalBytes = 0;
+  let modelDownloadError: string | undefined;
+
+  const resolveMlxHelperPath = (): string | null => {
+    if (deps.platform !== 'darwin') return null;
+    if ((deps.arch ?? process.arch) !== 'arm64') return null;
+    if (deps.mlxHelperPath) return deps.mlxHelperPath;
+    if (deps.resourcesPath) {
+      const packaged = join(deps.resourcesPath, 'imcodes-speech-mlx');
+      if (existsSync(packaged)) return packaged;
+    }
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const candidates = [
+      resolve(moduleDir, '../../native/qwen3-asr/.build/release/imcodes-speech-mlx'),
+      resolve(moduleDir, '../../native/qwen3-asr/.build/debug/imcodes-speech-mlx'),
+      resolve(moduleDir, '../native/qwen3-asr/.build/release/imcodes-speech-mlx'),
+      resolve(moduleDir, '../native/qwen3-asr/.build/debug/imcodes-speech-mlx'),
+    ];
+    return candidates.find((p) => existsSync(p)) ?? null;
+  };
+
+  const computeStatusSync = (): PcAppSpeechModelStatus => {
+    const variant = choiceToSpeechVariant(selectedModel);
+    const mlxSupported = cachedMlxSupport ?? false;
+    if (!variant) {
+      return {
+        selectedModel: 'system',
+        activeBackend: 'system',
+        state: 'idle',
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        mlxSupported,
+      };
+    }
+    const manifest = downloader.getManifest(variant);
+    const totalBytes = manifest.files.reduce((sum, f) => sum + f.expectedSize, 0);
+    const modelDir = downloader.getModelDirectory(variant);
+    const ready = downloader.isModelReadySync(variant);
+    if (ready) {
+      return {
+        selectedModel,
+        activeBackend: mlxSupported ? selectedModel : 'system',
+        state: mlxSupported ? 'ready' : 'unsupported',
+        progress: 1,
+        downloadedBytes: totalBytes,
+        totalBytes,
+        mlxSupported,
+        modelDir,
+      };
+    }
+    const effectiveState: PcAppSpeechModelStatus['state'] =
+      cachedMlxSupport === false
+        ? 'unsupported'
+        : modelDownloadState;
+    return {
+      selectedModel,
+      activeBackend: 'system',
+      state: effectiveState,
+      progress: modelDownloadProgress,
+      downloadedBytes: modelDownloadedBytes,
+      totalBytes: modelTotalBytes || totalBytes,
+      mlxSupported,
+      ...(modelDownloadError ? { error: modelDownloadError } : {}),
+      modelDir,
+    };
+  };
+
+  const notifyStatusChanged = (force = false) => {
+    const status = computeStatusSync();
+    const bucket = status.state === 'downloading' ? Math.floor(status.progress * 10) : -1;
+    if (!force && status.state === lastProgressNotifiedState && bucket === lastProgressNotifiedBucket) {
+      return;
+    }
+    lastProgressNotifiedState = status.state;
+    lastProgressNotifiedBucket = bucket;
+    deps.onSpeechModelStatusChanged?.(status);
+  };
+
+  const downloader = new PcAppSpeechModelDownloader({
+    modelsBaseDir: deps.speechModelsDir ?? join(deps.userDataDir, 'speech-models'),
+    manifests: deps.manifests,
+    explicitMirrors: deps.mirrorOrigins,
+    customMirrors: deps.customMirrors,
+    locale: deps.locale,
+    timeZone: deps.timeZone,
+    fetchFn: deps.fetchModel,
+    onProgress: (ev) => {
+      if (choiceToSpeechVariant(selectedModel) !== ev.variant) return;
+      modelDownloadState = ev.state;
+      modelDownloadProgress = ev.progress;
+      modelDownloadedBytes = ev.downloadedBytes;
+      modelTotalBytes = ev.totalBytes;
+      modelDownloadError = ev.error;
+      notifyStatusChanged(ev.state !== 'downloading');
+    },
+  });
+
+  const checkMlxSupported = async (): Promise<boolean> => {
+    if (deps.platform !== 'darwin' || (deps.arch ?? process.arch) !== 'arm64') {
+      cachedMlxSupport = false;
+      return false;
+    }
+    if (cachedMlxSupport !== null) return cachedMlxSupport;
+    if (deps.isMlxSupported !== undefined) {
+      try {
+        cachedMlxSupport = Boolean(
+          typeof deps.isMlxSupported === 'function'
+            ? await deps.isMlxSupported()
+            : deps.isMlxSupported,
+        );
+      } catch {
+        cachedMlxSupport = false;
+      }
+      return cachedMlxSupport;
+    }
+    const mlxBin = resolveMlxHelperPath();
+    if (!mlxBin) {
+      cachedMlxSupport = false;
+      return false;
+    }
+    try {
+      const raw = deps.runHelperSync
+        ? deps.runHelperSync(mlxBin, ['probe'])
+        : await (deps.runHelperAsync ?? defaultRunHelperAsync)(mlxBin, ['probe']);
+      const parsed = JSON.parse(raw.trim()) as { mlxSupported?: unknown };
+      cachedMlxSupport = parsed.mlxSupported === true;
+    } catch {
+      cachedMlxSupport = false;
+    }
+    return cachedMlxSupport;
+  };
+
+  const triggerDownloadIfSelected = async (): Promise<void> => {
+    const variant = choiceToSpeechVariant(selectedModel);
+    if (!variant) return;
+    const supported = await checkMlxSupported();
+    if (!supported) {
+      modelDownloadState = 'unsupported';
+      notifyStatusChanged(true);
+      return;
+    }
+    if (downloader.isModelReadySync(variant)) {
+      const valid = await downloader.verifyModelFilesOnDisk(variant);
+      if (valid) {
+        modelDownloadState = 'ready';
+        modelDownloadProgress = 1;
+        notifyStatusChanged(true);
+        return;
+      }
+    }
+    const manifest = downloader.getManifest(variant);
+    modelTotalBytes = manifest.files.reduce((sum, f) => sum + f.expectedSize, 0);
+    modelDownloadError = undefined;
+    void downloader.ensureDownloaded(variant);
+  };
 
   const isTrustedSender = (event: PcAppIpcInvokeEventLike): boolean => {
     if (!deps.isMainWebContents(event.sender)) return false;
@@ -304,19 +493,49 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     if (perms.mic !== 'granted') {
       return { ok: false, error: 'permission_denied', target: 'mic' };
     }
-    if (perms.speech !== 'granted') {
-      return { ok: false, error: 'permission_denied', target: 'speech' };
-    }
-    const bin = resolveSpeechHelperPath();
-    if (!bin) {
-      return { ok: false, error: 'speech_helper_unavailable' };
-    }
-    await stopListening({ abort: true });
 
-    const args = ['listen'];
-    if (typeof options?.locale === 'string' && options.locale.trim()) {
-      args.push('--locale', options.locale.trim());
+    const variant = choiceToSpeechVariant(selectedModel);
+    let bin: string | null = null;
+    let args: string[];
+
+    if (variant && (await checkMlxSupported()) && downloader.isModelReadySync(variant)) {
+      const mlxBin = resolveMlxHelperPath();
+      const verified = await downloader.verifyModelFilesOnDisk(variant);
+      if (mlxBin && verified) {
+        bin = mlxBin;
+        args = ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant];
+        if (typeof options?.locale === 'string' && options.locale.trim()) {
+          args.push('--locale', options.locale.trim());
+        }
+      } else {
+        if (!verified) {
+          void triggerDownloadIfSelected();
+        }
+        bin = null;
+        args = [];
+      }
+    } else {
+      if (variant) {
+        void triggerDownloadIfSelected();
+      }
+      args = [];
     }
+
+    if (!bin) {
+      if (perms.speech !== 'granted') {
+        return { ok: false, error: 'permission_denied', target: 'speech' };
+      }
+      bin = resolveSpeechHelperPath();
+      if (!bin) {
+        return { ok: false, error: 'speech_helper_unavailable' };
+      }
+      args = ['listen'];
+      if (typeof options?.locale === 'string' && options.locale.trim()) {
+        args.push('--locale', options.locale.trim());
+      }
+    }
+
+    await stopListening({ abort: true });
 
     const child = (deps.spawnHelper ?? ((p, a) => spawn(p, a, { stdio: ['pipe', 'pipe', 'pipe'] })))(bin, args);
     activeChild = child;
@@ -374,6 +593,39 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     return true;
   };
 
+  const getSpeechModel = (): PcAppSpeechModelChoice => selectedModel;
+
+  const getSpeechModelStatus = async (): Promise<PcAppSpeechModelStatus> => {
+    if (choiceToSpeechVariant(selectedModel)) {
+      await checkMlxSupported();
+    }
+    return computeStatusSync();
+  };
+
+  const setSpeechModel = async (rawModel: unknown): Promise<PcAppSpeechModelStatus> => {
+    if (!isValidSpeechModelChoice(rawModel)) {
+      throw new Error(`Invalid speech model: ${String(rawModel)}`);
+    }
+    selectedModel = rawModel;
+    modelStore.save(rawModel);
+    modelDownloadError = undefined;
+    modelDownloadProgress = 0;
+    modelDownloadedBytes = 0;
+    modelTotalBytes = 0;
+
+    if (rawModel === 'system') {
+      downloader.cancelActive();
+      modelDownloadState = 'idle';
+      notifyStatusChanged(true);
+      return computeStatusSync();
+    }
+
+    modelDownloadState = 'idle';
+    await triggerDownloadIfSelected();
+    notifyStatusChanged(true);
+    return computeStatusSync();
+  };
+
   const registerIpc = (ipcMain: PcAppIpcMainLike) => {
     ipcMain.handle(PC_APP_VOICE_CHANNELS.getPermissions, async (event) => {
       assertTrustedSender(event);
@@ -399,6 +651,18 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       const abort = Boolean(opts && typeof opts === 'object' && (opts as { abort?: unknown }).abort);
       await stopListening({ abort });
     });
+    ipcMain.handle(PC_APP_VOICE_CHANNELS.getSpeechModel, async (event) => {
+      assertTrustedSender(event);
+      return getSpeechModel();
+    });
+    ipcMain.handle(PC_APP_VOICE_CHANNELS.setSpeechModel, async (event, model) => {
+      assertTrustedSender(event);
+      return setSpeechModel(model);
+    });
+    ipcMain.handle(PC_APP_VOICE_CHANNELS.getSpeechModelStatus, async (event) => {
+      assertTrustedSender(event);
+      return getSpeechModelStatus();
+    });
   };
 
   const unregisterIpc = (ipcMain: PcAppIpcMainLike) => {
@@ -408,6 +672,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       PC_APP_VOICE_CHANNELS.openPrivacySettings,
       PC_APP_VOICE_CHANNELS.startListening,
       PC_APP_VOICE_CHANNELS.stopListening,
+      PC_APP_VOICE_CHANNELS.getSpeechModel,
+      PC_APP_VOICE_CHANNELS.setSpeechModel,
+      PC_APP_VOICE_CHANNELS.getSpeechModelStatus,
     ]) {
       ipcMain.removeHandler?.(channel);
     }
@@ -421,8 +688,16 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     openPrivacySettings,
     startListening,
     stopListening,
+    getSpeechModel,
+    setSpeechModel,
+    getSpeechModelStatus,
+    getSpeechModelStatusSync: computeStatusSync,
+    warmSelectedSpeechModel: triggerDownloadIfSelected,
     registerIpc,
     unregisterIpc,
-    dispose: () => stopListening({ abort: true }),
+    dispose: () => {
+      downloader.cancelActive();
+      return stopListening({ abort: true });
+    },
   };
 }

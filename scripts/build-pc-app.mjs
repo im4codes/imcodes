@@ -42,6 +42,7 @@ export const REPO_ROOT = resolve(SCRIPT_DIR, '..');
 export const DEFAULT_NODE_EXE_DIR = join(REPO_ROOT, 'dist-node-exe');
 export const DEFAULT_TMUX_DIR = join(DEFAULT_NODE_EXE_DIR, 'bundled-tmux-macos');
 export const DEFAULT_SPEECH_SWIFT_SRC = join(PC_APP_DIR, 'native', 'imcodes-speech.swift');
+export const DEFAULT_SPEECH_MLX_PKG_DIR = join(PC_APP_DIR, 'native', 'qwen3-asr');
 export const DEFAULT_SPEECH_BIN_DIR = join(DEFAULT_NODE_EXE_DIR, 'speech-helper-macos');
 export const DEFAULT_STAGE_ROOT = join(REPO_ROOT, '.pc-app-stage');
 export const DEFAULT_PC_APP_OUT_DIR = join(PC_APP_DIR, 'release');
@@ -172,7 +173,7 @@ export function buildMacosSpeechHelper({
 
 /**
  * Stage `extraResources` for macOS or Windows prior to `electron-builder` packing/signing.
- * - macOS: `imcodes`, `imcodes-speech` (when provided), `bin/tmux`, `terminfo/`, `licenses/`
+ * - macOS: `imcodes`, `imcodes-speech` (when provided), optional `imcodes-speech-mlx` (+ `mlx.metallib`), `bin/tmux`, `terminfo/`, `licenses/`
  * - Windows: `imcodes.exe`
  */
 export function stagePcAppResources({
@@ -180,6 +181,8 @@ export function stagePcAppResources({
   nodeExePath,
   tmuxDir,
   speechBinPath,
+  mlxSpeechBinPath,
+  mlxMetallibPath,
   stageDir,
 }) {
   if (!nodeExePath || !existsSync(nodeExePath)) {
@@ -206,6 +209,17 @@ export function stagePcAppResources({
       chmodSync(destSpeech, 0o755);
     }
 
+    let destMlxSpeech = null;
+    if (mlxSpeechBinPath && existsSync(mlxSpeechBinPath)) {
+      accessSync(mlxSpeechBinPath, fsConstants.X_OK);
+      destMlxSpeech = join(absStageDir, 'imcodes-speech-mlx');
+      cpSync(mlxSpeechBinPath, destMlxSpeech);
+      chmodSync(destMlxSpeech, 0o755);
+      if (mlxMetallibPath && existsSync(mlxMetallibPath)) {
+        cpSync(mlxMetallibPath, join(absStageDir, 'mlx.metallib'));
+      }
+    }
+
     const layout = validateBundledTmuxLayout(tmuxDir);
     const destBinDir = join(absStageDir, 'bin');
     const destTmux = join(destBinDir, 'tmux');
@@ -219,6 +233,7 @@ export function stagePcAppResources({
       stageDir: absStageDir,
       imcodesPath: destExe,
       ...(destSpeech ? { speechBinPath: destSpeech } : {}),
+      ...(destMlxSpeech ? { mlxSpeechBinPath: destMlxSpeech } : {}),
       tmuxBin: destTmux,
       terminfoDir: join(absStageDir, 'terminfo'),
       licensesDir: join(absStageDir, 'licenses'),

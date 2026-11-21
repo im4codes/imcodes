@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
@@ -5,12 +6,14 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { PcAppSpeechModelManifest, PcAppSpeechVariant } from '../src/speech-models.js';
 import {
   createPcAppVoiceController,
   PC_APP_VOICE_CHANNELS,
   resolvePrivacySettingsUrl,
   type PcAppIpcInvokeEventLike,
   type PcAppIpcMainLike,
+  type PcAppVoiceControllerDeps,
   type PcAppVoiceEvent,
 } from '../src/voice-ipc.js';
 
@@ -47,6 +50,7 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
 
   function setupController(opts: {
     platform?: NodeJS.Platform;
+    arch?: string;
     currentTrustedOrigin?: string | null;
     activeOrigin?: string | null;
     senderUrl?: string;
@@ -55,6 +59,12 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     helperStatusJson?: string;
     helperRequestJson?: string;
     spawnedProc?: ReturnType<typeof createFakeChildProcess>;
+    mlxHelperPath?: string;
+    isMlxSupported?: PcAppVoiceControllerDeps['isMlxSupported'];
+    fetchModel?: typeof fetch;
+    manifests?: Record<PcAppSpeechVariant, PcAppSpeechModelManifest>;
+    mirrorOrigins?: readonly string[] | null;
+    onSpeechModelStatusChanged?: PcAppVoiceControllerDeps['onSpeechModelStatusChanged'];
   } = {}) {
     const handlers = new Map<string, (ev: PcAppIpcInvokeEventLike, ...args: unknown[]) => Promise<unknown> | unknown>();
     const ipcMain: PcAppIpcMainLike = {
@@ -86,8 +96,10 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
 
     const voice = createPcAppVoiceController({
       platform: opts.platform ?? 'darwin',
+      arch: opts.arch ?? 'arm64',
       userDataDir: tempDir,
       speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+      mlxHelperPath: opts.mlxHelperPath,
       isMainWebContents: (sender) => sender === mainWc,
       getCurrentTrustedOrigin: () => currentTrusted,
       getActiveOrigin: () => activeOrigin,
@@ -99,6 +111,11 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       openSystemUrl,
       runHelperAsync,
       spawnHelper,
+      isMlxSupported: opts.isMlxSupported,
+      fetchModel: opts.fetchModel,
+      manifests: opts.manifests,
+      mirrorOrigins: opts.mirrorOrigins,
+      onSpeechModelStatusChanged: opts.onSpeechModelStatusChanged,
     });
     voice.registerIpc(ipcMain);
 
@@ -137,6 +154,9 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       PC_APP_VOICE_CHANNELS.openPrivacySettings,
       PC_APP_VOICE_CHANNELS.startListening,
       PC_APP_VOICE_CHANNELS.stopListening,
+      PC_APP_VOICE_CHANNELS.getSpeechModel,
+      PC_APP_VOICE_CHANNELS.setSpeechModel,
+      PC_APP_VOICE_CHANNELS.getSpeechModelStatus,
     ]) {
       const fn = ctx.handlers.get(ch)!;
       await expect(fn(untrustedFrameEvent, 'microphone')).rejects.toThrow(/Untrusted origin/);
@@ -279,4 +299,112 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       expect(typeof parsed.speechAvailable).toBe('boolean');
     });
   }
+
+  it('persists speech model selection, downloads in background, falls back to system until ready, and routes to Qwen3-ASR 0.6b/1.7b once verified', async () => {
+    const smallBuf = Buffer.from('06b-weights');
+    const largeBuf = Buffer.from('17b-weights');
+    const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'aufklarer/test-0.6b',
+        revision: 'rev06',
+        files: [{ filename: 'config.json', expectedSize: smallBuf.length, expectedSha256: sha(smallBuf) }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'aufklarer/test-1.7b',
+        revision: 'rev17',
+        files: [{ filename: 'config.json', expectedSize: largeBuf.length, expectedSha256: sha(largeBuf) }],
+      },
+    };
+
+    let release06!: () => void;
+    const download06Gate = new Promise<void>((res) => { release06 = res; });
+    const mlxBin = '/Applications/IM.codes.app/Contents/Resources/imcodes-speech-mlx';
+
+    const ctx = setupController({
+      micStatus: 'granted',
+      helperRequestJson: JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+      mlxHelperPath: mlxBin,
+      isMlxSupported: () => true,
+      manifests,
+      mirrorOrigins: ['https://hf-mirror.com'],
+      fetchModel: async (input) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.includes('test-0.6b')) {
+          await download06Gate;
+          return new Response(new Uint8Array(smallBuf), { status: 200 });
+        }
+        return new Response(new Uint8Array(largeBuf), { status: 200 });
+      },
+    });
+
+    const ev: PcAppIpcInvokeEventLike = {
+      sender: ctx.mainWc,
+      senderFrame: { url: 'https://app.im.codes/session/1' },
+    };
+
+    expect(await ctx.handlers.get(PC_APP_VOICE_CHANNELS.getSpeechModel)!(ev)).toBe('system');
+    await expect(ctx.handlers.get(PC_APP_VOICE_CHANNELS.setSpeechModel)!(ev, 'invalid-model')).rejects.toThrow(/Invalid speech model/);
+
+    // Switch to qwen3-0.6b while download is gated -> starts downloading, activeBackend stays 'system'
+    const initialStatus = await ctx.handlers.get(PC_APP_VOICE_CHANNELS.setSpeechModel)!(ev, 'qwen3-0.6b') as {
+      selectedModel: string;
+      activeBackend: string;
+      state: string;
+    };
+    expect(initialStatus.selectedModel).toBe('qwen3-0.6b');
+    expect(initialStatus.activeBackend).toBe('system');
+
+    // Starting voice before weights finish falls back cleanly to system SFSpeechRecognizer
+    expect(await ctx.handlers.get(PC_APP_VOICE_CHANNELS.startListening)!(ev, { locale: 'zh-CN' })).toEqual({ ok: true });
+    expect(ctx.spawnHelper).toHaveBeenLastCalledWith(
+      '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+      ['listen', '--locale', 'zh-CN'],
+    );
+
+    // Finish background download -> next startListening uses imcodes-speech-mlx with --variant 0.6b
+    release06();
+    await new Promise((res) => setTimeout(res, 25));
+    const ready06 = await ctx.handlers.get(PC_APP_VOICE_CHANNELS.getSpeechModelStatus)!(ev) as {
+      activeBackend: string;
+      state: string;
+      modelDir: string;
+    };
+    expect(ready06.state).toBe('ready');
+    expect(ready06.activeBackend).toBe('qwen3-0.6b');
+
+    expect(await ctx.handlers.get(PC_APP_VOICE_CHANNELS.startListening)!(ev, { locale: 'zh-CN' })).toEqual({ ok: true });
+    expect(ctx.spawnHelper).toHaveBeenLastCalledWith(
+      mlxBin,
+      ['listen', '--model-dir', ready06.modelDir, '--variant', '0.6b', '--locale', 'zh-CN'],
+    );
+
+    // Switch to 1.7b, verify persistence across new controller instance, and check x64 unsupported fallback
+    await ctx.handlers.get(PC_APP_VOICE_CHANNELS.setSpeechModel)!(ev, 'qwen3-1.7b');
+    await new Promise((res) => setTimeout(res, 25));
+    const ctx2 = setupController({
+      platform: 'darwin',
+      arch: 'x64',
+      micStatus: 'granted',
+      helperRequestJson: JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+      mlxHelperPath: mlxBin,
+      manifests,
+    });
+    expect(await ctx2.voice.getSpeechModel()).toBe('qwen3-1.7b');
+    const x64Status = await ctx2.voice.getSpeechModelStatus();
+    expect(x64Status.state).toBe('unsupported');
+    expect(x64Status.activeBackend).toBe('system');
+    expect(await ctx2.voice.startListening({ locale: 'en-US' })).toEqual({ ok: true });
+    expect(ctx2.spawnHelper).toHaveBeenLastCalledWith(
+      '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+      ['listen', '--locale', 'en-US'],
+    );
+
+    await ctx.voice.dispose();
+    await ctx2.voice.dispose();
+  });
 });

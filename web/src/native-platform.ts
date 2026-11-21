@@ -45,6 +45,20 @@ export type PcAppVoiceEvent =
   | { type: 'error'; code: string; target?: 'mic' | 'speech'; message?: string }
   | { type: 'end' };
 
+export type PcAppSpeechModelChoice = 'system' | 'qwen3-0.6b' | 'qwen3-1.7b';
+
+export interface PcAppSpeechModelStatus {
+  selectedModel: PcAppSpeechModelChoice;
+  activeBackend: PcAppSpeechModelChoice;
+  state: 'idle' | 'downloading' | 'ready' | 'failed' | 'unsupported';
+  progress: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  mlxSupported: boolean;
+  error?: string;
+  modelDir?: string;
+}
+
 export interface PcAppBridge {
   platform?: string;
   isElectron?: boolean;
@@ -55,6 +69,9 @@ export interface PcAppBridge {
     openPrivacySettings?: (target: 'microphone' | 'speech') => Promise<boolean>;
     startListening?: (options?: { locale?: string }) => Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }>;
     stopListening?: (options?: { abort?: boolean }) => Promise<void>;
+    getSpeechModel?: () => Promise<PcAppSpeechModelChoice>;
+    setSpeechModel?: (model: PcAppSpeechModelChoice) => Promise<PcAppSpeechModelStatus>;
+    getSpeechModelStatus?: () => Promise<PcAppSpeechModelStatus>;
     subscribe?: (listener: (event: PcAppVoiceEvent) => void) => () => void;
   };
 }

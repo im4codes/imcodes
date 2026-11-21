@@ -46,6 +46,8 @@ export async function startPcApp(): Promise<void> {
     ipcMain,
     voiceDeps: {
       resourcesPath: process.resourcesPath,
+      speechModelsDir: join(app.getPath('appData'), 'imcodes-pc-app', 'speech-models'),
+      locale: app.getLocale(),
       getMediaAccessStatus: process.platform === 'darwin'
         ? (mediaType) => systemPreferences.getMediaAccessStatus(mediaType)
         : undefined,

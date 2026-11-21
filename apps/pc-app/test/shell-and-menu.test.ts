@@ -561,10 +561,14 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       expect(findMenuItem(menu, 'app:settings')?.accelerator).toBe('CmdOrCtrl+,');
       expect(findMenuItem(menu, 'server:switch')?.label).toBe(tPcApp(locale, 'menu.server.switch'));
       expect(findMenuItem(menu, 'server:add')?.label).toBe(tPcApp(locale, 'menu.server.add'));
+      expect(findMenuItem(menu, 'voice:model-system')?.label).toBe(tPcApp(locale, 'menu.voice.system'));
+      expect(findMenuItem(menu, 'voice:model-qwen3-0.6b')?.label).toBe(tPcApp(locale, 'menu.voice.qwen06b'));
+      expect(findMenuItem(menu, 'voice:model-qwen3-1.7b')?.label).toBe(tPcApp(locale, 'menu.voice.qwen17b'));
       expect(findMenuItem(menu, 'help:docs')?.label).toBe(tPcApp(locale, 'menu.help.docs'));
       expect(menu.find((m) => m.label === tPcApp(locale, 'menu.edit.label'))).toBeDefined();
       expect(menu.find((m) => m.label === tPcApp(locale, 'menu.view.label'))).toBeDefined();
       expect(menu.find((m) => m.label === tPcApp(locale, 'menu.server.label'))).toBeDefined();
+      expect(menu.find((m) => m.label === tPcApp(locale, 'menu.voice.label'))).toBeDefined();
       expect(menu.find((m) => m.label === tPcApp(locale, 'menu.window.label'))).toBeDefined();
       expect(menu.find((m) => m.label === tPcApp(locale, 'menu.help.label'))).toBeDefined();
     }

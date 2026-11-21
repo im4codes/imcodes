@@ -6,6 +6,7 @@ import {
   type PcAppMessageKey,
 } from './i18n.js';
 import type { SavedServer } from './servers.js';
+import type { PcAppSpeechModelChoice, PcAppSpeechModelStatus } from './speech-models.js';
 
 export interface MenuItemOptionsLike {
   id?: string;
@@ -26,6 +27,8 @@ export interface AppMenuOptions {
   servers: SavedServer[];
   activeOrigin: string | null;
   boundServer?: BoundServerSummary | null;
+  speechModelStatus?: PcAppSpeechModelStatus;
+  onSelectSpeechModel?: (model: PcAppSpeechModelChoice) => void;
   onSelectServer: (origin: string) => void;
   onAddServer: () => void;
   onSwitchServer?: () => void;
@@ -167,6 +170,62 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     });
   }
 
+  const speechStatus = options.speechModelStatus;
+  const selectedSpeechModel = speechStatus?.selectedModel ?? 'system';
+  const speechStatusLabel = (() => {
+    if (!speechStatus || speechStatus.selectedModel === 'system' || speechStatus.state === 'idle') {
+      return t('menu.voice.statusIdle');
+    }
+    switch (speechStatus.state) {
+      case 'downloading':
+        return t('menu.voice.statusDownloading', {
+          progress: Math.round(speechStatus.progress * 100),
+        });
+      case 'ready':
+        return t('menu.voice.statusReady');
+      case 'failed':
+        return t('menu.voice.statusFailed');
+      case 'unsupported':
+        return t('menu.voice.statusUnsupported');
+    }
+  })();
+
+  const voiceMenu: MenuItemOptionsLike | null = platform === 'darwin'
+    ? {
+        id: 'voice:menu',
+        label: t('menu.voice.label'),
+        submenu: [
+          {
+            id: 'voice:model-system',
+            label: t('menu.voice.system'),
+            type: 'radio',
+            checked: selectedSpeechModel === 'system',
+            click: () => options.onSelectSpeechModel?.('system'),
+          },
+          {
+            id: 'voice:model-qwen3-0.6b',
+            label: t('menu.voice.qwen06b'),
+            type: 'radio',
+            checked: selectedSpeechModel === 'qwen3-0.6b',
+            click: () => options.onSelectSpeechModel?.('qwen3-0.6b'),
+          },
+          {
+            id: 'voice:model-qwen3-1.7b',
+            label: t('menu.voice.qwen17b'),
+            type: 'radio',
+            checked: selectedSpeechModel === 'qwen3-1.7b',
+            click: () => options.onSelectSpeechModel?.('qwen3-1.7b'),
+          },
+          { type: 'separator' },
+          {
+            id: 'voice:status',
+            label: speechStatusLabel,
+            enabled: false,
+          },
+        ],
+      }
+    : null;
+
   template.push(
     {
       label: t('menu.edit.label'),
@@ -195,6 +254,7 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
       ],
     },
     serverMenu,
+    ...(voiceMenu ? [voiceMenu] : []),
     {
       label: t('menu.window.label'),
       submenu: platform === 'darwin'

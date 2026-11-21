@@ -74,6 +74,9 @@ export interface PcAppShellDeps {
       PcAppVoiceControllerDeps,
       | 'resourcesPath'
       | 'speechHelperPath'
+      | 'mlxHelperPath'
+      | 'speechModelsDir'
+      | 'arch'
       | 'getMediaAccessStatus'
       | 'askForMediaAccess'
       | 'openSystemUrl'
@@ -81,6 +84,14 @@ export interface PcAppShellDeps {
       | 'runHelperAsync'
       | 'spawnHelper'
       | 'buildDevHelper'
+      | 'isMlxSupported'
+      | 'fetchModel'
+      | 'mirrorOrigins'
+      | 'customMirrors'
+      | 'manifests'
+      | 'locale'
+      | 'timeZone'
+      | 'onSpeechModelStatusChanged'
     >
   >;
   createMainWindow: (options: {
@@ -359,6 +370,10 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       servers: store.list(),
       activeOrigin: controller.getActiveOrigin(),
       boundServer: bind.getBoundSummary(),
+      speechModelStatus: voice?.getSpeechModelStatusSync(),
+      onSelectSpeechModel: (model) => {
+        void voice.setSpeechModel(model).then(() => rebuildMenu());
+      },
       onSelectServer: (origin) => void handleSelectServer(origin),
       onAddServer: () => void handleAddServer(),
       onSwitchServer: () => void showServerPicker(),
@@ -401,10 +416,14 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
         mainWindow.webContents.send?.(channel, payload);
       }
     },
+    onSpeechModelStatusChanged: () => rebuildMenu(),
     ...(deps.voiceDeps ?? {}),
   });
   if (deps.ipcMain) {
     voice.registerIpc(deps.ipcMain);
+  }
+  if (deps.platform === 'darwin' && voice.getSpeechModel() !== 'system') {
+    void voice.warmSelectedSpeechModel();
   }
 
   const ensureWindow = async (): Promise<ShellWindowLike> => {
