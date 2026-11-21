@@ -34,6 +34,7 @@ const TEXT_TAIL_HISTORY_PAGE_LIMIT = 500;
 const TEXT_TAIL_HISTORY_MAX_PAGES = 6;
 const TEXT_TAIL_HISTORY_TIMEOUT_MS = 1500;
 const TEXT_TAIL_MAX_ENCODED_BYTES = 64 * 1024;
+const WATCH_SNAPSHOT_AUTO_INCLUDE_MAIN_LIMIT = 5;
 const textTailBackfills = new Map<string, Promise<Awaited<ReturnType<typeof getSessionTextTailCache>>>>();
 
 type WatchSessionState = 'working' | 'idle' | 'error' | 'stopped';
@@ -438,12 +439,34 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
       }))
     : null;
 
+  const parseSessionListParam = (paramName: string): string[] => {
+    const rawValues = typeof c.req.queries === 'function'
+      ? (c.req.queries(paramName) ?? [])
+      : (() => {
+          const single = c.req.query(paramName);
+          return single ? [single] : [];
+        })();
+    return rawValues
+      .flatMap((value) => value.split(','))
+      .map((name) => name.trim())
+      .filter(Boolean);
+  };
+  const explicitSessions = new Set<string>([
+    ...parseSessionListParam('includeSessions'),
+    ...parseSessionListParam('sessions'),
+  ]);
+
   const mainSessions = (liveMainSessions ?? dbMainSessions)
     .filter((session) => !session.name.startsWith('deck_sub_'));
+  const fetchAllRecentText = mainSessions.length <= WATCH_SNAPSHOT_AUTO_INCLUDE_MAIN_LIMIT;
+  const isIncludedMainSession = (sessionName: string): boolean =>
+    fetchAllRecentText || tabPrefs.pinned.has(sessionName) || explicitSessions.has(sessionName);
 
   const mainTitleBySession = new Map<string, string>();
   const mainRows = await mapWithConcurrency(mainSessions, WATCH_RECENT_TEXT_CONCURRENCY, async (session) => {
-    const recentText = await bridge.getRecentTextForWatch(session.name);
+    const recentText = isIncludedMainSession(session.name)
+      ? await bridge.getRecentTextForWatch(session.name)
+      : [];
     const latest = recentText.at(-1);
     const row = {
       serverId,
@@ -467,7 +490,11 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
   const activeSubs = subSessions.filter((sub) => sub.parent_session && activeMainNames.has(sub.parent_session));
   const subRows = await mapWithConcurrency(activeSubs, WATCH_RECENT_TEXT_CONCURRENCY, async (sub) => {
     const sessionName = `deck_sub_${sub.id}`;
-    const recentText = await bridge.getRecentTextForWatch(sessionName);
+    const shouldFetchRecentText = (sub.parent_session ? isIncludedMainSession(sub.parent_session) : false)
+      || explicitSessions.has(sessionName);
+    const recentText = shouldFetchRecentText
+      ? await bridge.getRecentTextForWatch(sessionName)
+      : [];
     const latest = recentText.at(-1);
     return {
       serverId,

@@ -280,6 +280,111 @@ describe('Watch routes', () => {
     expect(mockGetRecentTextForWatch).toHaveBeenCalledWith('deck_proj_brain');
   });
 
+  it('GET /api/watch/sessions fetches recentText for all <= 5 main sessions and their active sub-sessions', async () => {
+    mockGetDbSessionsByServer.mockResolvedValue(
+      Array.from({ length: 5 }, (_, idx) => ({
+        name: `deck_proj_${idx + 1}`,
+        project_name: `proj-${idx + 1}`,
+        label: `Main ${idx + 1}`,
+        state: 'idle',
+        agent_type: 'codex',
+      })),
+    );
+    mockGetSubSessionsByServer.mockResolvedValue([
+      { id: 's5', type: 'shell', label: 'Sub 5', parent_session: 'deck_proj_5', closed_at: null },
+    ]);
+    mockGetRecentTextForWatch.mockImplementation(async (sessionName: string) => [
+      { eventId: `e-${sessionName}`, type: 'assistant.text', text: `text-${sessionName}`, ts: 100 },
+    ]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sessions: Array<{ sessionName: string; previewText?: string }> };
+    expect(body.sessions).toHaveLength(6);
+    expect(mockGetRecentTextForWatch).toHaveBeenCalledTimes(6);
+    expect(body.sessions.every((row) => row.previewText === `text-${row.sessionName}`)).toBe(true);
+  });
+
+  it('GET /api/watch/sessions skips recentText for unpinned/non-included sessions when mainSessions > 5 while keeping metadata', async () => {
+    mockGetDbSessionsByServer.mockResolvedValue(
+      Array.from({ length: 7 }, (_, idx) => ({
+        name: `deck_proj_${idx + 1}`,
+        project_name: `proj-${idx + 1}`,
+        label: `Main ${idx + 1}`,
+        state: idx === 0 ? 'running' : 'idle',
+        agent_type: 'claude-code',
+      })),
+    );
+    mockGetSubSessionsByServer.mockResolvedValue([
+      { id: 'pinned-sub', type: 'codex', label: 'Pinned Sub', parent_session: 'deck_proj_2', closed_at: null },
+      { id: 'other-sub', type: 'shell', label: 'Other Sub', parent_session: 'deck_proj_4', closed_at: null },
+    ]);
+    mockGetUserPref.mockImplementation(async (_db: unknown, _userId: string, key: string) => {
+      if (key === 'tab_pinned') return JSON.stringify({ v: ['deck_proj_2'], t: 1 });
+      return null;
+    });
+    mockGetRecentTextForWatch.mockImplementation(async (sessionName: string) => [
+      { eventId: `e-${sessionName}`, type: 'assistant.text', text: `text-${sessionName}`, ts: 100 },
+    ]);
+
+    const app = await buildTestApp();
+
+    // 1. Without includeSessions: only pinned main (deck_proj_2) + its sub (deck_sub_pinned-sub) fetch recentText
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      sessions: Array<{
+        sessionName: string;
+        title: string;
+        isSubSession: boolean;
+        parentTitle?: string;
+        isPinned: boolean;
+        previewText?: string;
+        recentText: unknown[];
+      }>;
+    };
+    expect(body.sessions).toHaveLength(9);
+    expect(mockGetRecentTextForWatch.mock.calls.map((c) => c[0])).toEqual([
+      'deck_proj_2',
+      'deck_sub_pinned-sub',
+    ]);
+    const pinnedRow = body.sessions.find((s) => s.sessionName === 'deck_proj_2')!;
+    const pinnedSubRow = body.sessions.find((s) => s.sessionName === 'deck_sub_pinned-sub')!;
+    const unpinnedRow = body.sessions.find((s) => s.sessionName === 'deck_proj_1')!;
+    const unpinnedSubRow = body.sessions.find((s) => s.sessionName === 'deck_sub_other-sub')!;
+    expect(pinnedRow.previewText).toBe('text-deck_proj_2');
+    expect(pinnedSubRow.previewText).toBe('text-deck_sub_pinned-sub');
+    expect(unpinnedRow.title).toBe('Main 1');
+    expect(unpinnedRow.previewText).toBeUndefined();
+    expect(unpinnedRow.recentText).toEqual([]);
+    expect(unpinnedSubRow.title).toBe('Other Sub');
+    expect(unpinnedSubRow.parentTitle).toBe('Main 4');
+    expect(unpinnedSubRow.previewText).toBeUndefined();
+    expect(unpinnedSubRow.recentText).toEqual([]);
+
+    // 2. With includeSessions=deck_proj_4: pinned + explicitly requested main & its sub fetch recentText
+    mockGetRecentTextForWatch.mockClear();
+    const resIncluded = await app.request('/api/watch/sessions?serverId=srv-1&includeSessions=deck_proj_4');
+    expect(resIncluded.status).toBe(200);
+    expect(mockGetRecentTextForWatch.mock.calls.map((c) => c[0])).toEqual([
+      'deck_proj_2',
+      'deck_proj_4',
+      'deck_sub_pinned-sub',
+      'deck_sub_other-sub',
+    ]);
+
+    // 3. > 5 sessions with 0 pinned and no includeSessions makes 0 RPC calls
+    mockGetRecentTextForWatch.mockClear();
+    mockGetUserPref.mockResolvedValue(null);
+    const resZeroPinned = await app.request('/api/watch/sessions?serverId=srv-1');
+    expect(resZeroPinned.status).toBe(200);
+    expect(mockGetRecentTextForWatch).not.toHaveBeenCalled();
+    const zeroBody = await resZeroPinned.json() as { sessions: unknown[] };
+    expect(zeroBody.sessions).toHaveLength(9);
+  });
+
   it('GET /api/server/:id/timeline/history preserves event identity and pagination metadata', async () => {
     const events = [
       { eventId: 'e-old', sessionId: 'deck_proj_brain', ts: 100, type: 'user.message', payload: { text: 'older' } },
@@ -1155,6 +1260,13 @@ describe('Watch routes', () => {
         closed_at: null,
       })),
     );
+
+    mockGetUserPref.mockImplementation(async (_db: unknown, _userId: string, key: string) => {
+      if (key === 'tab_pinned') {
+        return JSON.stringify({ v: Array.from({ length: 15 }, (_, m) => `deck_proj_${m}_brain`), t: 1 });
+      }
+      return null;
+    });
 
     let active = 0;
     let peak = 0;
