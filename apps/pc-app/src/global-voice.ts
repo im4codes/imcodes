@@ -132,7 +132,7 @@ function clampLevel(raw: unknown): number {
 type DictationPhase = 'idle' | 'starting' | 'listening' | 'draining' | 'pasting';
 
 /**
- * Manage macOS system-wide Double-Tap Ctrl hotkey detection, non-activating
+ * Manage macOS system-wide Double-Tap Shift hotkey detection, non-activating
  * floating NSPanel overlay (with IM.codes robot logo), dictation lifecycle,
  * and Accessibility Unicode pasting into foreground applications.
  */
@@ -152,6 +152,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
   let phase: DictationPhase = 'idle';
   let cancelRequestedDuringStart = false;
   let stopRequestedDuringStart = false;
+  let pendingEnterOnPaste = false;
   let latestText = '';
   let finalText: string | null = null;
   let latestLevel = 0;
@@ -264,14 +265,15 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
     }
   };
 
-  const pasteRecognizedText = async (text: string): Promise<void> => {
+  const pasteRecognizedText = async (text: string, sendEnter = false): Promise<void> => {
     const trimmed = text.trim();
     if (!trimmed) return;
     const bin = deps.getSpeechHelperPath();
     if (!bin) return;
     const runPaste = deps.runPasteHelper ?? defaultRunPasteHelper;
     try {
-      const stdout = await runPaste(bin, ['paste', '--stdin'], trimmed);
+      const pasteArgs = sendEnter ? ['paste', '--stdin', '--enter'] : ['paste', '--stdin'];
+      const stdout = await runPaste(bin, pasteArgs, trimmed);
       const line = stdout.trim().split('\n').pop() ?? '';
       if (line) {
         try {
@@ -292,6 +294,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
     phase = 'idle';
     cancelRequestedDuringStart = false;
     stopRequestedDuringStart = false;
+    pendingEnterOnPaste = false;
     latestText = '';
     finalText = null;
     latestLevel = 0;
@@ -300,6 +303,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
 
   const finishAndPasteCurrent = async (sessionId: number): Promise<void> => {
     if (phase !== 'listening' && phase !== 'starting') return;
+    const shouldSendEnter = pendingEnterOnPaste;
     phase = 'draining';
     showOverlay('draining', latestText, 0);
     await deps.voice.stopListening();
@@ -309,7 +313,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
     const textToPaste = (finalText ?? latestText).trim();
     if (textToPaste && !disposed && enabled) {
       phase = 'pasting';
-      await pasteRecognizedText(textToPaste);
+      await pasteRecognizedText(textToPaste, shouldSendEnter);
     }
     if (sessionId === activeSessionId) {
       resetActiveDictationState();
@@ -411,15 +415,60 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
   const toggleDictation = async (): Promise<void> => {
     if (disposed || !enabled || deps.platform !== 'darwin') return;
     if (phase === 'idle') {
+      pendingEnterOnPaste = false;
       await startGlobalDictation();
       return;
     }
     if (phase === 'starting') {
+      pendingEnterOnPaste = false;
       stopRequestedDuringStart = true;
       return;
     }
     if (phase === 'listening') {
+      pendingEnterOnPaste = false;
       await finishAndPasteCurrent(activeSessionId);
+    }
+  };
+
+  const handleHotkeyEvent = async (eventType: string): Promise<void> => {
+    if (disposed || !enabled || deps.platform !== 'darwin') return;
+    if (isMainWindowFocused()) return;
+
+    if (eventType === 'double_tap') {
+      if (phase === 'idle') {
+        pendingEnterOnPaste = false;
+        await startGlobalDictation();
+        return;
+      }
+      if (phase === 'starting') {
+        pendingEnterOnPaste = true;
+        stopRequestedDuringStart = true;
+        return;
+      }
+      if (phase === 'listening') {
+        pendingEnterOnPaste = true;
+        await finishAndPasteCurrent(activeSessionId);
+      }
+      return;
+    }
+
+    if (eventType === 'single_tap') {
+      if (phase === 'idle') return;
+      if (phase === 'starting') {
+        pendingEnterOnPaste = false;
+        stopRequestedDuringStart = true;
+        return;
+      }
+      if (phase === 'listening') {
+        pendingEnterOnPaste = false;
+        await finishAndPasteCurrent(activeSessionId);
+      }
+      return;
+    }
+
+    // Legacy fallback alias
+    if (eventType === 'toggle') {
+      await toggleDictation();
     }
   };
 
@@ -446,11 +495,12 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
           if (!line) continue;
           try {
             const parsed = JSON.parse(line) as { type?: string };
-            if (parsed?.type === 'toggle') {
-              if (isMainWindowFocused()) {
-                continue;
-              }
-              void toggleDictation();
+            if (
+              parsed?.type === 'double_tap' ||
+              parsed?.type === 'single_tap' ||
+              parsed?.type === 'toggle'
+            ) {
+              void handleHotkeyEvent(parsed.type);
             }
           } catch {
             // Ignore malformed stdout line.

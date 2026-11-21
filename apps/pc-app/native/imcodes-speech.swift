@@ -665,69 +665,113 @@ final class SpeechSession {
   }
 }
 
-// MARK: - Global Double-Tap Ctrl Hotkey Monitor
+// MARK: - Global Single/Double-Tap Shift Hotkey Monitor
 
-final class CtrlDoubleTapDetector {
-  private let tapWindowSeconds: TimeInterval = 0.40
+final class ShiftDoubleTapDetector {
+  private let tapWindowSeconds: TimeInterval = 0.35
   private let maxHoldSeconds: TimeInterval = 0.35
-  private let debounceSeconds: TimeInterval = 0.35
+  private let debounceSeconds: TimeInterval = 0.25
 
-  private var ctrlDown = false
-  private var ctrlDownAt: Date?
-  private var otherKeyPressedWhileCtrlDown = false
+  private let lock = NSLock()
+  private let onEmit: (String) -> Void
+
+  private var shiftDown = false
+  private var shiftDownAt: Date?
+  private var otherKeyPressed = false
   private var lastTapUpAt: Date?
-  private var lastEmitAt = Date.distantPast
+  private var secondTapDownWasInWindow = false
+  private var lastDoubleTapEmitAt = Date.distantPast
+  private var pendingSingleTapWork: DispatchWorkItem?
 
-  func handleFlagsChanged(flags: NSEvent.ModifierFlags, keyCode: UInt16) -> Bool {
-    // Only clean Control taps (no Shift/Option/Command/Fn mixed in)
-    let extraModifiers: NSEvent.ModifierFlags = [.shift, .command, .option, .function]
+  init(onEmit: @escaping (String) -> Void) {
+    self.onEmit = onEmit
+  }
+
+  private func cancelPendingSingleTapLocked() {
+    pendingSingleTapWork?.cancel()
+    pendingSingleTapWork = nil
+  }
+
+  func handleFlagsChanged(flags: NSEvent.ModifierFlags, keyCode: UInt16) {
+    lock.lock()
+    defer { lock.unlock() }
+
+    // Only clean Shift taps (no Control/Command/Option/Fn mixed in)
+    let extraModifiers: NSEvent.ModifierFlags = [.control, .command, .option, .function]
     if !flags.intersection(extraModifiers).isEmpty {
-      otherKeyPressedWhileCtrlDown = true
+      otherKeyPressed = true
       lastTapUpAt = nil
+      secondTapDownWasInWindow = false
+      cancelPendingSingleTapLocked()
     }
 
-    let isCtrlNow = flags.contains(.control)
+    let isShiftNow = flags.contains(.shift)
     let now = Date()
 
-    if !ctrlDown && isCtrlNow && (keyCode == 59 || keyCode == 62 || flags.contains(.control)) {
-      ctrlDown = true
-      ctrlDownAt = now
-      otherKeyPressedWhileCtrlDown = !flags.intersection(extraModifiers).isEmpty
-      return false
+    if !shiftDown && isShiftNow && (keyCode == 56 || keyCode == 60 || flags.contains(.shift)) {
+      shiftDown = true
+      shiftDownAt = now
+      otherKeyPressed = !flags.intersection(extraModifiers).isEmpty
+      if !otherKeyPressed, let prevUp = lastTapUpAt, now.timeIntervalSince(prevUp) <= tapWindowSeconds {
+        secondTapDownWasInWindow = true
+      } else {
+        secondTapDownWasInWindow = false
+        lastTapUpAt = nil
+      }
+      cancelPendingSingleTapLocked()
+      return
     }
 
-    if ctrlDown && !isCtrlNow {
-      ctrlDown = false
-      let heldDuration = ctrlDownAt.map { now.timeIntervalSince($0) } ?? (maxHoldSeconds + 1)
-      ctrlDownAt = nil
-      let wasCleanTap = !otherKeyPressedWhileCtrlDown && heldDuration <= maxHoldSeconds
-      otherKeyPressedWhileCtrlDown = false
+    if shiftDown && !isShiftNow {
+      shiftDown = false
+      let heldDuration = shiftDownAt.map { now.timeIntervalSince($0) } ?? (maxHoldSeconds + 1)
+      shiftDownAt = nil
+      let wasCleanTap = !otherKeyPressed && heldDuration <= maxHoldSeconds
+      let wasSecondTap = secondTapDownWasInWindow
+      otherKeyPressed = false
+      secondTapDownWasInWindow = false
 
       if !wasCleanTap {
         lastTapUpAt = nil
-        return false
+        return
       }
 
-      if let prevUp = lastTapUpAt, now.timeIntervalSince(prevUp) <= tapWindowSeconds {
+      if wasSecondTap {
         lastTapUpAt = nil
-        if now.timeIntervalSince(lastEmitAt) >= debounceSeconds {
-          lastEmitAt = now
-          return true
+        if now.timeIntervalSince(lastDoubleTapEmitAt) >= debounceSeconds {
+          lastDoubleTapEmitAt = now
+          onEmit("double_tap")
         }
-        return false
+        return
       }
 
       lastTapUpAt = now
-      return false
+      let work = DispatchWorkItem { [weak self] in
+        guard let self else { return }
+        self.lock.lock()
+        guard self.pendingSingleTapWork != nil, !self.shiftDown else {
+          self.lock.unlock()
+          return
+        }
+        self.pendingSingleTapWork = nil
+        self.lastTapUpAt = nil
+        self.secondTapDownWasInWindow = false
+        self.lock.unlock()
+        self.onEmit("single_tap")
+      }
+      pendingSingleTapWork = work
+      DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + tapWindowSeconds, execute: work)
     }
-
-    return false
   }
 
   func handleKeyDown() {
-    if ctrlDown || lastTapUpAt != nil {
-      otherKeyPressedWhileCtrlDown = true
+    lock.lock()
+    defer { lock.unlock() }
+    cancelPendingSingleTapLocked()
+    if shiftDown || lastTapUpAt != nil {
+      otherKeyPressed = true
       lastTapUpAt = nil
+      secondTapDownWasInWindow = false
     }
   }
 }
@@ -736,20 +780,17 @@ func runHotkeyCommand() -> Int32 {
   let app = NSApplication.shared
   app.setActivationPolicy(.prohibited)
 
-  let detector = CtrlDoubleTapDetector()
-  let lock = NSLock()
+  let detector = ShiftDoubleTapDetector { eventType in
+    emitJson(["type": eventType])
+  }
 
   var globalMonitor: Any?
   var localMonitor: Any?
 
   let processEvent: (NSEvent) -> Void = { event in
-    lock.lock()
-    defer { lock.unlock() }
     switch event.type {
     case .flagsChanged:
-      if detector.handleFlagsChanged(flags: event.modifierFlags, keyCode: event.keyCode) {
-        emitJson(["type": "toggle"])
-      }
+      detector.handleFlagsChanged(flags: event.modifierFlags, keyCode: event.keyCode)
     case .keyDown:
       detector.handleKeyDown()
     default:
@@ -1039,13 +1080,16 @@ func runOverlayCommand(args: [String]) -> Int32 {
 
 // MARK: - Accessibility Unicode Paste (16-UniChar Chunks)
 
-func waitForControlRelease(timeoutSeconds: TimeInterval = 1.5) {
+func waitForModifierRelease(timeoutSeconds: TimeInterval = 1.5) {
   let deadline = Date().addingTimeInterval(timeoutSeconds)
   while Date() < deadline {
+    let leftShift = CGEventSource.keyState(.hidSystemState, key: 56)
+    let rightShift = CGEventSource.keyState(.hidSystemState, key: 60)
     let leftCtrl = CGEventSource.keyState(.hidSystemState, key: 59)
     let rightCtrl = CGEventSource.keyState(.hidSystemState, key: 62)
-    let flagsCtrl = CGEventSource.flagsState(.hidSystemState).contains(.maskControl)
-    if !leftCtrl && !rightCtrl && !flagsCtrl {
+    let flags = CGEventSource.flagsState(.hidSystemState)
+    if !leftShift && !rightShift && !leftCtrl && !rightCtrl
+      && !flags.contains(.maskShift) && !flags.contains(.maskControl) {
       return
     }
     usleep(10_000)
@@ -1055,6 +1099,7 @@ func waitForControlRelease(timeoutSeconds: TimeInterval = 1.5) {
 func runPasteCommand(args: [String]) -> Int32 {
   var prompt = false
   var useStdin = false
+  var sendEnter = false
   var argText: String?
   var idx = 1
   while idx < args.count {
@@ -1063,6 +1108,9 @@ func runPasteCommand(args: [String]) -> Int32 {
       idx += 1
     } else if args[idx] == "--stdin" {
       useStdin = true
+      idx += 1
+    } else if args[idx] == "--enter" {
+      sendEnter = true
       idx += 1
     } else if args[idx] == "--text", idx + 1 < args.count {
       argText = args[idx + 1]
@@ -1088,10 +1136,10 @@ func runPasteCommand(args: [String]) -> Int32 {
     text = ""
   }
 
-  waitForControlRelease()
+  waitForModifierRelease()
 
   let utf16 = Array(text.utf16)
-  if utf16.isEmpty {
+  if utf16.isEmpty && !sendEnter {
     emitJson(["type": "ok", "length": 0])
     return 0
   }
@@ -1120,6 +1168,17 @@ func runPasteCommand(args: [String]) -> Int32 {
     offset = end
     if offset < utf16.count {
       usleep(2_000)
+    }
+  }
+
+  if sendEnter {
+    usleep(2_000)
+    if let retDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+       let retUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) {
+      retDown.flags.remove([.maskShift, .maskControl])
+      retUp.flags.remove([.maskShift, .maskControl])
+      retDown.post(tap: .cghidEventTap)
+      retUp.post(tap: .cghidEventTap)
     }
   }
 

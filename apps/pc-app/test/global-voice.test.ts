@@ -124,18 +124,19 @@ describe('resolveGlobalVoiceOverlayIconPath', () => {
 });
 
 describe('createPcAppGlobalVoice', () => {
-  it('ignores double-tap Ctrl toggle when the IM.codes main window is focused', async () => {
+  it('ignores single-tap and double-tap Shift when the IM.codes main window is focused, and ignores single-tap when idle', async () => {
     const userDataDir = makeTempDir('imcodes-gv-focus-');
     const hotkey = createFakeHelper();
     const spawnHelper = vi.fn(() => hotkey.proc);
     const startListening = vi.fn();
 
+    let focused = true;
     const controller = createPcAppGlobalVoice({
       platform: 'darwin',
       userDataDir,
       iconPath: '/tmp/robot-icon.png',
       getLocale: () => 'en',
-      getMainWindow: () => ({ isDestroyed: () => false, isFocused: () => true }),
+      getMainWindow: () => ({ isDestroyed: () => false, isFocused: () => focused }),
       getSpeechHelperPath: () => '/usr/local/bin/imcodes-speech',
       voice: {
         startListening,
@@ -147,14 +148,21 @@ describe('createPcAppGlobalVoice', () => {
     controller.start();
     expect(spawnHelper).toHaveBeenCalledWith('/usr/local/bin/imcodes-speech', ['hotkey']);
 
-    hotkey.stdout.write('{"type":"toggle"}\n');
+    hotkey.stdout.write('{"type":"single_tap"}\n');
+    hotkey.stdout.write('{"type":"double_tap"}\n');
     await new Promise((r) => setTimeout(r, 10));
-
     expect(startListening).not.toHaveBeenCalled();
+
+    // Unfocused while idle: single_tap is ignored, double_tap starts dictation
+    focused = false;
+    hotkey.stdout.write('{"type":"single_tap"}\n');
+    await new Promise((r) => setTimeout(r, 10));
+    expect(startListening).not.toHaveBeenCalled();
+
     await controller.dispose();
   });
 
-  it('drives overlay with robot icon, 66ms throttled levels, live partial/final text, and pastes via stdin on second toggle', async () => {
+  it('starts on double_tap, stops and pastes without Enter on single_tap, and pastes with --enter on double_tap when active', async () => {
     const userDataDir = makeTempDir('imcodes-gv-flow-');
     const hotkey = createFakeHelper();
     const overlay = createFakeHelper();
@@ -165,7 +173,7 @@ describe('createPcAppGlobalVoice', () => {
       if (args[0] === 'overlay') return overlay.proc;
       throw new Error(`Unexpected subcommand: ${args.join(' ')}`);
     });
-    const runPasteHelper = vi.fn(async () => '{"type":"pasted","length":11}\n');
+    const runPasteHelper = vi.fn(async () => '{"type":"ok","length":11}\n');
 
     let capturedOnEvent: ((event: PcAppVoiceEvent) => void) | undefined;
     const startListening = vi.fn(async (opts?: { source?: 'in-app' | 'global'; locale?: string; onEvent?: (e: PcAppVoiceEvent) => void }) => {
@@ -191,7 +199,7 @@ describe('createPcAppGlobalVoice', () => {
     });
 
     controller.start();
-    hotkey.stdout.write('{"type":"toggle"}\n');
+    hotkey.stdout.write('{"type":"double_tap"}\n');
     await new Promise((r) => setTimeout(r, 10));
 
     expect(startListening).toHaveBeenCalledWith(
@@ -212,8 +220,8 @@ describe('createPcAppGlobalVoice', () => {
     capturedOnEvent?.({ type: 'result', text: 'hello', isFinal: false });
     capturedOnEvent?.({ type: 'result', text: 'hello world', isFinal: true });
 
-    // Second double-tap Ctrl stops and pastes.
-    hotkey.stdout.write('{"type":"toggle"}\n');
+    // Single-tap Shift stops and pastes WITHOUT --enter.
+    hotkey.stdout.write('{"type":"single_tap"}\n');
     await new Promise((r) => setTimeout(r, 20));
 
     expect(stopListening).toHaveBeenCalledTimes(1);
@@ -236,6 +244,21 @@ describe('createPcAppGlobalVoice', () => {
     expect(levelShowCmds.map((c) => c.level)).toEqual([0.4, 0.9]);
     expect(parsedOverlayCmds.some((cmd) => cmd.cmd === 'show' && cmd.state === 'draining')).toBe(true);
     expect(parsedOverlayCmds[parsedOverlayCmds.length - 1]).toEqual({ cmd: 'hide' });
+
+    // Second session: double_tap starts, then double_tap while listening stops and pastes WITH --enter.
+    hotkey.stdout.write('{"type":"double_tap"}\n');
+    await new Promise((r) => setTimeout(r, 10));
+    capturedOnEvent?.({ type: 'start' });
+    capturedOnEvent?.({ type: 'result', text: 'send now', isFinal: true });
+    hotkey.stdout.write('{"type":"double_tap"}\n');
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(stopListening).toHaveBeenCalledTimes(2);
+    expect(runPasteHelper).toHaveBeenLastCalledWith(
+      '/usr/local/bin/imcodes-speech',
+      ['paste', '--stdin', '--enter'],
+      'send now',
+    );
 
     await controller.dispose();
   });
