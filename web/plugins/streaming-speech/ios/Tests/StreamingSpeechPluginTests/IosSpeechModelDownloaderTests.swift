@@ -333,4 +333,142 @@ final class IosSpeechModelDownloaderTests: XCTestCase {
         XCTAssertTrue(downloader.hasVerifiedLocalModels)
         XCTAssertEqual(try Data(contentsOf: configURL), goodData)
     }
+
+    func testResolvedDefaultMirrorOriginsRoutesByRegionAndSanitizesCustomOverrides() {
+        let suiteName = "IosSpeechModelDownloaderTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        // CN locale -> hf-mirror first
+        XCTAssertEqual(
+            IosSpeechModelDownloader.resolvedDefaultMirrorOrigins(
+                locale: Locale(identifier: "zh_CN"),
+                timeZone: TimeZone(identifier: "America/New_York")!,
+                environment: [:],
+                userDefaults: defaults
+            ),
+            ["https://hf-mirror.com", "https://huggingface.co"]
+        )
+
+        // China timezone even with en_US locale -> hf-mirror first
+        XCTAssertEqual(
+            IosSpeechModelDownloader.resolvedDefaultMirrorOrigins(
+                locale: Locale(identifier: "en_US"),
+                timeZone: TimeZone(identifier: "Asia/Shanghai")!,
+                environment: [:],
+                userDefaults: defaults
+            ),
+            ["https://hf-mirror.com", "https://huggingface.co"]
+        )
+
+        // Global locale + non-CN timezone -> huggingface first
+        XCTAssertEqual(
+            IosSpeechModelDownloader.resolvedDefaultMirrorOrigins(
+                locale: Locale(identifier: "en_US"),
+                timeZone: TimeZone(identifier: "America/Los_Angeles")!,
+                environment: [:],
+                userDefaults: defaults
+            ),
+            ["https://huggingface.co", "https://hf-mirror.com"]
+        )
+
+        // Env + UserDefaults custom mirrors prepended; invalid/empty entries ignored safely; duplicates deduplicated
+        defaults.set(["https://r2.example.com/", "not-a-url", ""], forKey: IosSpeechModelDownloader.customMirrorDefaultsKey)
+        XCTAssertEqual(
+            IosSpeechModelDownloader.resolvedDefaultMirrorOrigins(
+                locale: Locale(identifier: "en_US"),
+                timeZone: TimeZone(identifier: "America/Los_Angeles")!,
+                environment: [
+                    IosSpeechModelDownloader.customMirrorEnvKey: " , ftp://bad.example, https://cdn.example.com/ , javascript:alert(1) "
+                ],
+                userDefaults: defaults
+            ),
+            [
+                "https://cdn.example.com",
+                "https://r2.example.com",
+                "https://huggingface.co",
+                "https://hf-mirror.com",
+            ]
+        )
+
+        // Only invalid custom entries -> falls back cleanly to region defaults
+        defaults.set(" , invalid-host , file:///etc/passwd", forKey: IosSpeechModelDownloader.customMirrorDefaultsKey)
+        XCTAssertEqual(
+            IosSpeechModelDownloader.resolvedDefaultMirrorOrigins(
+                locale: Locale(identifier: "zh_CN"),
+                timeZone: TimeZone(identifier: "Asia/Shanghai")!,
+                environment: [IosSpeechModelDownloader.customMirrorEnvKey: "   , http://"],
+                userDefaults: defaults
+            ),
+            ["https://hf-mirror.com", "https://huggingface.co"]
+        )
+    }
+
+    func testStickyMirrorPromotesWorkingMirrorAcrossRemainingAssets() throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelsDir = root.appendingPathComponent("models", isDirectory: true)
+
+        let payloadA = Data("{\"a\":1}".utf8)
+        let payloadB = Data("merges-data".utf8)
+        let payloadC = Data("vocab-data".utf8)
+        let testAssets = [
+            IosSpeechModelAsset(filename: "config.json", expectedSize: Int64(payloadA.count), expectedSha256: sha256(payloadA)),
+            IosSpeechModelAsset(filename: "merges.txt", expectedSize: Int64(payloadB.count), expectedSha256: sha256(payloadB)),
+            IosSpeechModelAsset(filename: "vocab.json", expectedSize: Int64(payloadC.count), expectedSha256: sha256(payloadC)),
+            IosSpeechModelAsset(filename: "hotwords.txt", expectedSize: 0, expectedSha256: IosSpeechModelDownloader.emptyFileSha256, downloadable: false),
+        ]
+
+        var requestedHosts: [String] = []
+        MockSpeechAssetURLProtocol.handler = { request in
+            let url = request.url!
+            let host = url.host ?? ""
+            requestedHosts.append(host)
+            if host == "blocked.mirror.test" || host == "huggingface.co" {
+                return (503, nil, URLError(.timedOut))
+            }
+            if url.lastPathComponent == "config.json" { return (200, payloadA, nil) }
+            if url.lastPathComponent == "merges.txt" { return (200, payloadB, nil) }
+            if url.lastPathComponent == "vocab.json" { return (200, payloadC, nil) }
+            return (404, nil, nil)
+        }
+        defer { MockSpeechAssetURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSpeechAssetURLProtocol.self]
+        let downloader = IosSpeechModelDownloader(
+            modelsDirectory: modelsDir,
+            mirrorOrigins: ["https://blocked.mirror.test", "https://huggingface.co", "https://hf-mirror.com"],
+            assets: testAssets,
+            sessionIdentifier: nil,
+            urlSessionConfiguration: config
+        )
+        defer { downloader.invalidateSession() }
+
+        XCTAssertEqual(downloader.mirrorOrigins, ["https://blocked.mirror.test", "https://huggingface.co", "https://hf-mirror.com"])
+
+        let exp = expectation(description: "sticky mirror avoids retrying blocked mirrors on subsequent files")
+        var ok = false
+        downloader.ensureDownloadedIfNeeded { result in
+            ok = result
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 10)
+
+        XCTAssertTrue(ok)
+        // Asset 1 fails blocked.mirror.test -> huggingface.co -> succeeds on hf-mirror.com;
+        // Assets 2 and 3 go straight to hf-mirror.com without touching failed mirrors again.
+        XCTAssertEqual(requestedHosts, [
+            "blocked.mirror.test",
+            "huggingface.co",
+            "hf-mirror.com",
+            "hf-mirror.com",
+            "hf-mirror.com",
+        ])
+        XCTAssertEqual(downloader.currentMirrorOrder, [
+            "https://hf-mirror.com",
+            "https://blocked.mirror.test",
+            "https://huggingface.co",
+        ])
+    }
 }

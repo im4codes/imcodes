@@ -48,6 +48,16 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
     public static let revision = "bc441bd1e4295c1f42d9879f056049a925b6e013"
     public static let modelDirectoryRelativePath = "imcodes-speech-models/Qwen3-ASR-0.6B-MLX-4bit"
     public static let defaultMirrorOrigins = ["https://huggingface.co", "https://hf-mirror.com"]
+    public static let chinaMirrorOrigins = ["https://hf-mirror.com", "https://huggingface.co"]
+    public static let customMirrorEnvKey = "IMCODES_SPEECH_MODEL_MIRRORS"
+    public static let customMirrorDefaultsKey = "imcodes.speech.modelMirrors"
+    private static let chinaTimeZoneIdentifiers: Set<String> = [
+        "Asia/Shanghai",
+        "Asia/Chongqing",
+        "Asia/Harbin",
+        "Asia/Urumqi",
+        "Asia/Kashgar",
+    ]
     public static let emptyFileSha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     public static let verifiedMarkerFilename = ".verified-\(revision)"
 
@@ -164,7 +174,7 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
     private var _status: IosSpeechDownloadStatus = .idle
     private var inFlight = false
     private var lastFailureAt: Date?
-    private var preferredMirrorIndex = 0
+    private var preferredMirrorOrder: [Int]
     private var pendingCompletions: [(Bool) -> Void] = []
     private var activeTasks: [Int: ActiveTaskState] = [:]
     private var backgroundSessionCompletionHandler: (() -> Void)?
@@ -173,7 +183,7 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
 
     public init(
         modelsDirectory: URL = IosSpeechModelDownloader.defaultModelsDirectory(),
-        mirrorOrigins: [String] = IosSpeechModelDownloader.defaultMirrorOrigins,
+        mirrorOrigins: [String]? = nil,
         assets: [IosSpeechModelAsset] = IosSpeechModelDownloader.requiredAssets,
         sessionIdentifier: String? = IosSpeechModelDownloader.backgroundSessionIdentifier,
         urlSessionConfiguration: URLSessionConfiguration? = nil,
@@ -183,13 +193,87 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         }
     ) {
         self.modelsDirectory = modelsDirectory
-        self.mirrorOrigins = mirrorOrigins.isEmpty ? Self.defaultMirrorOrigins : mirrorOrigins
+        let resolvedMirrors: [String]
+        if let explicitMirrors = mirrorOrigins {
+            let sanitized = Self.sanitizedMirrorOrigins(explicitMirrors)
+            resolvedMirrors = sanitized.isEmpty ? Self.resolvedDefaultMirrorOrigins() : sanitized
+        } else {
+            resolvedMirrors = Self.resolvedDefaultMirrorOrigins()
+        }
+        self.mirrorOrigins = resolvedMirrors
+        self.preferredMirrorOrder = Array(0..<resolvedMirrors.count)
         self.assets = assets
         self.sessionIdentifier = sessionIdentifier
         self.customSessionConfiguration = urlSessionConfiguration
         self.retryCooldownSeconds = retryCooldownSeconds
         self.fileVerifier = fileVerifier
         super.init()
+    }
+
+    public var currentMirrorOrder: [String] {
+        lock.lock()
+        let order = preferredMirrorOrder
+        lock.unlock()
+        return order.map { mirrorOrigins[$0] }
+    }
+
+    public static func resolvedDefaultMirrorOrigins(
+        locale: Locale = .current,
+        timeZone: TimeZone = .current,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        userDefaults: UserDefaults = .standard
+    ) -> [String] {
+        let region = regionIdentifier(for: locale)
+        let isChinaRegion = (region == "CN") || chinaTimeZoneIdentifiers.contains(timeZone.identifier)
+        let regionDefaults = isChinaRegion ? chinaMirrorOrigins : defaultMirrorOrigins
+
+        var customRaw: [String] = []
+        if let envValue = environment[customMirrorEnvKey], !envValue.isEmpty {
+            customRaw.append(contentsOf: envValue.split(separator: ",").map(String.init))
+        }
+        if let defaultsArray = userDefaults.stringArray(forKey: customMirrorDefaultsKey) {
+            customRaw.append(contentsOf: defaultsArray)
+        } else if let defaultsValue = userDefaults.string(forKey: customMirrorDefaultsKey), !defaultsValue.isEmpty {
+            customRaw.append(contentsOf: defaultsValue.split(separator: ",").map(String.init))
+        }
+
+        let merged = sanitizedMirrorOrigins(customRaw + regionDefaults)
+        return merged.isEmpty ? regionDefaults : merged
+    }
+
+    public static func sanitizedMirrorOrigins(_ rawOrigins: [String]) -> [String] {
+        var sanitized: [String] = []
+        var seen: Set<String> = []
+        for raw in rawOrigins {
+            let candidate = raw
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard !candidate.isEmpty,
+                  let parsed = URL(string: candidate),
+                  let scheme = parsed.scheme?.lowercased(),
+                  scheme == "https" || scheme == "http",
+                  let host = parsed.host,
+                  !host.isEmpty else {
+                continue
+            }
+            let dedupeKey = candidate.lowercased()
+            guard !seen.contains(dedupeKey) else { continue }
+            seen.insert(dedupeKey)
+            sanitized.append(candidate)
+        }
+        return sanitized
+    }
+
+    private static func regionIdentifier(for locale: Locale) -> String? {
+        if #available(iOS 16.0, macOS 13.0, *) {
+            if let identifier = locale.region?.identifier, !identifier.isEmpty {
+                return identifier.uppercased()
+            }
+        }
+        if let legacy = (locale as NSLocale).object(forKey: .countryCode) as? String, !legacy.isEmpty {
+            return legacy.uppercased()
+        }
+        return nil
     }
 
     public static func defaultModelsDirectory(fileManager: FileManager = .default) -> URL {
@@ -440,19 +524,15 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         totalDownloadBytes: Int64
     ) throws {
         lock.lock()
-        let startIdx = preferredMirrorIndex
+        let orderedIndices = preferredMirrorOrder
         lock.unlock()
 
-        var orderedIndices = Array(0..<mirrorOrigins.count)
-        if startIdx > 0 && startIdx < orderedIndices.count {
-            orderedIndices.remove(at: startIdx)
-            orderedIndices.insert(startIdx, at: 0)
-        }
-
+        var failedIndices: [Int] = []
         var lastError: Error = DownloadError.missingOutput(asset.filename)
         for mirrorIdx in orderedIndices {
             let origin = mirrorOrigins[mirrorIdx].trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             guard let url = Self.assetURL(origin: origin, filename: asset.filename) else {
+                failedIndices.append(mirrorIdx)
                 lastError = DownloadError.invalidURL("\(origin)/\(asset.filename)")
                 continue
             }
@@ -463,15 +543,31 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
                     completedBytes: completedBytes,
                     totalDownloadBytes: totalDownloadBytes
                 )
-                lock.lock()
-                preferredMirrorIndex = mirrorIdx
-                lock.unlock()
+                promoteWinningMirror(mirrorIdx, afterFailures: failedIndices)
                 return
             } catch {
+                failedIndices.append(mirrorIdx)
                 lastError = error
             }
         }
         throw lastError
+    }
+
+    private func promoteWinningMirror(_ winningIdx: Int, afterFailures failedIndices: [Int]) {
+        lock.lock()
+        defer { lock.unlock() }
+        let failedSet = Set(failedIndices)
+        var nextOrder: [Int] = [winningIdx]
+        for idx in preferredMirrorOrder where idx != winningIdx && !failedSet.contains(idx) {
+            nextOrder.append(idx)
+        }
+        for idx in failedIndices where idx != winningIdx && !nextOrder.contains(idx) {
+            nextOrder.append(idx)
+        }
+        for idx in preferredMirrorOrder where !nextOrder.contains(idx) {
+            nextOrder.append(idx)
+        }
+        preferredMirrorOrder = nextOrder
     }
 
     private func downloadSingleFile(
