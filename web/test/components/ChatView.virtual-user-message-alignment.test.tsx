@@ -173,10 +173,9 @@ describe('Human user message right-alignment in virtualized and non-virtualized 
     expect(css).toMatch(/\.chat-user-supervision-prompt\s*\{[^}]*align-self:\s*flex-start;/);
     expect(css).toMatch(/\.chat-user-supervision-prompt\s*\{[^}]*margin-inline-start:\s*0;/);
 
-    // Wide-screen 95% max-width and distinct pale-blue styling for human user bubble
-    expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s*\{[^}]*max-width:\s*88%;/);
+    // Unified 95% max-width and distinct pale-blue styling for human user bubble
+    expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s*\{[^}]*max-width:\s*95%;/);
     expect(css).toMatch(/\.chat-user\.chat-user-origin-user\s*\{[^}]*border-right:\s*2px solid rgba\(125,\s*211,\s*252/);
-    expect(css).toMatch(/@media\s*\(min-width:\s*641px\)\s*\{[^}]*\.chat-user\.chat-user-origin-user\s*\{[^}]*max-width:\s*95%;/);
 
     // Pending / failed states and restored 10-line unified fold height for human user bubble
     expect(css).toMatch(/\.chat-user\.chat-user-origin-user\.chat-pending\s*\{/);
