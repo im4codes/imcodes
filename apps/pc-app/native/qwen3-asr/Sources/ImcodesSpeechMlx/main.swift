@@ -355,6 +355,60 @@ func joinTranscriptSegments(_ committed: String, _ active: String) -> String {
     return needsSpace ? "\(lhs) \(rhs)" : "\(lhs)\(rhs)"
 }
 
+private func readHotwords(from modelDir: URL) -> String? {
+    let hotwordsText = ((try? String(contentsOf: modelDir.appendingPathComponent("hotwords.txt"), encoding: .utf8)) ?? "")
+        .split(whereSeparator: \.isNewline)
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    return hotwordsText.isEmpty ? nil : hotwordsText.joined(separator: ", ")
+}
+
+private func checkMlxRuntimeAvailable() -> Bool {
+    #if !arch(arm64)
+    emitJson(["type": "error", "code": "mlx_unsupported", "message": "Qwen3-ASR requires Apple Silicon"])
+    return false
+    #else
+    guard MTLCreateSystemDefaultDevice() != nil else {
+        emitJson(["type": "error", "code": "mlx_unsupported", "message": "Metal GPU device unavailable"])
+        return false
+    }
+    guard hasAvailableMetallib() else {
+        emitJson(["type": "error", "code": "mlx_unsupported", "message": "MLX Metal shader library (mlx.metallib) not found"])
+        return false
+    }
+    return true
+    #endif
+}
+
+private func loadMlxModel(modelDir: URL, variant: String, onQueue decodeQueue: DispatchQueue) -> Qwen3ASRModel? {
+    let modelId = variant == "1.7b"
+        ? "aufklarer/Qwen3-ASR-1.7B-MLX-4bit"
+        : "aufklarer/Qwen3-ASR-0.6B-MLX-4bit"
+    var loadedModel: Qwen3ASRModel?
+    var loadError: Error?
+    let loadSem = DispatchSemaphore(value: 0)
+    emitJson(["type": "loading", "variant": variant])
+    decodeQueue.async {
+        do {
+            loadedModel = try Qwen3ASRModel.loadLocal(from: modelDir, modelId: modelId)
+        } catch {
+            loadError = error
+        }
+        loadSem.signal()
+    }
+    loadSem.wait()
+
+    guard let model = loadedModel else {
+        emitJson([
+            "type": "error",
+            "code": "model_load_failed",
+            "message": loadError?.localizedDescription ?? "Failed to load Qwen3-ASR model",
+        ])
+        return nil
+    }
+    return model
+}
+
 final class QwenStreamingSession {
     private let sampleRate = 16_000
     private let initialStrideSamples = 12_800 // 0.8s initial partial threshold
@@ -362,9 +416,12 @@ final class QwenStreamingSession {
     private let maxSegmentSamples = 216_000 // 13.5s bounded segment
     private let rollbackTokenCount = 5
 
+    private let model: Qwen3ASRModel
+    private let hotwords: String?
+    private let decodeQueue: DispatchQueue
+    private let unloadOnFinish: Bool
     private let audioEngine = AVAudioEngine()
     private let lock = NSLock()
-    private let decodeQueue = DispatchQueue(label: "com.imcodes.pc-app.qwen3asr", qos: .userInteractive)
     private let workSignal = DispatchSemaphore(value: 0)
     private let doneSemaphore = DispatchSemaphore(value: 0)
 
@@ -379,60 +436,28 @@ final class QwenStreamingSession {
     private var stopRequested = false
     private var aborted = false
     private var finished = false
+    private var onFinishCallback: (() -> Void)?
 
-    func run(modelDir: URL, variant: String, localeTag: String?, deviceUID: String?) -> Int32 {
-        #if !arch(arm64)
-        emitJson(["type": "error", "code": "mlx_unsupported", "message": "Qwen3-ASR requires Apple Silicon"])
-        return 1
-        #else
-        guard MTLCreateSystemDefaultDevice() != nil else {
-            emitJson(["type": "error", "code": "mlx_unsupported", "message": "Metal GPU device unavailable"])
-            return 1
-        }
-        guard hasAvailableMetallib() else {
-            emitJson(["type": "error", "code": "mlx_unsupported", "message": "MLX Metal shader library (mlx.metallib) not found"])
-            return 1
-        }
-        #endif
+    init(
+        model: Qwen3ASRModel,
+        hotwords: String?,
+        decodeQueue: DispatchQueue,
+        unloadOnFinish: Bool
+    ) {
+        self.model = model
+        self.hotwords = hotwords
+        self.decodeQueue = decodeQueue
+        self.unloadOnFinish = unloadOnFinish
+    }
 
-        let micStatus = requestMicIfNeeded()
-        guard micStatus == .authorized else {
-            emitJson(["type": "error", "code": "permission_denied", "target": "mic"])
-            return 1
-        }
-
-        let modelId = variant == "1.7b"
-            ? "aufklarer/Qwen3-ASR-1.7B-MLX-4bit"
-            : "aufklarer/Qwen3-ASR-0.6B-MLX-4bit"
-        let hotwordsText = ((try? String(contentsOf: modelDir.appendingPathComponent("hotwords.txt"), encoding: .utf8)) ?? "")
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        let hotwords: String? = hotwordsText.isEmpty ? nil : hotwordsText.joined(separator: ", ")
+    func start(
+        localeTag: String?,
+        deviceUID: String?,
+        emitEndOnStartFailure: Bool,
+        onFinish: (() -> Void)? = nil
+    ) -> Bool {
+        onFinishCallback = onFinish
         let language = Qwen3ASRModel.resolveLanguage(localeTag)
-
-        var loadedModel: Qwen3ASRModel?
-        var loadError: Error?
-        let loadSem = DispatchSemaphore(value: 0)
-        emitJson(["type": "loading", "variant": variant])
-        decodeQueue.async {
-            do {
-                loadedModel = try Qwen3ASRModel.loadLocal(from: modelDir, modelId: modelId)
-            } catch {
-                loadError = error
-            }
-            loadSem.signal()
-        }
-        loadSem.wait()
-
-        guard let model = loadedModel else {
-            emitJson([
-                "type": "error",
-                "code": "model_load_failed",
-                "message": loadError?.localizedDescription ?? "Failed to load Qwen3-ASR model",
-            ])
-            return 1
-        }
 
         let inputNode = audioEngine.inputNode
         if let targetInputID = resolveInputDeviceID(deviceUID: deviceUID) {
@@ -441,7 +466,13 @@ final class QwenStreamingSession {
         let inputFormat = inputNode.outputFormat(forBus: 0)
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
             emitJson(["type": "error", "code": "no_audio_input"])
-            return 1
+            if emitEndOnStartFailure {
+                finish()
+            } else {
+                onFinishCallback?()
+                doneSemaphore.signal()
+            }
+            return false
         }
 
         guard let targetFormat = AVAudioFormat(
@@ -451,7 +482,13 @@ final class QwenStreamingSession {
             interleaved: false
         ), let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
             emitJson(["type": "error", "code": "audio_format_failed"])
-            return 1
+            if emitEndOnStartFailure {
+                finish()
+            } else {
+                onFinishCallback?()
+                doneSemaphore.signal()
+            }
+            return false
         }
 
         inputNode.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
@@ -469,27 +506,25 @@ final class QwenStreamingSession {
                 "code": "audio_engine_failed",
                 "message": error.localizedDescription,
             ])
-            return 1
+            if emitEndOnStartFailure {
+                finish()
+            } else {
+                onFinishCallback?()
+                doneSemaphore.signal()
+            }
+            return false
         }
 
         emitJson(["type": "start"])
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            while let line = readLine(strippingNewline: true) {
-                if line == "stop" || line == "abort" {
-                    self?.stop(abort: line == "abort")
-                    return
-                }
-            }
-            self?.stop(abort: false)
-        }
-
         decodeQueue.async { [weak self] in
-            self?.workerLoop(model: model, language: language, hotwords: hotwords)
+            self?.workerLoop(language: language)
         }
+        return true
+    }
 
+    func waitForCompletion() {
         _ = doneSemaphore.wait(timeout: .distantFuture)
-        return 0
     }
 
     private func appendAudioBuffer(
@@ -546,7 +581,7 @@ final class QwenStreamingSession {
         }
     }
 
-    private func workerLoop(model: Qwen3ASRModel, language: String?, hotwords: String?) {
+    private func workerLoop(language: String?) {
         let expectLangHeader = language == nil
         while true {
             _ = workSignal.wait(timeout: .now() + .milliseconds(250))
@@ -641,8 +676,10 @@ final class QwenStreamingSession {
             }
         }
 
-        model.unload()
-        Qwen3ASRModel.clearMetalCache()
+        if unloadOnFinish {
+            model.unload()
+            Qwen3ASRModel.clearMetalCache()
+        }
         finish()
     }
 
@@ -679,28 +716,121 @@ final class QwenStreamingSession {
             audioEngine.inputNode.removeTap(onBus: 0)
         }
         emitJson(["type": "end"])
+        let cb = onFinishCallback
+        onFinishCallback = nil
+        cb?()
         doneSemaphore.signal()
     }
 }
 
-let args = Array(CommandLine.arguments.dropFirst())
-let cmd = args.first ?? "probe"
+final class QwenServeRunner {
+    private let model: Qwen3ASRModel
+    private let hotwords: String?
+    private let decodeQueue: DispatchQueue
+    private let sessionLock = NSLock()
+    private var activeSession: QwenStreamingSession?
+    private var shuttingDown = false
 
-switch cmd {
-case "probe":
-    emitJson(probePayload())
-    exit(0)
-case "devices":
-    if let data = try? JSONSerialization.data(withJSONObject: listAliveInputDevices(), options: []),
-       let str = String(data: data, encoding: .utf8) {
-        print(str)
-        fflush(stdout)
-    } else {
-        print("[]")
-        fflush(stdout)
+    init(model: Qwen3ASRModel, hotwords: String?, decodeQueue: DispatchQueue) {
+        self.model = model
+        self.hotwords = hotwords
+        self.decodeQueue = decodeQueue
     }
-    exit(0)
-case "listen":
+
+    private func stopActiveSession(abort: Bool, wait: Bool) {
+        sessionLock.lock()
+        let current = activeSession
+        sessionLock.unlock()
+        guard let current else { return }
+        current.stop(abort: abort)
+        if wait {
+            current.waitForCompletion()
+        }
+    }
+
+    func shutdown() -> Never {
+        sessionLock.lock()
+        if shuttingDown {
+            sessionLock.unlock()
+            exit(0)
+        }
+        shuttingDown = true
+        let current = activeSession
+        sessionLock.unlock()
+
+        if let current {
+            current.stop(abort: true)
+            current.waitForCompletion()
+        }
+        decodeQueue.sync {
+            model.unload()
+            Qwen3ASRModel.clearMetalCache()
+        }
+        exit(0)
+    }
+
+    func run() -> Never {
+        while let line = readLine(strippingNewline: true) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            guard let data = trimmed.data(using: .utf8),
+                  let json = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any],
+                  let cmd = json["cmd"] as? String else {
+                continue
+            }
+
+            switch cmd {
+            case "start":
+                stopActiveSession(abort: true, wait: true)
+                let micStatus = requestMicIfNeeded()
+                guard micStatus == .authorized else {
+                    emitJson(["type": "error", "code": "permission_denied", "target": "mic"])
+                    emitJson(["type": "end"])
+                    continue
+                }
+                let localeTag = json["locale"] as? String
+                let deviceUID = json["device"] as? String
+                let session = QwenStreamingSession(
+                    model: model,
+                    hotwords: hotwords,
+                    decodeQueue: decodeQueue,
+                    unloadOnFinish: false
+                )
+                sessionLock.lock()
+                if shuttingDown {
+                    sessionLock.unlock()
+                    shutdown()
+                }
+                activeSession = session
+                sessionLock.unlock()
+                _ = session.start(
+                    localeTag: localeTag,
+                    deviceUID: deviceUID,
+                    emitEndOnStartFailure: true,
+                    onFinish: { [weak self, weak session] in
+                        guard let self, let session else { return }
+                        self.sessionLock.lock()
+                        if self.activeSession === session {
+                            self.activeSession = nil
+                        }
+                        self.sessionLock.unlock()
+                    }
+                )
+            case "stop":
+                stopActiveSession(abort: false, wait: false)
+            case "abort":
+                stopActiveSession(abort: true, wait: false)
+            case "shutdown":
+                shutdown()
+            default:
+                continue
+            }
+        }
+        shutdown()
+    }
+}
+
+private func parseModelArgs(_ args: [String]) -> (modelDirPath: String?, variant: String, localeTag: String?, deviceUID: String?) {
     var modelDirPath: String?
     var variant = "0.6b"
     var localeTag: String?
@@ -740,11 +870,50 @@ case "listen":
             idx += 1
         }
     }
-    guard let modelDirPath, !modelDirPath.isEmpty else {
+    return (modelDirPath, variant, localeTag, deviceUID)
+}
+
+let args = Array(CommandLine.arguments.dropFirst())
+let cmd = args.first ?? "probe"
+
+switch cmd {
+case "probe":
+    emitJson(probePayload())
+    exit(0)
+case "devices":
+    if let data = try? JSONSerialization.data(withJSONObject: listAliveInputDevices(), options: []),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+        fflush(stdout)
+    } else {
+        print("[]")
+        fflush(stdout)
+    }
+    exit(0)
+case "listen":
+    let parsed = parseModelArgs(args)
+    guard let modelDirPath = parsed.modelDirPath, !modelDirPath.isEmpty else {
         emitJson(["type": "error", "code": "missing_model_dir"])
         exit(2)
     }
-    let session = QwenStreamingSession()
+    guard checkMlxRuntimeAvailable() else {
+        exit(1)
+    }
+    guard requestMicIfNeeded() == .authorized else {
+        emitJson(["type": "error", "code": "permission_denied", "target": "mic"])
+        exit(1)
+    }
+    let modelDir = URL(fileURLWithPath: modelDirPath, isDirectory: true)
+    let decodeQueue = DispatchQueue(label: "com.imcodes.pc-app.qwen3asr", qos: .userInteractive)
+    guard let model = loadMlxModel(modelDir: modelDir, variant: parsed.variant, onQueue: decodeQueue) else {
+        exit(1)
+    }
+    let session = QwenStreamingSession(
+        model: model,
+        hotwords: readHotwords(from: modelDir),
+        decodeQueue: decodeQueue,
+        unloadOnFinish: true
+    )
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
     let termSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
@@ -753,13 +922,51 @@ case "listen":
     let intSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
     intSrc.setEventHandler { session.stop(abort: true) }
     intSrc.resume()
-    let code = session.run(
-        modelDir: URL(fileURLWithPath: modelDirPath, isDirectory: true),
-        variant: variant,
-        localeTag: localeTag,
-        deviceUID: deviceUID
+    guard session.start(localeTag: parsed.localeTag, deviceUID: parsed.deviceUID, emitEndOnStartFailure: false) else {
+        model.unload()
+        Qwen3ASRModel.clearMetalCache()
+        exit(1)
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+        while let line = readLine(strippingNewline: true) {
+            if line == "stop" || line == "abort" {
+                session.stop(abort: line == "abort")
+                return
+            }
+        }
+        session.stop(abort: false)
+    }
+    session.waitForCompletion()
+    exit(0)
+case "serve":
+    let parsed = parseModelArgs(args)
+    guard let modelDirPath = parsed.modelDirPath, !modelDirPath.isEmpty else {
+        emitJson(["type": "error", "code": "missing_model_dir"])
+        exit(2)
+    }
+    guard checkMlxRuntimeAvailable() else {
+        exit(1)
+    }
+    let modelDir = URL(fileURLWithPath: modelDirPath, isDirectory: true)
+    let decodeQueue = DispatchQueue(label: "com.imcodes.pc-app.qwen3asr", qos: .userInteractive)
+    guard let model = loadMlxModel(modelDir: modelDir, variant: parsed.variant, onQueue: decodeQueue) else {
+        exit(1)
+    }
+    emitJson(["type": "ready", "variant": parsed.variant])
+    let runner = QwenServeRunner(
+        model: model,
+        hotwords: readHotwords(from: modelDir),
+        decodeQueue: decodeQueue
     )
-    exit(code)
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let termSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
+    termSrc.setEventHandler { runner.shutdown() }
+    termSrc.resume()
+    let intSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+    intSrc.setEventHandler { runner.shutdown() }
+    intSrc.resume()
+    runner.run()
 default:
     emitJson(["type": "error", "code": "unknown_command", "command": cmd])
     exit(2)

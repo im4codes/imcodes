@@ -63,6 +63,7 @@ export async function startPcApp(): Promise<void> {
         ? (mediaType) => systemPreferences.askForMediaAccess(mediaType)
         : undefined,
       openSystemUrl: (url) => shell.openExternal(url),
+      useResidentMlxWorker: true,
       onVoiceEvent: (ev) => voiceHud.handleEvent(ev),
     },
     createMainWindow: (opts) =>

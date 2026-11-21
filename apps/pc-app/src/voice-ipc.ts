@@ -49,6 +49,7 @@ export interface PcAppVoicePermissions {
 
 export type PcAppVoiceEvent =
   | { type: 'loading'; variant?: string }
+  | { type: 'ready'; variant?: string }
   | { type: 'start' }
   | { type: 'level'; value: number }
   | { type: 'result'; text: string; isFinal: boolean }
@@ -99,6 +100,7 @@ export interface PcAppVoiceControllerDeps {
   onSpeechModelStatusChanged?: (status: PcAppSpeechModelStatus) => void;
   onInputDevicesChanged?: (devices: PcAppInputDevice[], selectedUid: string) => void;
   onVoiceEvent?: (event: PcAppVoiceEvent) => void;
+  useResidentMlxWorker?: boolean;
 }
 
 const MAC_PRIVACY_URLS: Record<PcAppPrivacyTarget, string> = {
@@ -179,6 +181,33 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let lastProgressNotifiedDownloading: PcAppSpeechVariant | null = null;
   let lastProgressNotifiedMlx: boolean | null = cachedMlxSupport;
   let lastProgressNotifiedAt = 0;
+
+  interface ActiveWorkerUtterance {
+    onEvent?: (event: PcAppVoiceEvent) => void;
+    loggedFirstLevel: boolean;
+    loggedFirstResult: boolean;
+    waitersForEnd: Array<() => void>;
+  }
+
+  interface ResidentMlxWorker {
+    proc: ChildProcess;
+    variant: PcAppSpeechVariant;
+    modelDir: string;
+    state: 'starting' | 'loading' | 'ready' | 'stopping';
+    stdoutBuffer: string;
+    stderrBuffer: string;
+    utterance: ActiveWorkerUtterance | null;
+    killTimer: ReturnType<typeof setTimeout> | null;
+  }
+
+  let mlxWorker: ResidentMlxWorker | null = null;
+  let activeWorkerUtterance: ActiveWorkerUtterance | null = null;
+  let workerSpawnInFlight: { variant: PcAppSpeechVariant; promise: Promise<ResidentMlxWorker | null> } | null = null;
+  let serveUnsupported = false;
+  let controllerDisposed = false;
+
+  const shouldUseResidentMlxWorker = (): boolean =>
+    !controllerDisposed && !serveUnsupported && (deps.useResidentMlxWorker ?? (deps.spawnHelper === undefined));
 
   const modelStore = new PcAppSpeechModelStore(deps.userDataDir);
   const loadedModel = modelStore.load();
@@ -558,6 +587,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         targetModelAfterDownload = null;
         selectedModel = choice;
         modelStore.save(choice);
+        void ensureResidentMlxWorker(variant, { skipVerify: true });
       }
       notifyStatusChanged(true);
     });
@@ -588,6 +618,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         };
         selectedModel = candidate;
         notifyStatusChanged(true);
+        void ensureResidentMlxWorker(variant, { skipVerify: true });
         return;
       }
     }
@@ -720,11 +751,378 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
   };
 
+  const logVoiceEvent = (
+    payload: PcAppVoiceEvent,
+    state: { loggedFirstLevel: boolean; loggedFirstResult: boolean },
+  ): void => {
+    if (payload.type === 'loading') {
+      appendVoiceLog(`helper model loading variant=${payload.variant ?? '-'}`);
+    } else if (payload.type === 'ready') {
+      appendVoiceLog(`helper model ready variant=${payload.variant ?? '-'}`);
+    } else if (payload.type === 'level' && !state.loggedFirstLevel && payload.value > 0.01) {
+      state.loggedFirstLevel = true;
+      appendVoiceLog(`first level value=${payload.value.toFixed(4)}`);
+    } else if (payload.type === 'result') {
+      const trimmed = payload.text.trim();
+      if (!state.loggedFirstResult && trimmed) {
+        state.loggedFirstResult = true;
+        appendVoiceLog(
+          `first result isFinal=${payload.isFinal} len=${trimmed.length} text=${JSON.stringify(trimmed.slice(0, 80))}`,
+        );
+      }
+      if (payload.isFinal) {
+        appendVoiceLog(`final result len=${trimmed.length} text=${JSON.stringify(trimmed.slice(0, 80))}`);
+      }
+    } else if (payload.type === 'error') {
+      appendVoiceLog(`helper error code=${payload.code} target=${payload.target ?? '-'} message=${payload.message ?? '-'}`);
+    }
+  };
+
+  const resolveUtteranceWaiters = (utt: ActiveWorkerUtterance): void => {
+    const waiters = utt.waitersForEnd.splice(0, utt.waitersForEnd.length);
+    for (const resolveWaiter of waiters) {
+      resolveWaiter();
+    }
+  };
+
+  const emitWorkerUtteranceEvent = (utt: ActiveWorkerUtterance | null, payload: PcAppVoiceEvent): void => {
+    if (!utt) return;
+    logVoiceEvent(payload, utt);
+    notifyVoiceEvent(payload);
+    if (utt.onEvent) {
+      utt.onEvent(payload);
+      return;
+    }
+    if (!deps.getCurrentTrustedOrigin()) return;
+    deps.sendToRenderer(PC_APP_VOICE_CHANNELS.event, payload);
+  };
+
+  const shutdownMlxWorker = (target?: ResidentMlxWorker | null): void => {
+    const worker = target ?? mlxWorker;
+    if (!worker) return;
+    if (mlxWorker === worker) {
+      mlxWorker = null;
+    }
+    if (workerSpawnInFlight && !target) {
+      workerSpawnInFlight = null;
+    }
+    if (worker.state === 'stopping') return;
+    worker.state = 'stopping';
+
+    if (worker.utterance) {
+      const utt = worker.utterance;
+      worker.utterance = null;
+      if (activeWorkerUtterance === utt) {
+        activeWorkerUtterance = null;
+      }
+      emitWorkerUtteranceEvent(utt, { type: 'end' });
+      resolveUtteranceWaiters(utt);
+    }
+
+    appendVoiceLog(`mlx serve shutdown variant=${worker.variant}`);
+    try {
+      worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'shutdown' })}\n`);
+      worker.proc.stdin?.end();
+    } catch {
+      try {
+        worker.proc.kill('SIGTERM');
+      } catch {
+        // Already exited.
+      }
+    }
+
+    if (worker.killTimer !== null) {
+      clearTimeout(worker.killTimer);
+    }
+    worker.killTimer = setTimeout(() => {
+      worker.killTimer = null;
+      try {
+        worker.proc.kill('SIGTERM');
+      } catch {
+        // Already exited.
+      }
+    }, 1_500);
+    if (typeof worker.killTimer.unref === 'function') {
+      worker.killTimer.unref();
+    }
+  };
+
+  const ensureResidentMlxWorker = async (
+    variant: PcAppSpeechVariant,
+    opts?: { skipVerify?: boolean },
+  ): Promise<ResidentMlxWorker | null> => {
+    if (controllerDisposed || !shouldUseResidentMlxWorker()) return null;
+    if (mlxWorker && mlxWorker.variant === variant && mlxWorker.state !== 'stopping') {
+      return mlxWorker;
+    }
+    if (mlxWorker && mlxWorker.variant !== variant) {
+      shutdownMlxWorker(mlxWorker);
+    }
+    if (workerSpawnInFlight && workerSpawnInFlight.variant === variant) {
+      return workerSpawnInFlight.promise;
+    }
+
+    const spawnPromise = (async (): Promise<ResidentMlxWorker | null> => {
+      if (controllerDisposed || !shouldUseResidentMlxWorker()) return null;
+      if (!(await checkMlxSupported())) return null;
+      const mlxBin = resolveMlxHelperPath();
+      if (!mlxBin || !downloader.isModelReadySync(variant)) return null;
+
+      if (!opts?.skipVerify) {
+        const verified = await downloader.verifyModelFilesOnDisk(variant);
+        if (!verified) {
+          void triggerDownloadIfSelected();
+          return null;
+        }
+      }
+
+      if (controllerDisposed || !shouldUseResidentMlxWorker()) return null;
+      if (choiceToSpeechVariant(selectedModel) !== variant) return null;
+      if (mlxWorker && mlxWorker.variant === variant && mlxWorker.state !== 'stopping') {
+        return mlxWorker;
+      }
+      if (mlxWorker) {
+        shutdownMlxWorker(mlxWorker);
+      }
+
+      const modelDir = downloader.getModelDirectory(variant);
+      const args = ['serve', '--model-dir', modelDir, '--variant', variant];
+      appendVoiceLog(`mlx serve spawn variant=${variant} bin=${mlxBin} args=${JSON.stringify(args)}`);
+      const proc = (deps.spawnHelper ?? ((p, a) => spawn(p, a, { stdio: ['pipe', 'pipe', 'pipe'] })))(mlxBin, args);
+      const worker: ResidentMlxWorker = {
+        proc,
+        variant,
+        modelDir,
+        state: 'starting',
+        stdoutBuffer: '',
+        stderrBuffer: '',
+        utterance: null,
+        killTimer: null,
+      };
+      mlxWorker = worker;
+
+      proc.stderr?.on('data', (chunk: Buffer | string) => {
+        const text = String(chunk);
+        if (text.trim()) {
+          appendVoiceLog(`mlx serve stderr: ${text.trim()}`);
+        }
+        worker.stderrBuffer += text;
+        if (worker.stderrBuffer.length > 512) {
+          worker.stderrBuffer = worker.stderrBuffer.slice(-512);
+        }
+      });
+
+      proc.stdout?.on('data', (chunk: Buffer | string) => {
+        worker.stdoutBuffer += String(chunk);
+        let idx = worker.stdoutBuffer.indexOf('\n');
+        while (idx !== -1) {
+          const line = worker.stdoutBuffer.slice(0, idx).trim();
+          worker.stdoutBuffer = worker.stdoutBuffer.slice(idx + 1);
+          idx = worker.stdoutBuffer.indexOf('\n');
+          if (!line) continue;
+          let parsed: PcAppVoiceEvent;
+          try {
+            parsed = JSON.parse(line) as PcAppVoiceEvent;
+          } catch {
+            continue;
+          }
+          if (!parsed || typeof parsed.type !== 'string') continue;
+
+          if (parsed.type === 'loading') {
+            if (worker.state !== 'stopping') {
+              worker.state = 'loading';
+            }
+            if (worker.utterance) {
+              emitWorkerUtteranceEvent(worker.utterance, parsed);
+            } else {
+              appendVoiceLog(`mlx serve prewarm loading variant=${parsed.variant ?? worker.variant}`);
+            }
+            continue;
+          }
+
+          if (parsed.type === 'ready') {
+            if (worker.state !== 'stopping') {
+              worker.state = 'ready';
+            }
+            appendVoiceLog(`mlx serve ready variant=${parsed.variant ?? worker.variant}`);
+            continue;
+          }
+
+          if (parsed.type === 'error') {
+            if (parsed.code === 'unknown_command' && worker.state !== 'ready') {
+              serveUnsupported = true;
+            }
+            if (worker.utterance) {
+              emitWorkerUtteranceEvent(worker.utterance, parsed);
+            } else {
+              appendVoiceLog(`mlx serve background error code=${parsed.code} message=${parsed.message ?? '-'}`);
+            }
+            continue;
+          }
+
+          if (parsed.type === 'end') {
+            const utt = worker.utterance;
+            if (utt) {
+              worker.utterance = null;
+              if (activeWorkerUtterance === utt) {
+                activeWorkerUtterance = null;
+              }
+              emitWorkerUtteranceEvent(utt, parsed);
+              resolveUtteranceWaiters(utt);
+            }
+            continue;
+          }
+
+          emitWorkerUtteranceEvent(worker.utterance, parsed);
+        }
+      });
+
+      proc.once('exit', (code, signal) => {
+        appendVoiceLog(`mlx serve exit variant=${worker.variant} code=${code ?? 'null'} signal=${signal ?? 'null'}`);
+        if (worker.killTimer !== null) {
+          clearTimeout(worker.killTimer);
+          worker.killTimer = null;
+        }
+        if (mlxWorker === worker) {
+          mlxWorker = null;
+        }
+        const wasStopping = worker.state === 'stopping';
+        worker.state = 'stopping';
+        const utt = worker.utterance;
+        if (utt) {
+          worker.utterance = null;
+          if (activeWorkerUtterance === utt) {
+            activeWorkerUtterance = null;
+          }
+          if (!wasStopping && code && code !== 0) {
+            const message = worker.stderrBuffer.trim();
+            emitWorkerUtteranceEvent(utt, {
+              type: 'error',
+              code: 'helper_exited',
+              ...(message ? { message } : {}),
+            });
+          }
+          emitWorkerUtteranceEvent(utt, { type: 'end' });
+          resolveUtteranceWaiters(utt);
+        }
+      });
+
+      proc.once('error', (err) => {
+        appendVoiceLog(`mlx serve spawn_error variant=${worker.variant}: ${err.message}`);
+        if (worker.killTimer !== null) {
+          clearTimeout(worker.killTimer);
+          worker.killTimer = null;
+        }
+        if (mlxWorker === worker) {
+          mlxWorker = null;
+        }
+        const wasStopping = worker.state === 'stopping';
+        worker.state = 'stopping';
+        const utt = worker.utterance;
+        if (utt) {
+          worker.utterance = null;
+          if (activeWorkerUtterance === utt) {
+            activeWorkerUtterance = null;
+          }
+          if (!wasStopping) {
+            emitWorkerUtteranceEvent(utt, {
+              type: 'error',
+              code: 'helper_spawn_failed',
+              message: err.message,
+            });
+          }
+          emitWorkerUtteranceEvent(utt, { type: 'end' });
+          resolveUtteranceWaiters(utt);
+        }
+      });
+
+      return worker;
+    })();
+
+    workerSpawnInFlight = { variant, promise: spawnPromise };
+    try {
+      return await spawnPromise;
+    } finally {
+      if (workerSpawnInFlight?.promise === spawnPromise) {
+        workerSpawnInFlight = null;
+      }
+    }
+  };
+
   const stopListening = async (options?: { abort?: boolean }): Promise<void> => {
     if (activeStopTimer !== null) {
       clearTimeout(activeStopTimer);
       activeStopTimer = null;
     }
+
+    if (activeWorkerUtterance) {
+      const utt = activeWorkerUtterance;
+      const worker = mlxWorker && mlxWorker.utterance === utt ? mlxWorker : null;
+      if (options?.abort) {
+        activeWorkerUtterance = null;
+        if (worker) {
+          worker.utterance = null;
+          try {
+            worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'abort' })}\n`);
+          } catch {
+            shutdownMlxWorker(worker);
+          }
+        }
+        resolveUtteranceWaiters(utt);
+        notifyVoiceEvent({ type: 'end' });
+        return;
+      }
+
+      if (!worker || worker.state === 'stopping') {
+        activeWorkerUtterance = null;
+        if (worker) worker.utterance = null;
+        resolveUtteranceWaiters(utt);
+        notifyVoiceEvent({ type: 'end' });
+        return;
+      }
+
+      try {
+        worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'stop' })}\n`);
+      } catch {
+        activeWorkerUtterance = null;
+        worker.utterance = null;
+        resolveUtteranceWaiters(utt);
+        shutdownMlxWorker(worker);
+        return;
+      }
+
+      await new Promise<void>((resolveStop) => {
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          if (activeStopTimer !== null) {
+            clearTimeout(activeStopTimer);
+            activeStopTimer = null;
+          }
+          resolveStop();
+        };
+        utt.waitersForEnd.push(done);
+        activeStopTimer = setTimeout(() => {
+          if (activeWorkerUtterance === utt) {
+            activeWorkerUtterance = null;
+          }
+          if (worker.utterance === utt) {
+            worker.utterance = null;
+            try {
+              worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'abort' })}\n`);
+            } catch {
+              shutdownMlxWorker(worker);
+            }
+          }
+          notifyVoiceEvent({ type: 'end' });
+          resolveUtteranceWaiters(utt);
+          done();
+        }, 12_000);
+      });
+      return;
+    }
+
     const child = activeChild;
     const isMlxChild = activeChildIsMlx;
     if (!child) return;
@@ -787,6 +1185,46 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
     if (variant && (await checkMlxSupported()) && downloader.isModelReadySync(variant)) {
       const mlxBin = resolveMlxHelperPath();
+      if (mlxBin && shouldUseResidentMlxWorker()) {
+        const alreadyReady = Boolean(mlxWorker && mlxWorker.variant === variant && mlxWorker.state === 'ready');
+        if (!alreadyReady) {
+          notifyVoiceEvent({ type: 'loading', variant });
+        }
+        const worker = await ensureResidentMlxWorker(variant, { skipVerify: alreadyReady });
+        if (worker && worker.state !== 'stopping' && !serveUnsupported) {
+          await stopListening({ abort: true });
+          if (worker.state !== 'ready') {
+            notifyVoiceEvent({ type: 'loading', variant });
+          }
+          const utterance: ActiveWorkerUtterance = {
+            onEvent: options?.onEvent,
+            loggedFirstLevel: false,
+            loggedFirstResult: false,
+            waitersForEnd: [],
+          };
+          worker.utterance = utterance;
+          activeWorkerUtterance = utterance;
+          const startCmd: { cmd: 'start'; locale?: string; device?: string } = { cmd: 'start' };
+          if (typeof options?.locale === 'string' && options.locale.trim()) {
+            startCmd.locale = options.locale.trim();
+          }
+          if (selectedInputDevice !== 'auto') {
+            startCmd.device = selectedInputDevice;
+          }
+          try {
+            appendVoiceLog(`mlx serve start variant=${variant} device=${selectedInputDevice}`);
+            worker.proc.stdin?.write(`${JSON.stringify(startCmd)}\n`);
+            return { ok: true };
+          } catch {
+            worker.utterance = null;
+            if (activeWorkerUtterance === utterance) {
+              activeWorkerUtterance = null;
+            }
+            shutdownMlxWorker(worker);
+          }
+        }
+      }
+
       if (mlxBin) {
         notifyVoiceEvent({ type: 'loading', variant });
       }
@@ -976,6 +1414,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       lastStatusVariant = null;
       selectedModel = 'system';
       modelStore.save('system');
+      shutdownMlxWorker();
       notifyStatusChanged(true);
       return computeStatusSync();
     }
@@ -989,6 +1428,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       downloadingVariant = null;
       targetModelAfterDownload = null;
       selectedModel = 'system';
+      shutdownMlxWorker();
       notifyStatusChanged(true);
       return computeStatusSync();
     }
@@ -1008,6 +1448,10 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         };
         selectedModel = rawModel;
         modelStore.save(rawModel);
+        if (mlxWorker && mlxWorker.variant !== variant) {
+          shutdownMlxWorker(mlxWorker);
+        }
+        void ensureResidentMlxWorker(variant, { skipVerify: true });
         notifyStatusChanged(true);
         return computeStatusSync();
       }
@@ -1161,9 +1605,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     warmSelectedSpeechModel: triggerDownloadIfSelected,
     registerIpc,
     unregisterIpc,
-    dispose: () => {
+    dispose: async () => {
+      controllerDisposed = true;
       downloader.cancelActive();
-      return stopListening({ abort: true });
+      await stopListening({ abort: true });
+      shutdownMlxWorker();
     },
   };
 }

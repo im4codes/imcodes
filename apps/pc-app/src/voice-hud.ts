@@ -315,6 +315,7 @@ export function createPcAppVoiceHud(deps: CreatePcAppVoiceHudDeps = {}): PcAppVo
       case 'end':
         hideHud();
         return;
+      case 'ready':
       case 'result':
         return;
     }

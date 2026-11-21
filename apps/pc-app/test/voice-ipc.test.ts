@@ -1047,4 +1047,130 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     }
     await voice.dispose();
   });
+
+  it('keeps resident MLX serve worker alive across utterances, suppresses prewarm HUD events, shuts down on switch/dispose, and respawns after crash', async () => {
+    const weights = Buffer.from('mlx-serve-weights');
+    const sha = createHash('sha256').update(weights).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'aufklarer/test-serve-0.6b',
+        revision: 'rev06',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'aufklarer/test-serve-1.7b',
+        revision: 'rev17',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+    };
+
+    const spawnedWorkers: Array<{ bin: string; args: string[]; proc: ReturnType<typeof createFakeChildProcess> }> = [];
+    const rendererEvents: PcAppVoiceEvent[] = [];
+    const hudEvents: PcAppVoiceEvent[] = [];
+
+    const voice = createPcAppVoiceController({
+      platform: 'darwin',
+      arch: 'arm64',
+      userDataDir: tempDir,
+      speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+      mlxHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech-mlx',
+      isMlxSupported: () => true,
+      useResidentMlxWorker: true,
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes/session/1',
+      sendToRenderer: (_ch, payload) => rendererEvents.push(payload),
+      onVoiceEvent: (ev) => hudEvents.push(ev),
+      getMediaAccessStatus: () => 'granted',
+      manifests,
+      mirrorOrigins: ['https://hf-mirror.com'],
+      fetchModel: async () => new Response(new Uint8Array(weights), { status: 200 }),
+      runHelperAsync: async () => JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+      spawnHelper: (bin, args) => {
+        const proc = createFakeChildProcess();
+        spawnedWorkers.push({ bin, args, proc });
+        return proc as unknown as ChildProcess;
+      },
+    });
+
+    // 1. Selecting & downloading qwen3-0.6b prewarms `serve` in background without popping HUD
+    await voice.setSpeechModel('qwen3-0.6b');
+    await vi.waitFor(() => {
+      expect(spawnedWorkers).toHaveLength(1);
+    });
+    expect(spawnedWorkers[0]!.bin).toBe('/Applications/IM.codes.app/Contents/Resources/imcodes-speech-mlx');
+    expect(spawnedWorkers[0]!.args).toEqual([
+      'serve',
+      '--model-dir',
+      (await voice.getSpeechModelStatus()).modelDir!,
+      '--variant',
+      '0.6b',
+    ]);
+
+    const w0 = spawnedWorkers[0]!.proc;
+    w0.stdout.emit('data', '{"type":"loading","variant":"0.6b"}\n{"type":"ready","variant":"0.6b"}\n');
+    expect(rendererEvents).toEqual([]);
+    expect(hudEvents).toEqual([]);
+
+    // 2. First utterance reuses prewarmed worker (no second spawn, instant start JSON)
+    expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    expect(spawnedWorkers).toHaveLength(1);
+    expect(w0.stdin.write).toHaveBeenLastCalledWith('{"cmd":"start","locale":"zh-CN"}\n');
+
+    w0.stdout.emit('data', '{"type":"start"}\n{"type":"level","value":0.5}\n{"type":"result","text":"你好","isFinal":false}\n');
+    const stop1 = voice.stopListening({ abort: false });
+    expect(w0.stdin.write).toHaveBeenLastCalledWith('{"cmd":"stop"}\n');
+    expect(w0.stdin.end).not.toHaveBeenCalled();
+    w0.stdout.emit('data', '{"type":"result","text":"你好世界","isFinal":true}\n{"type":"end"}\n');
+    await stop1;
+
+    expect(rendererEvents).toEqual([
+      { type: 'start' },
+      { type: 'level', value: 0.5 },
+      { type: 'result', text: '你好', isFinal: false },
+      { type: 'result', text: '你好世界', isFinal: true },
+      { type: 'end' },
+    ]);
+    expect(hudEvents).toEqual(rendererEvents);
+
+    // 3. Second utterance & abort=true still reuse the same worker without killing/ending stdin
+    rendererEvents.length = 0;
+    hudEvents.length = 0;
+    expect(await voice.startListening({ locale: 'en-US' })).toEqual({ ok: true });
+    expect(spawnedWorkers).toHaveLength(1);
+    expect(w0.stdin.write).toHaveBeenLastCalledWith('{"cmd":"start","locale":"en-US"}\n');
+    await voice.stopListening({ abort: true });
+    expect(w0.stdin.write).toHaveBeenLastCalledWith('{"cmd":"abort"}\n');
+    expect(w0.kill).not.toHaveBeenCalled();
+
+    // 4. Switching to qwen3-1.7b shuts down 0.6b worker and spawns 1.7b serve worker
+    await voice.setSpeechModel('qwen3-1.7b');
+    await vi.waitFor(() => {
+      expect(spawnedWorkers).toHaveLength(2);
+    });
+    expect(w0.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
+    expect(w0.stdin.end).toHaveBeenCalledTimes(1);
+    expect(spawnedWorkers[1]!.args[3]).toBe('--variant');
+    expect(spawnedWorkers[1]!.args[4]).toBe('1.7b');
+
+    const w1 = spawnedWorkers[1]!.proc;
+    w1.stdout.emit('data', '{"type":"loading","variant":"1.7b"}\n{"type":"ready","variant":"1.7b"}\n');
+
+    // 5. Unexpected crash clears worker so next startListening respawns cleanly
+    w1.emit('exit', 1);
+    expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    expect(spawnedWorkers).toHaveLength(3);
+    const w2 = spawnedWorkers[2]!.proc;
+
+    // 6. Switching to system shuts down active worker; dispose also shuts down cleanly
+    await voice.setSpeechModel('system');
+    expect(w2.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
+    await voice.dispose();
+  });
 });

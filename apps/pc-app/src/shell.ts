@@ -95,6 +95,7 @@ export interface PcAppShellDeps {
       | 'onSpeechModelStatusChanged'
       | 'onInputDevicesChanged'
       | 'onVoiceEvent'
+      | 'useResidentMlxWorker'
     >
   >;
   createMainWindow: (options: {
