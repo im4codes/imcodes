@@ -564,6 +564,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       expect(findMenuItem(menu, 'voice:model-system')?.label).toBe(tPcApp(locale, 'menu.voice.system'));
       expect(findMenuItem(menu, 'voice:model-qwen3-0.6b')?.label).toBe(tPcApp(locale, 'menu.voice.qwen06b'));
       expect(findMenuItem(menu, 'voice:model-qwen3-1.7b')?.label).toBe(tPcApp(locale, 'menu.voice.qwen17b'));
+      expect(findMenuItem(menu, 'voice:mic-test')?.label).toBe(tPcApp(locale, 'menu.voice.micTest'));
       expect(findMenuItem(menu, 'help:docs')?.label).toBe(tPcApp(locale, 'menu.help.docs'));
       expect(menu.find((m) => m.label === tPcApp(locale, 'menu.edit.label'))).toBeDefined();
       expect(menu.find((m) => m.label === tPcApp(locale, 'menu.view.label'))).toBeDefined();
@@ -846,6 +847,167 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       const latest = menus.at(-1)!;
       expect(findMenuItem(latest, 'voice:mic:usb-1')?.label).toBe('Shure MV7 (Default)');
       expect(findMenuItem(latest, 'voice:mic:bt-1')).toBeUndefined();
+    });
+  });
+
+  it('opens Voice -> Microphone Test window cleanly, switches devices, streams waveform/transcript updates, and stops listening on close', async () => {
+    const menus: MenuItemOptionsLike[][] = [];
+    const promptWindows: Array<{
+      emitter: EventEmitter;
+      wc: EventEmitter & {
+        setWindowOpenHandler: (fn: (d: { url: string }) => { action: 'deny' }) => void;
+        executeJavaScript: ReturnType<typeof vi.fn>;
+      };
+      loadedUrls: string[];
+      focusSpy: ReturnType<typeof vi.fn>;
+      close: () => void;
+      isDestroyed: () => boolean;
+      webPreferences: Record<string, unknown>;
+    }> = [];
+    const spawnedChildren: Array<{
+      args: string[];
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      stdin: { write: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn> };
+      kill: ReturnType<typeof vi.fn>;
+      emitter: EventEmitter;
+    }> = [];
+
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      welcomeLocale: 'en',
+      voiceDeps: {
+        speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+        getMediaAccessStatus: () => 'granted',
+        runHelperAsync: async (_bin, args) => {
+          if (args[0] === 'devices') {
+            return JSON.stringify([
+              { uid: 'bt-1', name: 'AirPods Pro', transport: 'bluetooth', isDefault: true, isPhysical: false },
+              { uid: 'usb-1', name: 'LG USB Audio', transport: 'usb', isDefault: false, isPhysical: true },
+            ]);
+          }
+          return JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true });
+        },
+        spawnHelper: (_bin, args) => {
+          const em = new EventEmitter();
+          const child = Object.assign(em, {
+            args,
+            stdout: new EventEmitter(),
+            stderr: new EventEmitter(),
+            stdin: { write: vi.fn(), end: vi.fn() },
+            kill: vi.fn(() => {
+              em.emit('exit', 0);
+            }),
+            emitter: em,
+          });
+          spawnedChildren.push(child);
+          return child as unknown as import('node:child_process').ChildProcess;
+        },
+      },
+      createMainWindow: (opts) => createFakeShellWindow({ webPreferences: opts.webPreferences }),
+      createPromptWindow: (opts) => {
+        const emitter = new EventEmitter();
+        const wc = Object.assign(new EventEmitter(), {
+          setWindowOpenHandler: vi.fn(),
+          executeJavaScript: vi.fn(async () => undefined),
+        });
+        let destroyed = false;
+        const focusSpy = vi.fn();
+        const loadedUrls: string[] = [];
+        const record = {
+          emitter,
+          wc,
+          loadedUrls,
+          focusSpy,
+          webPreferences: opts.webPreferences as Record<string, unknown>,
+          isDestroyed: () => destroyed,
+          close: () => {
+            if (destroyed) return;
+            destroyed = true;
+            emitter.emit('closed');
+          },
+        };
+        promptWindows.push(record);
+        return {
+          loadURL: (u: string) => {
+            loadedUrls.push(u);
+          },
+          focus: focusSpy,
+          close: record.close,
+          isDestroyed: record.isDestroyed,
+          on: (ev: 'closed', fn: () => void) => emitter.on(ev, fn),
+          webContents: wc,
+        };
+      },
+      setApplicationMenu: (template) => {
+        menus.push(template);
+      },
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 0 }),
+    });
+
+    await shell.ensureWindow();
+    const micTestItem = findMenuItem(menus.at(-1)!, 'voice:mic-test');
+    expect(micTestItem).toBeDefined();
+
+    micTestItem?.click?.();
+    await vi.waitFor(() => {
+      expect(promptWindows).toHaveLength(1);
+      expect(promptWindows[0].loadedUrls.length).toBeGreaterThan(0);
+    });
+
+    const modal = promptWindows[0];
+    expect(modal.webPreferences).toEqual({
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webviewTag: false,
+      partition: 'pc-app-mic-test-ephemeral',
+    });
+    const html = decodeURIComponent(modal.loadedUrls[0]);
+    expect(html).toContain('id="device-select"');
+    expect(html).toContain('class="bar"');
+    expect(html).toContain('LG USB Audio');
+
+    // Re-opening while open focuses existing window without creating a second one
+    findMenuItem(menus.at(-1)!, 'voice:mic-test')?.click?.();
+    expect(promptWindows).toHaveLength(1);
+    expect(modal.focusSpy).toHaveBeenCalledTimes(1);
+
+    // Start test listening from mic-test window
+    const startEv = { preventDefault: vi.fn() };
+    modal.wc.emit('will-navigate', startEv, 'https://imcodes-mic-test.local/start');
+    expect(startEv.preventDefault).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(spawnedChildren).toHaveLength(1);
+    });
+    expect(spawnedChildren[0].args).toEqual(['listen', '--locale', 'en']);
+
+    spawnedChildren[0].stdout.emit('data', '{"type":"start"}\n{"type":"level","value":0.72}\n{"type":"result","text":"testing one two","isFinal":false}\n');
+    await vi.waitFor(() => {
+      const lastCall = modal.wc.executeJavaScript.mock.calls.at(-1)?.[0] as string | undefined;
+      expect(lastCall).toContain('"level":0.72');
+      expect(lastCall).toContain('testing one two');
+    });
+
+    // Switching device while listening aborts current process and restarts on usb-1
+    const switchEv = { preventDefault: vi.fn() };
+    modal.wc.emit('will-navigate', switchEv, 'https://imcodes-mic-test.local/select-device?uid=usb-1');
+    expect(switchEv.preventDefault).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(spawnedChildren).toHaveLength(2);
+    });
+    expect(spawnedChildren[0].kill).toHaveBeenCalledWith('SIGTERM');
+    expect(shell.voice.getSelectedInputDevice()).toBe('usb-1');
+    expect(spawnedChildren[1].args).toEqual(['listen', '--locale', 'en', '--device', 'usb-1']);
+
+    // Closing the mic-test window aborts active test listening
+    modal.close();
+    await vi.waitFor(() => {
+      expect(spawnedChildren[1].kill).toHaveBeenCalledWith('SIGTERM');
     });
   });
 });

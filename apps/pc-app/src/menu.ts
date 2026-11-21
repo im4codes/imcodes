@@ -34,6 +34,7 @@ export interface AppMenuOptions {
   selectedInputDevice?: string;
   onSelectInputDevice?: (uid: string) => void;
   onRefreshInputDevices?: () => void;
+  onOpenMicTest?: () => void;
   onSelectServer: (origin: string) => void;
   onAddServer: () => void;
   onSwitchServer?: () => void;
@@ -268,6 +269,12 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
                 click: () => options.onRefreshInputDevices?.(),
               },
             ],
+          },
+          { type: 'separator' },
+          {
+            id: 'voice:mic-test',
+            label: t('menu.voice.micTest'),
+            click: () => options.onOpenMicTest?.(),
           },
         ],
       }

@@ -663,4 +663,52 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     );
     await second.voice.dispose();
   });
+
+  it('forwards startListening({ onEvent }) to local test listener without relaxing untrusted remote IPC checks', async () => {
+    const spawned = createFakeChildProcess();
+    const sendToRenderer = vi.fn();
+    const mainWc = { id: 'main' };
+    const handlers = new Map<string, (event: PcAppIpcInvokeEventLike, ...args: unknown[]) => unknown>();
+    const ipcMain: PcAppIpcMainLike = {
+      handle: (channel, listener) => { handlers.set(channel, listener); },
+      removeHandler: (channel) => { handlers.delete(channel); },
+    };
+
+    const voice = createPcAppVoiceController({
+      platform: 'darwin',
+      userDataDir: tempDir,
+      speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+      isMainWebContents: (s) => s === mainWc,
+      getCurrentTrustedOrigin: () => null,
+      getActiveOrigin: () => null,
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => '',
+      sendToRenderer,
+      getMediaAccessStatus: () => 'granted',
+      runHelperAsync: async () => JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+      spawnHelper: () => spawned as unknown as ChildProcess,
+    });
+    voice.registerIpc(ipcMain);
+
+    // Remote IPC remains strictly blocked when untrusted / unauthenticated
+    await expect(
+      handlers.get(PC_APP_VOICE_CHANNELS.startListening)!({
+        sender: { id: 'evil' },
+        senderFrame: { url: 'https://evil.example' },
+      }),
+    ).rejects.toThrow('Untrusted origin');
+
+    // Internal local test listener receives events even with no connected remote origin, without leaking to renderer
+    const events: PcAppVoiceEvent[] = [];
+    expect(await voice.startListening({ locale: 'en-US', onEvent: (ev) => events.push(ev) })).toEqual({ ok: true });
+    spawned.stdout.emit('data', '{"type":"start"}\n{"type":"level","value":0.55}\n{"type":"result","text":"mic check","isFinal":true}\n{"type":"end"}\n');
+    expect(events).toEqual([
+      { type: 'start' },
+      { type: 'level', value: 0.55 },
+      { type: 'result', text: 'mic check', isFinal: true },
+      { type: 'end' },
+    ]);
+    expect(sendToRenderer).not.toHaveBeenCalled();
+    await voice.dispose();
+  });
 });

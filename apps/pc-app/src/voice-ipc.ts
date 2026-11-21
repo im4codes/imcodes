@@ -525,6 +525,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
   const startListening = async (options?: {
     locale?: string;
+    onEvent?: (event: PcAppVoiceEvent) => void;
   }): Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }> => {
     if (deps.platform !== 'darwin') {
       return { ok: false, error: 'unsupported_platform' };
@@ -589,6 +590,10 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     let stdoutBuffer = '';
     let stderrBuffer = '';
     const emitSafe = (payload: PcAppVoiceEvent) => {
+      if (options?.onEvent) {
+        options.onEvent(payload);
+        return;
+      }
       if (!deps.getCurrentTrustedOrigin()) return;
       deps.sendToRenderer(PC_APP_VOICE_CHANNELS.event, payload);
     };

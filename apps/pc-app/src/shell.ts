@@ -15,6 +15,7 @@ import {
   type PcAppLocale,
 } from './i18n.js';
 import { buildAppMenuTemplate, type MenuItemOptionsLike } from './menu.js';
+import { createPcAppMicTestController } from './mic-test.js';
 import {
   attachWindowSecurityGuards,
   isAllowedExternalUrl,
@@ -384,6 +385,9 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       onRefreshInputDevices: () => {
         void voice.getInputDevices().then(() => rebuildMenu());
       },
+      onOpenMicTest: () => {
+        void micTest.open();
+      },
       onSelectServer: (origin) => void handleSelectServer(origin),
       onAddServer: () => void handleAddServer(),
       onSwitchServer: () => void showServerPicker(),
@@ -429,6 +433,17 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     onSpeechModelStatusChanged: () => rebuildMenu(),
     onInputDevicesChanged: () => rebuildMenu(),
     ...(deps.voiceDeps ?? {}),
+  });
+  const micTest = createPcAppMicTestController({
+    createPromptWindow: deps.createPromptWindow,
+    getLocale: () => activeLocale,
+    getInputDevices: () => voice.getInputDevices(),
+    getInputDevicesSync: () => voice.getInputDevicesSync(),
+    getSelectedInputDevice: () => voice.getSelectedInputDevice(),
+    setSelectedInputDevice: (uid) => voice.setSelectedInputDevice(uid),
+    startTestListening: (onEvent, locale) => voice.startListening({ locale, onEvent }),
+    stopTestListening: (options) => voice.stopListening(options),
+    onDeviceChanged: () => rebuildMenu(),
   });
   if (deps.ipcMain) {
     voice.registerIpc(deps.ipcMain);
@@ -589,6 +604,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     });
 
     win.on('closed', () => {
+      void micTest.dispose();
       void voice.dispose();
       if (mainWindow === win) {
         mainWindow = null;

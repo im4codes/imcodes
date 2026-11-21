@@ -429,11 +429,13 @@ export function buildServerPromptDataUrl(opts?: {
 export interface PromptWindowLike {
   loadURL(url: string): Promise<void> | void;
   close(): void;
+  focus?(): void;
   isDestroyed(): boolean;
   on(event: 'closed', listener: () => void): unknown;
   webContents: {
     on(event: 'will-navigate', listener: (event: { preventDefault(): void }, url: string) => void): unknown;
     setWindowOpenHandler(handler: (details: { url: string }) => { action: 'deny' }): void;
+    executeJavaScript?(code: string, userGesture?: boolean): Promise<unknown>;
   };
 }
 

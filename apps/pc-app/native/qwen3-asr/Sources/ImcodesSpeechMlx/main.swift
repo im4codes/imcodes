@@ -1,3 +1,4 @@
+import AudioToolbox
 import AVFoundation
 import CoreAudio
 import Foundation
@@ -276,6 +277,31 @@ func listAliveInputDevices() -> [[String: Any]] {
     return result
 }
 
+func bindAudioInputDevice(_ inputNode: AVAudioInputNode, deviceID: AudioDeviceID) {
+    if let audioUnit = inputNode.audioUnit {
+        var devID = deviceID
+        let status = AudioUnitSetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &devID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        if status == noErr {
+            return
+        }
+        fputs("[imcodes-speech-mlx] AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice=\(deviceID)) failed: OSStatus=\(status)\n", stderr)
+    } else {
+        fputs("[imcodes-speech-mlx] inputNode.audioUnit unavailable for device \(deviceID)\n", stderr)
+    }
+    do {
+        try inputNode.auAudioUnit.setDeviceID(deviceID)
+    } catch {
+        fputs("[imcodes-speech-mlx] auAudioUnit.setDeviceID(\(deviceID)) fallback failed: \(error.localizedDescription)\n", stderr)
+    }
+}
+
 func resolveInputDeviceID(deviceUID: String?) -> AudioDeviceID? {
     if let raw = deviceUID?.trimmingCharacters(in: .whitespacesAndNewlines),
        !raw.isEmpty,
@@ -408,7 +434,7 @@ final class QwenStreamingSession {
 
         let inputNode = audioEngine.inputNode
         if let targetInputID = resolveInputDeviceID(deviceUID: deviceUID) {
-            try? inputNode.auAudioUnit.setDeviceID(targetInputID)
+            bindAudioInputDevice(inputNode, deviceID: targetInputID)
         }
         let inputFormat = inputNode.outputFormat(forBus: 0)
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
