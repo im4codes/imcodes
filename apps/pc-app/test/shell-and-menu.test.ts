@@ -8,7 +8,9 @@ import { PC_APP_LOCALES, tPcApp } from '../src/i18n.js';
 import { buildAppMenuTemplate, type MenuItemOptionsLike } from '../src/menu.js';
 import { MAIN_WINDOW_WEB_PREFERENCES } from '../src/security.js';
 import { buildWelcomeDataUrl, openAddServerPrompt } from '../src/server-prompt.js';
+import { PC_APP_MIC_TEST_CHANNELS } from '../src/mic-test.js';
 import { createPcAppShell, type ShellWindowLike } from '../src/shell.js';
+import type { PcAppIpcInvokeEventLike, PcAppIpcMainLike } from '../src/voice-ipc.js';
 
 function createFakeShellWindow(opts: {
   webPreferences: typeof MAIN_WINDOW_WEB_PREFERENCES;
@@ -850,13 +852,18 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     });
   });
 
-  it('opens Voice -> Microphone Test window cleanly, switches devices, streams waveform/transcript updates, and stops listening on close', async () => {
+  it('opens Voice -> Microphone Test window with dedicated preload + scoped IPC, skips select rebuilds on level ticks, switches devices, and stops listening on close', async () => {
     const menus: MenuItemOptionsLike[][] = [];
+    const handlers = new Map<string, (event: PcAppIpcInvokeEventLike, ...args: unknown[]) => unknown>();
+    const ipcMain: PcAppIpcMainLike = {
+      handle: (channel, listener) => { handlers.set(channel, listener); },
+      removeHandler: (channel) => { handlers.delete(channel); },
+    };
     const promptWindows: Array<{
       emitter: EventEmitter;
       wc: EventEmitter & {
         setWindowOpenHandler: (fn: (d: { url: string }) => { action: 'deny' }) => void;
-        executeJavaScript: ReturnType<typeof vi.fn>;
+        send: ReturnType<typeof vi.fn>;
       };
       loadedUrls: string[];
       focusSpy: ReturnType<typeof vi.fn>;
@@ -878,6 +885,8 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       appName: 'IM.codes',
       userDataDir: tempDir,
       welcomeLocale: 'en',
+      ipcMain,
+      micTestPreloadPath: '/tmp/mock-mic-test-preload.cjs',
       voiceDeps: {
         speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
         getMediaAccessStatus: () => 'granted',
@@ -911,7 +920,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
         const emitter = new EventEmitter();
         const wc = Object.assign(new EventEmitter(), {
           setWindowOpenHandler: vi.fn(),
-          executeJavaScript: vi.fn(async () => undefined),
+          send: vi.fn(),
         });
         let destroyed = false;
         const focusSpy = vi.fn();
@@ -966,21 +975,30 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       sandbox: true,
       webviewTag: false,
       partition: 'pc-app-mic-test-ephemeral',
+      preload: '/tmp/mock-mic-test-preload.cjs',
     });
     const html = decodeURIComponent(modal.loadedUrls[0]);
     expect(html).toContain('id="device-select"');
     expect(html).toContain('class="bar"');
     expect(html).toContain('LG USB Audio');
+    expect(html).toContain('computeDevicesKey');
+    expect(html).toContain('devicesKey !== lastDevicesKey');
+    expect(html).not.toContain('window.location.href');
+
+    // Scoped IPC rejects non-modal senders
+    const actionHandler = handlers.get(PC_APP_MIC_TEST_CHANNELS.action)!;
+    expect(actionHandler).toBeDefined();
+    await expect(
+      actionHandler({ sender: { id: 'evil-or-main' } }, { action: 'start' }),
+    ).rejects.toThrow('Blocked untrusted mic-test IPC invocation');
 
     // Re-opening while open focuses existing window without creating a second one
     findMenuItem(menus.at(-1)!, 'voice:mic-test')?.click?.();
     expect(promptWindows).toHaveLength(1);
     expect(modal.focusSpy).toHaveBeenCalledTimes(1);
 
-    // Start test listening from mic-test window
-    const startEv = { preventDefault: vi.fn() };
-    modal.wc.emit('will-navigate', startEv, 'https://imcodes-mic-test.local/start');
-    expect(startEv.preventDefault).toHaveBeenCalledTimes(1);
+    // Start test listening via scoped preload IPC
+    await expect(actionHandler({ sender: modal.wc }, { action: 'start' })).resolves.toEqual({ ok: true });
     await vi.waitFor(() => {
       expect(spawnedChildren).toHaveLength(1);
     });
@@ -988,15 +1006,13 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
 
     spawnedChildren[0].stdout.emit('data', '{"type":"start"}\n{"type":"level","value":0.72}\n{"type":"result","text":"testing one two","isFinal":false}\n');
     await vi.waitFor(() => {
-      const lastCall = modal.wc.executeJavaScript.mock.calls.at(-1)?.[0] as string | undefined;
-      expect(lastCall).toContain('"level":0.72');
-      expect(lastCall).toContain('testing one two');
+      const lastCall = modal.wc.send.mock.calls.at(-1);
+      expect(lastCall?.[0]).toBe(PC_APP_MIC_TEST_CHANNELS.state);
+      expect(lastCall?.[1]).toMatchObject({ level: 0.72, transcript: 'testing one two', listening: true });
     });
 
     // Switching device while listening aborts current process and restarts on usb-1
-    const switchEv = { preventDefault: vi.fn() };
-    modal.wc.emit('will-navigate', switchEv, 'https://imcodes-mic-test.local/select-device?uid=usb-1');
-    expect(switchEv.preventDefault).toHaveBeenCalledTimes(1);
+    await expect(actionHandler({ sender: modal.wc }, { action: 'select-device', payload: 'usb-1' })).resolves.toEqual({ ok: true });
     await vi.waitFor(() => {
       expect(spawnedChildren).toHaveLength(2);
     });
@@ -1004,10 +1020,13 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     expect(shell.voice.getSelectedInputDevice()).toBe('usb-1');
     expect(spawnedChildren[1].args).toEqual(['listen', '--locale', 'en', '--device', 'usb-1']);
 
-    // Closing the mic-test window aborts active test listening
+    // Closing the mic-test window aborts active test listening and blocks further IPC actions
     modal.close();
     await vi.waitFor(() => {
       expect(spawnedChildren[1].kill).toHaveBeenCalledWith('SIGTERM');
     });
+    await expect(
+      actionHandler({ sender: modal.wc }, { action: 'start' }),
+    ).rejects.toThrow('Blocked untrusted mic-test IPC invocation');
   });
 });

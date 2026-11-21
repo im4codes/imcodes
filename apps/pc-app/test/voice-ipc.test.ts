@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -710,5 +710,61 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     ]);
     expect(sendToRenderer).not.toHaveBeenCalled();
     await voice.dispose();
+  });
+
+  it('writes bounded voice.log diagnostics (<= 64 KB) and degrades cleanly when log path is unwritable', async () => {
+    const voiceLogPath = path.join(tempDir, 'voice.log');
+    writeFileSync(voiceLogPath, `${'stale-log-line\n'.repeat(4500)}`, 'utf8');
+    expect(statSync(voiceLogPath).size).toBeGreaterThan(64 * 1024);
+
+    const spawned = createFakeChildProcess();
+    const voice = createPcAppVoiceController({
+      platform: 'darwin',
+      userDataDir: tempDir,
+      speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes',
+      sendToRenderer: () => {},
+      getMediaAccessStatus: () => 'granted',
+      runHelperAsync: async () => JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+      spawnHelper: () => spawned as unknown as ChildProcess,
+    });
+
+    expect(await voice.startListening({ locale: 'en-US' })).toEqual({ ok: true });
+    spawned.stderr.emit('data', '[imcodes-speech] input deviceID=42 bindStatus=0 sampleRate=48000 channels=1\n');
+    spawned.stdout.emit('data', '{"type":"error","code":"no_audio_input"}\n');
+    spawned.emit('exit', 1, null);
+
+    expect(statSync(voiceLogPath).size).toBeLessThanOrEqual(64 * 1024);
+    const logContent = readFileSync(voiceLogPath, 'utf8');
+    expect(logContent).toContain('startListening model=system device=auto');
+    expect(logContent).toContain('helper stderr: [imcodes-speech] input deviceID=42 bindStatus=0 sampleRate=48000 channels=1');
+    expect(logContent).toContain('helper error code=no_audio_input');
+    expect(logContent).toContain('helper exit code=1');
+    await voice.dispose();
+
+    // Unwritable userDataDir (file blocking directory creation) never throws or blocks startListening
+    const blockerFile = path.join(tempDir, 'not-a-dir');
+    writeFileSync(blockerFile, 'x');
+    const spawned2 = createFakeChildProcess();
+    const voiceNoWrite = createPcAppVoiceController({
+      platform: 'darwin',
+      userDataDir: blockerFile,
+      speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes',
+      sendToRenderer: () => {},
+      getMediaAccessStatus: () => 'granted',
+      runHelperAsync: async () => JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+      spawnHelper: () => spawned2 as unknown as ChildProcess,
+    });
+    expect(await voiceNoWrite.startListening({ locale: 'en-US' })).toEqual({ ok: true });
+    await voiceNoWrite.dispose();
   });
 });

@@ -1,5 +1,5 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isSameActiveOrigin } from './security.js';
@@ -208,6 +208,31 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let modelDownloadedBytes = 0;
   let modelTotalBytes = 0;
   let modelDownloadError: string | undefined;
+
+  const voiceLogPath = join(deps.userDataDir, 'voice.log');
+  const VOICE_LOG_MAX_BYTES = 64 * 1024;
+  const appendVoiceLog = (message: string): void => {
+    try {
+      mkdirSync(dirname(voiceLogPath), { recursive: true });
+      const clean = message.replaceAll('\r', ' ').replaceAll('\n', ' | ').slice(0, 2048);
+      const entry = `[${new Date().toISOString()}] ${clean}\n`;
+      if (existsSync(voiceLogPath)) {
+        const st = statSync(voiceLogPath);
+        if (st.size + Buffer.byteLength(entry) > VOICE_LOG_MAX_BYTES) {
+          const prev = readFileSync(voiceLogPath, 'utf8');
+          const keepBytes = Math.max(0, Math.floor(VOICE_LOG_MAX_BYTES / 2));
+          const tail = Buffer.from(prev, 'utf8').subarray(-keepBytes).toString('utf8');
+          const firstNewline = tail.indexOf('\n');
+          const trimmed = firstNewline >= 0 ? tail.slice(firstNewline + 1) : tail;
+          writeFileSync(voiceLogPath, `${trimmed}${entry}`, 'utf8');
+          return;
+        }
+      }
+      appendFileSync(voiceLogPath, entry, 'utf8');
+    } catch {
+      // Best-effort diagnostics must never throw or block voice input.
+    }
+  };
 
   const resolveMlxHelperPath = (): string | null => {
     if (deps.platform !== 'darwin') return null;
@@ -532,6 +557,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
     const perms = await requestPermissions();
     if (perms.mic !== 'granted') {
+      appendVoiceLog(`startListening denied target=mic selectedModel=${selectedModel} device=${selectedInputDevice}`);
       return { ok: false, error: 'permission_denied', target: 'mic' };
     }
 
@@ -567,10 +593,12 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
     if (!bin) {
       if (perms.speech !== 'granted') {
+        appendVoiceLog(`startListening denied target=speech selectedModel=${selectedModel} device=${selectedInputDevice}`);
         return { ok: false, error: 'permission_denied', target: 'speech' };
       }
       bin = resolveSpeechHelperPath();
       if (!bin) {
+        appendVoiceLog(`startListening speech_helper_unavailable selectedModel=${selectedModel} device=${selectedInputDevice}`);
         return { ok: false, error: 'speech_helper_unavailable' };
       }
       args = ['listen'];
@@ -584,12 +612,16 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
     await stopListening({ abort: true });
 
+    appendVoiceLog(`startListening model=${selectedModel} device=${selectedInputDevice} bin=${bin} args=${JSON.stringify(args)}`);
     const child = (deps.spawnHelper ?? ((p, a) => spawn(p, a, { stdio: ['pipe', 'pipe', 'pipe'] })))(bin, args);
     activeChild = child;
 
     let stdoutBuffer = '';
     let stderrBuffer = '';
     const emitSafe = (payload: PcAppVoiceEvent) => {
+      if (payload.type === 'error') {
+        appendVoiceLog(`helper error code=${payload.code} target=${payload.target ?? '-'} message=${payload.message ?? '-'}`);
+      }
       if (options?.onEvent) {
         options.onEvent(payload);
         return;
@@ -599,7 +631,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     };
 
     child.stderr?.on('data', (chunk: Buffer | string) => {
-      stderrBuffer += String(chunk);
+      const text = String(chunk);
+      if (text.trim()) {
+        appendVoiceLog(`helper stderr: ${text.trim()}`);
+      }
+      stderrBuffer += text;
       if (stderrBuffer.length > 512) {
         stderrBuffer = stderrBuffer.slice(-512);
       }
@@ -624,7 +660,8 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       }
     });
 
-    child.once('exit', (code) => {
+    child.once('exit', (code, signal) => {
+      appendVoiceLog(`helper exit code=${code ?? 'null'} signal=${signal ?? 'null'}`);
       if (activeChild === child) {
         activeChild = null;
         if (code && code !== 0) {
@@ -640,6 +677,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     });
 
     child.once('error', (err) => {
+      appendVoiceLog(`helper spawn_error: ${err.message}`);
       if (activeChild === child) {
         activeChild = null;
       }

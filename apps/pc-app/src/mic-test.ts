@@ -1,9 +1,12 @@
 import { normalizePcAppLocale, tPcApp, type PcAppLocale } from './i18n.js';
 import { MAIN_WINDOW_WEB_PREFERENCES } from './security.js';
 import type { PromptWindowFactory, PromptWindowLike } from './server-prompt.js';
-import type { PcAppInputDevice, PcAppVoiceEvent } from './voice-ipc.js';
+import type { PcAppInputDevice, PcAppIpcMainLike, PcAppVoiceEvent } from './voice-ipc.js';
 
-export const MIC_TEST_ACTION_ORIGIN = 'https://imcodes-mic-test.local';
+export const PC_APP_MIC_TEST_CHANNELS = Object.freeze({
+  action: 'imcodes:mic-test:action',
+  state: 'imcodes:mic-test:state',
+} as const);
 
 export interface MicTestStateSnapshot {
   devices: PcAppInputDevice[];
@@ -16,6 +19,8 @@ export interface MicTestStateSnapshot {
 
 export interface OpenMicTestOptions {
   createPromptWindow: PromptWindowFactory;
+  preloadPath?: string;
+  ipcMain?: PcAppIpcMainLike;
   getLocale: () => string;
   getInputDevices: () => Promise<PcAppInputDevice[]>;
   getInputDevicesSync: () => PcAppInputDevice[];
@@ -176,7 +181,6 @@ export function buildMicTestDataUrl(
 
   <script>
     (function () {
-      const ACTION_ORIGIN = ${safeJson(MIC_TEST_ACTION_ORIGIN)};
       const STRINGS = ${safeJson(strings)};
       const bars = Array.from(document.querySelectorAll('#waveform .bar'));
       const history = new Array(bars.length).fill(0);
@@ -190,6 +194,8 @@ export function buildMicTestDataUrl(
       let currentListening = false;
       let hasStartedOnce = false;
       let tick = 0;
+      let lastDevicesKey = '';
+      let lastSelectedUid = '';
 
       function formatDev(dev) {
         const tags = [];
@@ -197,6 +203,14 @@ export function buildMicTestDataUrl(
         if (dev.transport === 'bluetooth') tags.push(STRINGS.tagBluetooth);
         else if (dev.isPhysical) tags.push(STRINGS.tagPhysical);
         return tags.length > 0 ? dev.name + ' [' + tags.join(' · ') + ']' : dev.name;
+      }
+
+      function computeDevicesKey(devices) {
+        return JSON.stringify(
+          devices.map(function (d) {
+            return [d.uid, d.name, d.transport, Boolean(d.isDefault), Boolean(d.isPhysical)];
+          }),
+        );
       }
 
       function renderWaveform(level, listening) {
@@ -225,22 +239,30 @@ export function buildMicTestDataUrl(
         }
       }
 
-      window.__imcodesMicTestUpdate = function (next) {
+      function applyState(next) {
         if (!next || typeof next !== 'object') return;
         if (Array.isArray(next.devices)) {
           const wantedUid = typeof next.selectedUid === 'string' ? next.selectedUid : 'auto';
-          selectEl.innerHTML = '';
-          const autoOpt = document.createElement('option');
-          autoOpt.value = 'auto';
-          autoOpt.textContent = STRINGS.autoOption;
-          selectEl.appendChild(autoOpt);
-          for (const dev of next.devices) {
-            const opt = document.createElement('option');
-            opt.value = dev.uid;
-            opt.textContent = formatDev(dev);
-            selectEl.appendChild(opt);
+          const devicesKey = computeDevicesKey(next.devices);
+          if (devicesKey !== lastDevicesKey) {
+            lastDevicesKey = devicesKey;
+            selectEl.innerHTML = '';
+            const autoOpt = document.createElement('option');
+            autoOpt.value = 'auto';
+            autoOpt.textContent = STRINGS.autoOption;
+            selectEl.appendChild(autoOpt);
+            for (const dev of next.devices) {
+              const opt = document.createElement('option');
+              opt.value = dev.uid;
+              opt.textContent = formatDev(dev);
+              selectEl.appendChild(opt);
+            }
+            lastSelectedUid = '';
           }
-          selectEl.value = Array.from(selectEl.options).some((o) => o.value === wantedUid) ? wantedUid : 'auto';
+          if (wantedUid !== lastSelectedUid) {
+            lastSelectedUid = wantedUid;
+            selectEl.value = Array.from(selectEl.options).some((o) => o.value === wantedUid) ? wantedUid : 'auto';
+          }
         }
 
         currentListening = Boolean(next.listening);
@@ -273,19 +295,24 @@ export function buildMicTestDataUrl(
           errorBoxEl.textContent = '';
           errorBoxEl.classList.remove('visible');
         }
-      };
+      }
+
+      const bridge = window.__IMCODES_MIC_TEST__;
+      if (bridge && typeof bridge.onState === 'function') {
+        bridge.onState(applyState);
+      }
 
       selectEl.addEventListener('change', function () {
-        window.location.href = ACTION_ORIGIN + '/select-device?uid=' + encodeURIComponent(selectEl.value);
+        void bridge?.sendAction('select-device', selectEl.value);
       });
       refreshBtn.addEventListener('click', function () {
-        window.location.href = ACTION_ORIGIN + '/refresh-devices';
+        void bridge?.sendAction('refresh-devices');
       });
       toggleBtn.addEventListener('click', function () {
-        window.location.href = ACTION_ORIGIN + (currentListening ? '/stop' : '/start');
+        void bridge?.sendAction(currentListening ? 'stop' : 'start');
       });
 
-      window.__imcodesMicTestUpdate(${safeJson(state)});
+      applyState(${safeJson(state)});
     })();
   </script>
 </body>
@@ -314,8 +341,7 @@ export function createPcAppMicTestController(opts: OpenMicTestOptions): MicTestC
 
   const pushState = () => {
     if (!win || win.isDestroyed()) return;
-    const json = JSON.stringify(snapshot()).replaceAll('</', '<\\/');
-    void win.webContents.executeJavaScript?.(`window.__imcodesMicTestUpdate?.(${json})`, false)?.catch?.(() => {});
+    win.webContents.send?.(PC_APP_MIC_TEST_CHANNELS.state, snapshot());
   };
 
   const handleVoiceEvent = (ev: PcAppVoiceEvent) => {
@@ -372,6 +398,70 @@ export function createPcAppMicTestController(opts: OpenMicTestOptions): MicTestC
     }
   };
 
+  if (opts.ipcMain) {
+    opts.ipcMain.removeHandler?.(PC_APP_MIC_TEST_CHANNELS.action);
+    opts.ipcMain.handle(PC_APP_MIC_TEST_CHANNELS.action, async (event, rawArg) => {
+      if (!win || win.isDestroyed() || event.sender !== win.webContents) {
+        throw new Error('Blocked untrusted mic-test IPC invocation');
+      }
+      const action =
+        rawArg && typeof rawArg === 'object' && 'action' in rawArg
+          ? String((rawArg as { action?: unknown }).action ?? '')
+          : '';
+      const payload =
+        rawArg && typeof rawArg === 'object' && 'payload' in rawArg
+          ? (rawArg as { payload?: unknown }).payload
+          : undefined;
+      const currentGen = windowGen;
+
+      if (action === 'start') {
+        if (!listening) {
+          void beginListening(currentGen);
+        }
+        return { ok: true };
+      }
+
+      if (action === 'stop') {
+        listening = false;
+        owningTestSession = false;
+        level = 0;
+        pushState();
+        await opts.stopTestListening({ abort: false });
+        return { ok: true };
+      }
+
+      if (action === 'refresh-devices') {
+        await opts.getInputDevices();
+        if (currentGen !== windowGen) return { ok: false };
+        opts.onDeviceChanged?.();
+        pushState();
+        return { ok: true };
+      }
+
+      if (action === 'select-device') {
+        const uid = typeof payload === 'string' ? payload : 'auto';
+        const wasListening = listening;
+        if (wasListening) {
+          listening = false;
+          owningTestSession = false;
+          level = 0;
+          pushState();
+          await opts.stopTestListening({ abort: true });
+        }
+        if (currentGen !== windowGen) return { ok: false };
+        opts.setSelectedInputDevice(uid);
+        opts.onDeviceChanged?.();
+        pushState();
+        if (wasListening && win && !win.isDestroyed()) {
+          await beginListening(currentGen);
+        }
+        return { ok: true };
+      }
+
+      return { ok: false, error: 'unknown_action' };
+    });
+  }
+
   const open = async (): Promise<void> => {
     if (win && !win.isDestroyed()) {
       win.focus?.();
@@ -402,69 +492,14 @@ export function createPcAppMicTestController(opts: OpenMicTestOptions): MicTestC
       webPreferences: {
         ...MAIN_WINDOW_WEB_PREFERENCES,
         partition: 'pc-app-mic-test-ephemeral',
+        ...(opts.preloadPath ? { preload: opts.preloadPath } : {}),
       },
     });
     win = modal;
 
     modal.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-
-    modal.webContents.on('will-navigate', (event, rawTarget) => {
+    modal.webContents.on('will-navigate', (event) => {
       event.preventDefault();
-      let parsed: URL;
-      try {
-        parsed = new URL(rawTarget);
-      } catch {
-        return;
-      }
-      if (parsed.origin !== MIC_TEST_ACTION_ORIGIN) {
-        return;
-      }
-
-      if (parsed.pathname === '/start') {
-        if (!listening) {
-          void beginListening(currentGen);
-        }
-        return;
-      }
-
-      if (parsed.pathname === '/stop') {
-        listening = false;
-        owningTestSession = false;
-        level = 0;
-        pushState();
-        void opts.stopTestListening({ abort: false });
-        return;
-      }
-
-      if (parsed.pathname === '/refresh-devices') {
-        void opts.getInputDevices().then(() => {
-          if (currentGen !== windowGen) return;
-          opts.onDeviceChanged?.();
-          pushState();
-        });
-        return;
-      }
-
-      if (parsed.pathname === '/select-device') {
-        const uid = parsed.searchParams.get('uid') ?? 'auto';
-        const wasListening = listening;
-        void (async () => {
-          if (wasListening) {
-            listening = false;
-            owningTestSession = false;
-            level = 0;
-            pushState();
-            await opts.stopTestListening({ abort: true });
-          }
-          if (currentGen !== windowGen) return;
-          opts.setSelectedInputDevice(uid);
-          opts.onDeviceChanged?.();
-          pushState();
-          if (wasListening && win && !win.isDestroyed()) {
-            await beginListening(currentGen);
-          }
-        })();
-      }
     });
 
     modal.on('closed', () => {
@@ -482,6 +517,7 @@ export function createPcAppMicTestController(opts: OpenMicTestOptions): MicTestC
     });
 
     await modal.loadURL(buildMicTestDataUrl(locale, snapshot()));
+    pushState();
     opts.onDeviceChanged?.();
   };
 
@@ -499,6 +535,7 @@ export function createPcAppMicTestController(opts: OpenMicTestOptions): MicTestC
       listening = false;
       owningTestSession = false;
       level = 0;
+      opts.ipcMain?.removeHandler?.(PC_APP_MIC_TEST_CHANNELS.action);
       if (win && !win.isDestroyed()) {
         const activeWin = win;
         win = null;

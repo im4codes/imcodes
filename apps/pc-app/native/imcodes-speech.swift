@@ -279,7 +279,8 @@ func listAliveInputDevices() -> [[String: Any]] {
   return result
 }
 
-func bindAudioInputDevice(_ inputNode: AVAudioInputNode, deviceID: AudioDeviceID) {
+@discardableResult
+func bindAudioInputDevice(_ inputNode: AVAudioInputNode, deviceID: AudioDeviceID) -> OSStatus {
   if let audioUnit = inputNode.audioUnit {
     var devID = deviceID
     let status = AudioUnitSetProperty(
@@ -291,16 +292,25 @@ func bindAudioInputDevice(_ inputNode: AVAudioInputNode, deviceID: AudioDeviceID
       UInt32(MemoryLayout<AudioDeviceID>.size)
     )
     if status == noErr {
-      return
+      return noErr
     }
     fputs("[imcodes-speech] AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice=\(deviceID)) failed: OSStatus=\(status)\n", stderr)
+    do {
+      try inputNode.auAudioUnit.setDeviceID(deviceID)
+      return noErr
+    } catch {
+      fputs("[imcodes-speech] auAudioUnit.setDeviceID(\(deviceID)) fallback failed: \(error.localizedDescription)\n", stderr)
+      return status
+    }
   } else {
     fputs("[imcodes-speech] inputNode.audioUnit unavailable for device \(deviceID)\n", stderr)
-  }
-  do {
-    try inputNode.auAudioUnit.setDeviceID(deviceID)
-  } catch {
-    fputs("[imcodes-speech] auAudioUnit.setDeviceID(\(deviceID)) fallback failed: \(error.localizedDescription)\n", stderr)
+    do {
+      try inputNode.auAudioUnit.setDeviceID(deviceID)
+      return noErr
+    } catch {
+      fputs("[imcodes-speech] auAudioUnit.setDeviceID(\(deviceID)) fallback failed: \(error.localizedDescription)\n", stderr)
+      return -1
+    }
   }
 }
 
@@ -375,6 +385,7 @@ final class SpeechSession {
     }
 
     guard let recognizer = resolveRecognizer(localeTag: localeTag), recognizer.isAvailable else {
+      fputs("[imcodes-speech] recognizer unavailable locale=\(localeTag ?? "default")\n", stderr)
       emitJson([
         "type": "error",
         "code": "speech_unavailable",
@@ -383,10 +394,10 @@ final class SpeechSession {
     }
 
     let inputNode = audioEngine.inputNode
-    if let targetInputID = resolveInputDeviceID(deviceUID: deviceUID) {
-      bindAudioInputDevice(inputNode, deviceID: targetInputID)
-    }
+    let targetInputID = resolveInputDeviceID(deviceUID: deviceUID)
+    let bindStatus: OSStatus = targetInputID.map { bindAudioInputDevice(inputNode, deviceID: $0) } ?? -1
     let format = inputNode.outputFormat(forBus: 0)
+    fputs("[imcodes-speech] input deviceID=\(targetInputID.map(String.init) ?? "none") bindStatus=\(bindStatus) sampleRate=\(format.sampleRate) channels=\(format.channelCount)\n", stderr)
     guard format.channelCount > 0, format.sampleRate > 0 else {
       emitJson([
         "type": "error",
@@ -409,6 +420,7 @@ final class SpeechSession {
     do {
       try audioEngine.start()
     } catch {
+      fputs("[imcodes-speech] audioEngine.start failed: \(error.localizedDescription)\n", stderr)
       inputNode.removeTap(onBus: 0)
       emitJson([
         "type": "error",

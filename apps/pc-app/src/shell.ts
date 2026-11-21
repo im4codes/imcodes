@@ -69,6 +69,7 @@ export interface PcAppShellDeps {
   appName: string;
   userDataDir: string;
   preloadPath?: string;
+  micTestPreloadPath?: string;
   ipcMain?: PcAppIpcMainLike;
   voiceDeps?: Partial<
     Pick<
@@ -436,6 +437,8 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
   });
   const micTest = createPcAppMicTestController({
     createPromptWindow: deps.createPromptWindow,
+    preloadPath: deps.micTestPreloadPath,
+    ipcMain: deps.ipcMain,
     getLocale: () => activeLocale,
     getInputDevices: () => voice.getInputDevices(),
     getInputDevicesSync: () => voice.getInputDevicesSync(),

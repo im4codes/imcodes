@@ -435,7 +435,7 @@ export interface PromptWindowLike {
   webContents: {
     on(event: 'will-navigate', listener: (event: { preventDefault(): void }, url: string) => void): unknown;
     setWindowOpenHandler(handler: (details: { url: string }) => { action: 'deny' }): void;
-    executeJavaScript?(code: string, userGesture?: boolean): Promise<unknown>;
+    send?(channel: string, ...args: unknown[]): void;
   };
 }
 
@@ -447,7 +447,7 @@ export type PromptWindowFactory = (options: {
   maximizable: boolean;
   modal: boolean;
   title: string;
-  webPreferences: typeof MAIN_WINDOW_WEB_PREFERENCES & { partition: string };
+  webPreferences: typeof MAIN_WINDOW_WEB_PREFERENCES & { partition: string; preload?: string };
 }) => PromptWindowLike;
 
 /**
