@@ -8,11 +8,13 @@ import type { UseQuickDataResult } from '../../src/components/QuickInputPanel.js
 type VoiceResultCb = (text: string, isFinal: boolean) => void;
 type VoiceListeningCb = (listening: boolean) => void;
 type VoiceErrorCb = (err: string) => void;
+type VoiceLevelCb = ((level: number) => void) | null;
 
 const voiceState = vi.hoisted(() => ({
   onResult: null as VoiceResultCb | null,
   onListeningChange: null as VoiceListeningCb | null,
   onError: null as VoiceErrorCb | null,
+  onLevel: null as VoiceLevelCb,
   startListening: vi.fn(async (onResult: VoiceResultCb, onListeningChange?: VoiceListeningCb, onError?: VoiceErrorCb) => {
     voiceState.onResult = onResult;
     voiceState.onListeningChange = onListeningChange ?? null;
@@ -25,7 +27,9 @@ const voiceState = vi.hoisted(() => ({
   }),
   isAvailable: vi.fn(() => true),
   prewarm: vi.fn(),
-  onAudioLevel: vi.fn(),
+  onAudioLevel: vi.fn((cb: VoiceLevelCb) => {
+    voiceState.onLevel = cb;
+  }),
   primeVoiceGesture: vi.fn(() => true),
   cancelVoiceGesturePrime: vi.fn(),
 }));
@@ -126,8 +130,10 @@ describe('Mac app inline composer voice input', () => {
     voiceState.onResult = null;
     voiceState.onListeningChange = null;
     voiceState.onError = null;
+    voiceState.onLevel = null;
     voiceState.startListening.mockClear();
     voiceState.stopListening.mockClear();
+    voiceState.onAudioLevel.mockClear();
     voiceState.isAvailable.mockReturnValue(true);
   });
 
@@ -262,5 +268,37 @@ describe('Mac app inline composer voice input', () => {
     const micBtn = container.querySelector('button[data-voice-trigger="desktop"]') as HTMLButtonElement;
     fireEvent.click(micBtn);
     expect(document.body.querySelector('.voice-overlay')).not.toBeNull();
+  });
+
+  it('drives the surround waveform level on VoiceStreamingRobot from VoiceInput.onAudioLevel and clears it on stop', async () => {
+    const { container, input } = renderComposer(1200);
+    input.focus();
+
+    const micBtn = container.querySelector('button[data-voice-trigger="desktop"]') as HTMLButtonElement;
+    fireEvent.click(micBtn);
+
+    expect(voiceState.onAudioLevel).toHaveBeenCalledTimes(1);
+    expect(voiceState.onLevel).toBeTypeOf('function');
+
+    const cursor = input.querySelector('.voice-streaming-robot-cursor') as HTMLElement;
+    expect(cursor).not.toBeNull();
+    expect(cursor.textContent).toBe('');
+    expect(cursor.classList.contains('has-level')).toBe(false);
+    expect(cursor.style.getPropertyValue('--voice-robot-level')).toBe('0.000');
+
+    voiceState.onLevel?.(0.72);
+    await waitFor(() => {
+      const updated = input.querySelector('.voice-streaming-robot-cursor') as HTMLElement;
+      expect(updated.classList.contains('has-level')).toBe(true);
+      expect(updated.style.getPropertyValue('--voice-robot-level')).toBe('0.720');
+      expect(readComposerElementText(input)).toBe('');
+    });
+
+    fireEvent.click(micBtn);
+    await waitFor(() => {
+      expect(voiceState.onLevel).toBeNull();
+      expect(voiceState.onAudioLevel).toHaveBeenLastCalledWith(null);
+      expect(input.querySelector('.voice-streaming-robot-cursor')).toBeNull();
+    });
   });
 });

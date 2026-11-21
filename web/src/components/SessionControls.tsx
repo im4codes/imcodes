@@ -26,7 +26,12 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
-import { VoiceStreamingRobot } from './VoiceStreamingRobot.js';
+import {
+  VoiceStreamingRobot,
+  applyVoiceRobotLevel,
+  clampVoiceRobotLevel,
+  clearVoiceRobotLevel,
+} from './VoiceStreamingRobot.js';
 import { moveCaretToEnd, registerComposerFocusHandler, type FocusComposerOptions } from '../util/composer-focus.js';
 import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../composer-inline-limit.js';
 import {
@@ -345,9 +350,11 @@ const VoiceHoldHud = memo(
       },
       pushLevel(level: number) {
         waveformRef.current?.pushLevel(level);
+        applyVoiceRobotLevel(transcriptRef.current, level);
       },
       resetBars() {
         waveformRef.current?.reset();
+        clearVoiceRobotLevel(transcriptRef.current);
       },
       getBottomPx() {
         const rect = hudElRef.current?.getBoundingClientRect();
@@ -2248,6 +2255,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceOverlayAutoStart, setVoiceOverlayAutoStart] = useState(true);
   const [inlineVoiceActive, setInlineVoiceActive] = useState(false);
   const [inlineVoiceRecognizing, setInlineVoiceRecognizing] = useState(false);
+  const [inlineVoiceLevel, setInlineVoiceLevel] = useState(0);
   const [inlineVoicePermissionTarget, setInlineVoicePermissionTarget] = useState<'mic' | 'speech' | null>(null);
   const inlineVoiceActiveRef = useRef(false);
   const inlineVoiceTokenRef = useRef(0);
@@ -6253,6 +6261,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (!options?.skipStateUpdate) {
       setInlineVoiceActive(false);
       setInlineVoiceRecognizing(false);
+      setInlineVoiceLevel(0);
+    }
+    if (wasActive) {
+      VoiceInput.onAudioLevel(null);
     }
     const caretTarget = inlineVoiceSegmentRef.current.caretAfterSegment;
     detachInlineVoiceRobotHost(inlineVoiceRobotHostRef.current);
@@ -6466,6 +6478,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     inlineVoiceActiveRef.current = false;
     setInlineVoiceActive(false);
     setInlineVoiceRecognizing(false);
+    setInlineVoiceLevel(0);
+    VoiceInput.onAudioLevel(null);
     // Detach the robot badge without rewriting root text so browser-inserted edits stay intact.
     detachInlineVoiceRobotHost(inlineVoiceRobotHostRef.current);
     void Promise.resolve(VoiceInput.stopListening({ abort: true })).catch(() => {});
@@ -6511,8 +6525,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     inlineVoiceActiveRef.current = true;
     setInlineVoiceActive(true);
     setInlineVoiceRecognizing(false);
+    setInlineVoiceLevel(0);
     setInlineVoicePermissionTarget(null);
     primeVoiceInputGesture({ deferAudioPause: false });
+
+    VoiceInput.onAudioLevel((rawLevel) => {
+      if (!mountedRef.current || inlineVoiceTokenRef.current !== token || !inlineVoiceActiveRef.current) return;
+      setInlineVoiceLevel(clampVoiceRobotLevel(rawLevel));
+    });
 
     let started = false;
     void Promise.resolve(VoiceInput.startListening(
@@ -11704,7 +11724,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       </div>
     )}
     {inlineVoiceActive && inlineVoiceRobotHostRef.current && createPortal(
-      <VoiceStreamingRobot active={inlineVoiceActive || inlineVoiceRecognizing} />,
+      <VoiceStreamingRobot active={inlineVoiceActive || inlineVoiceRecognizing} level={inlineVoiceLevel} />,
       inlineVoiceRobotHostRef.current,
     )}
     <VoiceOverlay

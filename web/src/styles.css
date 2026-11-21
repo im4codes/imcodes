@@ -4020,19 +4020,63 @@ html.native-ios-mac .chat-dl-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  vertical-align: -0.18em;
-  width: 1.08em;
-  height: 1.08em;
-  margin-left: 4px;
+  vertical-align: -0.32em;
+  width: 1.45em;
+  height: 1.45em;
+  margin-left: 3px;
   filter: drop-shadow(0 0 6px rgba(34,211,238,0.55));
 }
 .voice-streaming-robot-svg {
   width: 100%;
   height: 100%;
   display: block;
+  overflow: visible;
+}
+.voice-robot-wave-ring {
+  opacity: 0.25;
+  transition: opacity 90ms ease-out;
+}
+.voice-robot-wave-halo {
+  transform-box: view-box;
+  transform-origin: 12px 12px;
+  transform: scale(0.92);
+  opacity: 0.22;
+  transition: transform 90ms ease-out, opacity 90ms ease-out;
+}
+.voice-robot-wave-bar {
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+  transform: scaleY(0.25);
+  opacity: 0.45;
+  transition: transform 85ms ease-out, opacity 85ms ease-out;
 }
 .voice-streaming-robot-cursor.is-active {
   animation: voice-robot-bob 1.2s ease-in-out infinite;
+}
+.voice-streaming-robot-cursor.is-active .voice-robot-wave-ring {
+  opacity: 0.78;
+}
+.voice-streaming-robot-cursor.is-active .voice-robot-wave-halo {
+  animation: voice-robot-wave-halo-ambient 1.4s ease-in-out infinite;
+}
+.voice-streaming-robot-cursor.is-active .voice-robot-wave-bar {
+  animation: voice-robot-wave-ambient 1.2s ease-in-out var(--bar-delay, 0ms) infinite;
+}
+.voice-streaming-robot-cursor.has-level .voice-robot-wave-ring,
+.voice-hold-hud-transcript[data-voice-level-active="true"] .voice-streaming-robot-cursor .voice-robot-wave-ring {
+  opacity: 1;
+}
+.voice-streaming-robot-cursor.has-level .voice-robot-wave-halo,
+.voice-hold-hud-transcript[data-voice-level-active="true"] .voice-streaming-robot-cursor .voice-robot-wave-halo {
+  animation: none;
+  transform: scale(calc(0.92 + var(--voice-robot-level, 0) * 0.18));
+  opacity: calc(0.28 + var(--voice-robot-level, 0) * 0.72);
+}
+.voice-streaming-robot-cursor.has-level .voice-robot-wave-bar,
+.voice-hold-hud-transcript[data-voice-level-active="true"] .voice-streaming-robot-cursor .voice-robot-wave-bar {
+  animation: none;
+  transform: scaleY(calc(0.28 + var(--voice-robot-level, 0) * var(--bar-gain, 0.95)));
+  opacity: calc(0.45 + var(--voice-robot-level, 0) * 0.55);
 }
 .voice-streaming-robot-cursor.is-active .voice-robot-antenna {
   animation: voice-robot-antenna-pulse 0.9s ease-in-out infinite;
@@ -4059,6 +4103,14 @@ html.native-ios-mac .chat-dl-btn {
   0%, 100% { opacity: 0.82; }
   50% { opacity: 1; }
 }
+@keyframes voice-robot-wave-ambient {
+  0%, 100% { transform: scaleY(0.26); opacity: 0.4; }
+  50% { transform: scaleY(0.54); opacity: 0.78; }
+}
+@keyframes voice-robot-wave-halo-ambient {
+  0%, 100% { transform: scale(0.92); opacity: 0.2; }
+  50% { transform: scale(1.0); opacity: 0.45; }
+}
 @media (prefers-reduced-motion: reduce) {
   .btn-voice-active,
   .btn-voice.btn-voice-inline-active::before,
@@ -4081,7 +4133,9 @@ html.native-ios-mac .chat-dl-btn {
   .voice-streaming-robot-cursor.is-active,
   .voice-streaming-robot-cursor.is-active .voice-robot-antenna,
   .voice-streaming-robot-cursor.is-active .voice-robot-aura,
-  .voice-streaming-robot-cursor.is-active .voice-robot-eye {
+  .voice-streaming-robot-cursor.is-active .voice-robot-eye,
+  .voice-streaming-robot-cursor.is-active .voice-robot-wave-halo,
+  .voice-streaming-robot-cursor.is-active .voice-robot-wave-bar {
     animation: none;
   }
   .voice-editor-marquee::after { opacity: 0.6; }
