@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreAudio
 import Foundation
 import Speech
 
@@ -88,6 +89,129 @@ func resolveRecognizer(localeTag: String?) -> SFSpeechRecognizer? {
   return SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer()
 }
 
+private func audioDeviceTransportType(_ deviceID: AudioDeviceID) -> UInt32? {
+  var addr = AudioObjectPropertyAddress(
+    mSelector: kAudioDevicePropertyTransportType,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var transport: UInt32 = 0
+  var size = UInt32(MemoryLayout<UInt32>.size)
+  let status = AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &transport)
+  return status == noErr ? transport : nil
+}
+
+private func physicalTransportPriority(_ transport: UInt32) -> Int? {
+  switch transport {
+  case kAudioDeviceTransportTypeBuiltIn:
+    return 0
+  case kAudioDeviceTransportTypeUSB:
+    return 1
+  case kAudioDeviceTransportTypeThunderbolt:
+    return 2
+  case kAudioDeviceTransportTypeDisplayPort:
+    return 3
+  case kAudioDeviceTransportTypeHDMI:
+    return 4
+  case kAudioDeviceTransportTypePCI:
+    return 5
+  case kAudioDeviceTransportTypeFireWire:
+    return 6
+  case kAudioDeviceTransportTypeAVB:
+    return 7
+  default:
+    return nil
+  }
+}
+
+private func isAudioDeviceAlive(_ deviceID: AudioDeviceID) -> Bool {
+  var addr = AudioObjectPropertyAddress(
+    mSelector: kAudioDevicePropertyDeviceIsAlive,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var alive: UInt32 = 0
+  var size = UInt32(MemoryLayout<UInt32>.size)
+  let status = AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &alive)
+  return status == noErr && alive != 0
+}
+
+private func audioDeviceInputChannelCount(_ deviceID: AudioDeviceID) -> Int {
+  var addr = AudioObjectPropertyAddress(
+    mSelector: kAudioDevicePropertyStreamConfiguration,
+    mScope: kAudioDevicePropertyScopeInput,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var dataSize: UInt32 = 0
+  guard AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &dataSize) == noErr,
+        dataSize >= UInt32(MemoryLayout<AudioBufferList>.size) else {
+    return 0
+  }
+  let raw = UnsafeMutableRawPointer.allocate(
+    byteCount: Int(dataSize),
+    alignment: MemoryLayout<AudioBufferList>.alignment
+  )
+  defer { raw.deallocate() }
+  var size = dataSize
+  guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, raw) == noErr else {
+    return 0
+  }
+  let abl = raw.assumingMemoryBound(to: AudioBufferList.self)
+  return UnsafeMutableAudioBufferListPointer(abl).reduce(0) { $0 + Int($1.mNumberChannels) }
+}
+
+private func isPhysicalInputDevice(_ deviceID: AudioDeviceID) -> Int? {
+  guard deviceID != kAudioObjectUnknown,
+        isAudioDeviceAlive(deviceID),
+        audioDeviceInputChannelCount(deviceID) > 0,
+        let transport = audioDeviceTransportType(deviceID) else {
+    return nil
+  }
+  return physicalTransportPriority(transport)
+}
+
+func selectPreferredPhysicalInputDeviceID() -> AudioDeviceID? {
+  let systemObject = AudioObjectID(kAudioObjectSystemObject)
+
+  var defaultAddr = AudioObjectPropertyAddress(
+    mSelector: kAudioHardwarePropertyDefaultInputDevice,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var defaultID: AudioDeviceID = kAudioObjectUnknown
+  var defaultSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+  if AudioObjectGetPropertyData(systemObject, &defaultAddr, 0, nil, &defaultSize, &defaultID) == noErr,
+     isPhysicalInputDevice(defaultID) != nil {
+    return defaultID
+  }
+
+  var devicesAddr = AudioObjectPropertyAddress(
+    mSelector: kAudioHardwarePropertyDevices,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var dataSize: UInt32 = 0
+  guard AudioObjectGetPropertyDataSize(systemObject, &devicesAddr, 0, nil, &dataSize) == noErr,
+        dataSize > 0 else {
+    return nil
+  }
+  let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.stride
+  var deviceIDs = [AudioDeviceID](repeating: kAudioObjectUnknown, count: count)
+  var mutableSize = dataSize
+  guard AudioObjectGetPropertyData(systemObject, &devicesAddr, 0, nil, &mutableSize, &deviceIDs) == noErr else {
+    return nil
+  }
+
+  var best: (id: AudioDeviceID, priority: Int)?
+  for deviceID in deviceIDs {
+    guard let priority = isPhysicalInputDevice(deviceID) else { continue }
+    if best == nil || priority < best!.priority {
+      best = (deviceID, priority)
+    }
+  }
+  return best?.id
+}
+
 final class SpeechSession {
   private let audioEngine = AVAudioEngine()
   private var request: SFSpeechAudioBufferRecognitionRequest?
@@ -133,6 +257,9 @@ final class SpeechSession {
     }
 
     let inputNode = audioEngine.inputNode
+    if let preferredInputID = selectPreferredPhysicalInputDeviceID() {
+      try? inputNode.auAudioUnit.setDeviceID(preferredInputID)
+    }
     let format = inputNode.outputFormat(forBus: 0)
     guard format.channelCount > 0, format.sampleRate > 0 else {
       emitJson([
