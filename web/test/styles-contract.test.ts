@@ -1985,12 +1985,25 @@ describe('styles.css regression contracts', () => {
     expect(baseUserRule).toMatch(/color:\s*#f0f9ff/);
 
     const originUserRule = extractDirectStyleRule(topLevelCss, /\.chat-user\.chat-user-origin-user\s*/) ?? '';
+    expect(originUserRule).toMatch(/max-width:\s*95%/);
+    expect(originUserRule).not.toMatch(/max-width:\s*88%/);
+    expect(originUserRule).toMatch(/margin-left:\s*auto/);
     expect(originUserRule).toMatch(/rgba\(46,\s*108,\s*172,\s*0\.94\)/);
     expect(originUserRule).toMatch(/rgba\(34,\s*86,\s*142,\s*0\.96\)/);
     expect(originUserRule).toMatch(/border:\s*1px solid rgba\(125,\s*211,\s*252,\s*0\.45\)/);
     expect(originUserRule).toMatch(/border-right:\s*2px solid rgba\(125,\s*211,\s*252,\s*0\.85\)/);
     expect(originUserRule).toMatch(/color:\s*#f0f9ff/);
     expect(originUserRule).not.toMatch(/16,\s*35,\s*62|#1e3a5f|#145338|22,\s*92,\s*60/);
+
+    const mobile640 = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*640px\)/).join('\n');
+    expect(mobile640).not.toMatch(/\.chat-user\.chat-user-origin-user\s*\{[^}]*max-width/);
+
+    const originAgentWidthRule = cssWithoutComments.match(/^\.chat-user\.chat-user-origin-agent\s*\{[^}]*width:\s*100%[^}]*\}/m)?.[0] ?? '';
+    expect(originAgentWidthRule).toMatch(/width:\s*100%/);
+    expect(originAgentWidthRule).toMatch(/max-width:\s*100%/);
+    const originSystemWidthRule = cssWithoutComments.match(/^\.chat-user\.chat-user-origin-system\s*\{[^}]*width:\s*100%[^}]*\}/m)?.[0] ?? '';
+    expect(originSystemWidthRule).toMatch(/width:\s*100%/);
+    expect(originSystemWidthRule).toMatch(/max-width:\s*100%/);
 
     const originAgentRule = extractDirectStyleRule(topLevelCss, /\.chat-user\.chat-user-origin-agent,\s*\.chat-user\.chat-user-origin-system\s*/) ?? '';
     expect(originAgentRule).toMatch(/background:\s*#161b22/);

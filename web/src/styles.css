@@ -6802,7 +6802,7 @@ html.native-ios-mac .chat-dl-btn {
   align-self: flex-end;
   margin-left: auto;
   margin-inline-start: auto;
-  max-width: 88%;
+  max-width: 95%;
   box-sizing: border-box;
   background: linear-gradient(155deg, rgba(46, 108, 172, 0.94) 0%, rgba(34, 86, 142, 0.96) 58%, rgba(42, 102, 164, 0.94) 100%);
   border: 1px solid rgba(125, 211, 252, 0.45);
@@ -6812,11 +6812,6 @@ html.native-ios-mac .chat-dl-btn {
   color: #f0f9ff;
   word-break: break-word;
   overflow-wrap: anywhere;
-}
-@media (min-width: 641px) {
-  .chat-user.chat-user-origin-user {
-    max-width: 95%;
-  }
 }
 /* Only the human's own input is right-aligned (shared/chat-message-origin.ts):
    agent deliveries and daemon injections are incoming, so they sit on the left
