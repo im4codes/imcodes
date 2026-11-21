@@ -10,6 +10,20 @@ private enum WatchViewMode: String, CaseIterable {
         case .sessions: return "Sessions"
         }
     }
+
+    var toggled: WatchViewMode {
+        switch self {
+        case .tasks: return .sessions
+        case .sessions: return .tasks
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .tasks: return "checklist"
+        case .sessions: return "bubble.left.and.bubble.right"
+        }
+    }
 }
 
 struct ContentView: View {
@@ -25,10 +39,6 @@ struct ContentView: View {
 
     private var currentTasks: [WatchGlobalTaskRow] {
         sessionManager.displayTasks()
-    }
-
-    private var activeTaskCount: Int {
-        currentTasks.filter { $0.isTerminal != true }.count
     }
 
     private func isSubSessionRow(_ row: WatchSessionRow) -> Bool {
@@ -55,41 +65,29 @@ struct ContentView: View {
         return WatchRoute(serverId: task.serverId, sessionName: brainSession, title: brainTitle)
     }
 
-    private var modeSwitcher: some View {
-        HStack(spacing: 4) {
-            modeButton(for: .tasks, badge: activeTaskCount > 0 ? activeTaskCount : nil)
-            modeButton(for: .sessions, badge: !mainSessions.isEmpty ? mainSessions.count : nil)
-        }
-        .padding(.horizontal, 4)
-        .padding(.vertical, 2)
-    }
-
-    private func modeButton(for mode: WatchViewMode, badge: Int?) -> some View {
-        let isSelected = viewMode == mode
-        return Button {
+    private var modeToggleButton: some View {
+        Button {
             withAnimation(.easeInOut(duration: 0.15)) {
-                viewMode = mode
+                viewMode = viewMode.toggled
             }
         } label: {
-            HStack(spacing: 3) {
-                Text(mode.label)
-                    .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
-                    .lineLimit(1)
-                if let badge {
-                    Text("\(badge)")
-                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-                }
-            }
-            .frame(maxWidth: .infinity, minHeight: 26)
-            .padding(.horizontal, 4)
-            .background(
-                Capsule()
-                    .fill(isSelected ? Color.accentColor.opacity(0.28) : Color.secondary.opacity(0.14))
-            )
-            .foregroundStyle(isSelected ? .primary : .secondary)
+            Image(systemName: viewMode.iconName)
+                .font(.caption2)
         }
-        .buttonStyle(.plain)
+        .accessibilityLabel("Switch to \(viewMode.toggled.label)")
+    }
+
+    @ViewBuilder
+    private var serverPickerToolbarButton: some View {
+        if sessionManager.displayServers.count > 1 {
+            Button {
+                showServerPicker = true
+            } label: {
+                Image(systemName: "server.rack")
+                    .font(.caption2)
+            }
+            .accessibilityLabel("Select server")
+        }
     }
 
     @ViewBuilder
@@ -254,27 +252,29 @@ struct ContentView: View {
                     }
                     .padding()
                 } else {
-                    VStack(spacing: 2) {
-                        modeSwitcher
-                        switch viewMode {
-                        case .tasks:
-                            tasksModeContent
-                        case .sessions:
-                            sessionsModeContent
-                        }
+                    switch viewMode {
+                    case .tasks:
+                        tasksModeContent
+                    case .sessions:
+                        sessionsModeContent
                     }
                 }
             }
-            .navigationTitle("IM.codes")
+            .navigationTitle(viewMode.label)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    if sessionManager.displayServers.count > 1 {
-                        Button {
-                            showServerPicker = true
-                        } label: {
-                            Image(systemName: "server.rack")
-                                .font(.caption2)
-                        }
+                if #available(watchOS 10.5, *) {
+                    ToolbarItem(placement: .topBarLeading) {
+                        modeToggleButton
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        serverPickerToolbarButton
+                    }
+                } else {
+                    ToolbarItem(placement: .cancellationAction) {
+                        modeToggleButton
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        serverPickerToolbarButton
                     }
                 }
             }
