@@ -4,7 +4,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { UseQuickDataResult } from '../../src/components/QuickInputPanel.js';
-import type { PcAppBridge, PcAppVoiceEvent } from '../../src/native-platform.js';
+import type { PcAppBridge, PcAppVoiceEvent, PcAppVoiceInputDevice } from '../../src/native-platform.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k, i18n: { language: 'en', changeLanguage: vi.fn() } }),
@@ -75,11 +75,14 @@ function createFakePcAppBridge(overrides: Partial<NonNullable<PcAppBridge['voice
 }
 
 describe('PC App inline voice dictation and quick permission grant', () => {
+  const originalInnerWidth = window.innerWidth;
+
   beforeEach(() => {
     localStorage.clear();
     sessionStorage.clear();
     delete (globalThis as any).__IMCODES_PC_APP__;
     delete (globalThis as any).Capacitor;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: 1280 });
   });
 
   afterEach(async () => {
@@ -90,6 +93,7 @@ describe('PC App inline voice dictation and quick permission grant', () => {
     cleanup();
     document.body.innerHTML = '';
     delete (globalThis as any).__IMCODES_PC_APP__;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: originalInnerWidth });
     vi.restoreAllMocks();
   });
 
@@ -265,6 +269,190 @@ describe('PC App inline voice dictation and quick permission grant', () => {
     expect(document.body.querySelector('.voice-overlay')).not.toBeNull();
     expect(startListeningMock).not.toHaveBeenCalled();
     expect(container.querySelector('.voice-streaming-robot-cursor')).toBeNull();
+    delete (globalThis as any).SpeechRecognition;
+  });
+
+  it('shows selected microphone next to desktop PC App mic button and switches via setInputDevice', async () => {
+    const devices: PcAppVoiceInputDevice[] = [
+      { uid: 'bt-airpods', name: 'k的AirPods Pro3', transport: 'bluetooth', isDefault: true, isPhysical: false },
+      { uid: 'builtin-mic', name: 'MacBook Pro Microphone', transport: 'builtin', isDefault: false, isPhysical: true },
+      { uid: 'usb-mic', name: 'Shure MV7', transport: 'usb', isDefault: false, isPhysical: true },
+    ];
+    const getInputDevices = vi.fn(async () => devices);
+    const getInputDevice = vi.fn(async () => 'auto');
+    const setInputDevice = vi.fn(async (uid: string) => uid);
+    const fake = createFakePcAppBridge({
+      getInputDevices,
+      getInputDevice,
+      setInputDevice,
+    });
+    (globalThis as any).__IMCODES_PC_APP__ = fake.bridge;
+
+    const { container } = render(
+      <SessionControls
+        ws={makeWs()}
+        activeSession={{
+          name: 'deck_app_brain',
+          project: 'app',
+          role: 'brain',
+          state: 'idle',
+          projectDir: '/work/app',
+          agentType: 'claude-code',
+        } as never}
+        quickData={quickData}
+        serverId="srv1"
+        sessions={[]}
+        subSessions={[]}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const micBtn = container.querySelector('button[data-voice-trigger="desktop"]') as HTMLButtonElement;
+    const select = await screen.findByTestId('pc-voice-mic-select') as HTMLSelectElement;
+    expect(micBtn.nextElementSibling).toBe(select);
+
+    await waitFor(() => {
+      expect(select.options.length).toBe(4);
+    });
+    expect(select.value).toBe('auto');
+    expect(select.options[0]?.textContent).toContain('MacBook Pro Microphone');
+    expect(select.options[2]?.textContent).toBe('MacBook Pro Microphone');
+    expect(select.options[3]?.textContent).toBe('Shure MV7');
+
+    fireEvent.change(select, { target: { value: 'usb-mic' } });
+    await waitFor(() => {
+      expect(setInputDevice).toHaveBeenCalledWith('usb-mic');
+      expect(select.value).toBe('usb-mic');
+    });
+  });
+
+  it('supports getSelectedInputDevice/setSelectedInputDevice aliases and handles device load rejection cleanly', async () => {
+    const setSelectedInputDevice = vi.fn(async (uid: string) => uid);
+    const fake = createFakePcAppBridge({
+      getInputDevices: vi.fn(async () => [
+        { uid: 'usb-mic', name: 'Shure MV7', transport: 'usb', isDefault: true, isPhysical: true },
+      ]),
+      getSelectedInputDevice: vi.fn(async () => 'usb-mic'),
+      setSelectedInputDevice,
+    });
+    (globalThis as any).__IMCODES_PC_APP__ = fake.bridge;
+
+    render(
+      <SessionControls
+        ws={makeWs()}
+        activeSession={{
+          name: 'deck_app_brain',
+          project: 'app',
+          role: 'brain',
+          state: 'idle',
+          projectDir: '/work/app',
+          agentType: 'claude-code',
+        } as never}
+        quickData={quickData}
+        serverId="srv1"
+        sessions={[]}
+        subSessions={[]}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const select = await screen.findByTestId('pc-voice-mic-select') as HTMLSelectElement;
+    await waitFor(() => {
+      expect(select.value).toBe('usb-mic');
+    });
+    fireEvent.change(select, { target: { value: 'auto' } });
+    await waitFor(() => {
+      expect(setSelectedInputDevice).toHaveBeenCalledWith('auto');
+      expect(select.value).toBe('auto');
+    });
+
+    cleanup();
+    const broken = createFakePcAppBridge({
+      getInputDevices: vi.fn(async () => { throw new Error('helper failed'); }),
+      getInputDevice: vi.fn(async () => 'auto'),
+    });
+    (globalThis as any).__IMCODES_PC_APP__ = broken.bridge;
+    const { container } = render(
+      <SessionControls
+        ws={makeWs()}
+        activeSession={{
+          name: 'deck_app_brain',
+          project: 'app',
+          role: 'brain',
+          state: 'idle',
+          projectDir: '/work/app',
+          agentType: 'claude-code',
+        } as never}
+        quickData={quickData}
+        serverId="srv1"
+        sessions={[]}
+        subSessions={[]}
+        onSend={vi.fn()}
+      />,
+    );
+    expect(container.querySelector('button[data-voice-trigger="desktop"]')).not.toBeNull();
+    expect(screen.queryByTestId('pc-voice-mic-select')).not.toBeNull();
+  });
+
+  it('hides microphone selector on mobile layout and outside PC App', async () => {
+    const fake = createFakePcAppBridge({
+      getInputDevices: vi.fn(async () => [
+        { uid: 'builtin-mic', name: 'MacBook Pro Microphone', transport: 'builtin', isDefault: true, isPhysical: true },
+      ]),
+      getInputDevice: vi.fn(async () => 'auto'),
+      setInputDevice: vi.fn(async (uid: string) => uid),
+    });
+    (globalThis as any).__IMCODES_PC_APP__ = fake.bridge;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: 390 });
+
+    render(
+      <SessionControls
+        ws={makeWs()}
+        activeSession={{
+          name: 'deck_app_brain',
+          project: 'app',
+          role: 'brain',
+          state: 'idle',
+          projectDir: '/work/app',
+          agentType: 'claude-code',
+        } as never}
+        quickData={quickData}
+        serverId="srv1"
+        sessions={[]}
+        subSessions={[]}
+        onSend={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId('pc-voice-mic-select')).toBeNull();
+
+    cleanup();
+    delete (globalThis as any).__IMCODES_PC_APP__;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: 1280 });
+    (globalThis as any).SpeechRecognition = class MockWebSpeech {
+      start = vi.fn();
+      stop = vi.fn();
+      abort = vi.fn();
+    };
+    const { container } = render(
+      <SessionControls
+        ws={makeWs()}
+        activeSession={{
+          name: 'deck_app_brain',
+          project: 'app',
+          role: 'brain',
+          state: 'idle',
+          projectDir: '/work/app',
+          agentType: 'claude-code',
+        } as never}
+        quickData={quickData}
+        serverId="srv1"
+        sessions={[]}
+        subSessions={[]}
+        onSend={vi.fn()}
+      />,
+    );
+    expect(container.querySelector('button[data-voice-trigger="desktop"]')).not.toBeNull();
+    expect(screen.queryByTestId('pc-voice-mic-select')).toBeNull();
     delete (globalThis as any).SpeechRecognition;
   });
 });

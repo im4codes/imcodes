@@ -1613,7 +1613,10 @@
     "engine_label": "Speech engine",
     "engine_builtin": "Built-in model",
     "engine_apple": "Apple Speech",
-    "engine_system": "System Speech"
+    "engine_system": "System Speech",
+    "mic_select_label": "Microphone",
+    "mic_auto": "Auto (Physical)",
+    "mic_auto_prefix": "Auto"
   },
   "p2p": {
     "final_original_request_reminder": "After synthesizing the discussion, directly address and fulfill the user's original request instead of stopping at a discussion summary.\nThe original user request is: \"{{request}}\"",

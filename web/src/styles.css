@@ -3169,6 +3169,9 @@ html.native-ios-mac .chat-dl-btn {
 .btn-input-clear:hover { color: #ef4444; border-color: #ef4444; }
 .btn-voice { background: rgba(15,23,42,0.52); border: 1px solid rgba(125,211,252,0.14); color: #7b8797; cursor: pointer; padding: 4px 7px; font-size: 18px; line-height: 1; border-radius: 7px; transition: color 0.15s, background 0.15s, border-color 0.15s, box-shadow 0.15s; flex-shrink: 0; }
 .btn-voice:hover:not(:disabled) { color: #dbeafe; background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.42); box-shadow: 0 0 12px rgba(34,211,238,0.12); }
+.pc-voice-mic-select { max-width: 150px; min-width: 0; height: 28px; padding: 2px 6px; font-size: 11px; font-family: inherit; line-height: 1.2; color: #cbd5e1; background: rgba(15,23,42,0.52); border: 1px solid rgba(125,211,252,0.14); border-radius: 7px; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; cursor: pointer; flex-shrink: 1; transition: color 0.15s, background 0.15s, border-color 0.15s; }
+.pc-voice-mic-select:hover:not(:disabled), .pc-voice-mic-select:focus-visible { color: #dbeafe; background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.42); outline: none; }
+.pc-voice-mic-select:disabled { opacity: 0.46; cursor: default; }
 .btn-voice-active { color: #ef4444; animation: voice-pulse 1s ease-in-out infinite; }
 .btn-voice.btn-voice-inline-active {
   position: relative;

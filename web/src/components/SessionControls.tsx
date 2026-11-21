@@ -123,7 +123,7 @@ import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
 import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
-import { getPcAppBridge, isNativeMacDesktop, isPcAppInlineVoiceSupported } from '../native-platform.js';
+import { getPcAppBridge, isNativeMacDesktop, isPcAppInlineVoiceSupported, type PcAppVoiceInputDevice } from '../native-platform.js';
 import { setBackgroundTransferKeepAliveLabels } from '../background-transfer-keepalive.js';
 import { getUploadBackgroundEpoch, isUploadEnvironmentSuspended } from '../upload-suspend-wait.js';
 import {
@@ -8949,6 +8949,68 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, [syncMobileComposerMetrics]);
+
+  const [pcVoiceDevices, setPcVoiceDevices] = useState<PcAppVoiceInputDevice[]>([]);
+  const [pcVoiceSelectedDevice, setPcVoiceSelectedDevice] = useState<string>('auto');
+  const pcVoiceSelectedDeviceRef = useRef(pcVoiceSelectedDevice);
+  pcVoiceSelectedDeviceRef.current = pcVoiceSelectedDevice;
+  const pcVoiceMountedRef = useRef(true);
+  useEffect(() => {
+    pcVoiceMountedRef.current = true;
+    return () => {
+      pcVoiceMountedRef.current = false;
+    };
+  }, []);
+  const showPcVoiceMicSelect = !isMobileLayout && pcAppInlineVoice && Boolean(getPcAppBridge()?.voice?.getInputDevices);
+  const refreshPcVoiceInputDevices = useCallback(async () => {
+    const voice = getPcAppBridge()?.voice;
+    if (!voice?.getInputDevices || mobileLayoutRef.current || !isPcAppInlineVoiceSupported()) return;
+    const readSelected = voice.getInputDevice ?? voice.getSelectedInputDevice;
+    try {
+      const [devices, selected] = await Promise.all([
+        voice.getInputDevices(),
+        readSelected ? readSelected() : Promise.resolve('auto'),
+      ]);
+      if (!pcVoiceMountedRef.current) return;
+      if (Array.isArray(devices)) {
+        setPcVoiceDevices(devices);
+      }
+      const normalized = typeof selected === 'string' && selected.trim() ? selected.trim() : 'auto';
+      pcVoiceSelectedDeviceRef.current = normalized;
+      setPcVoiceSelectedDevice(normalized);
+    } catch {
+      // Fail soft: keep desktop voice button working even if device enumeration fails.
+    }
+  }, []);
+  const handlePcVoiceMicSelectChange = useCallback((nextRaw: string) => {
+    const nextUid = nextRaw.trim() || 'auto';
+    if (nextUid === pcVoiceSelectedDeviceRef.current) return;
+    pcVoiceSelectedDeviceRef.current = nextUid;
+    setPcVoiceSelectedDevice(nextUid);
+    const voice = getPcAppBridge()?.voice;
+    const writeSelected = voice?.setInputDevice ?? voice?.setSelectedInputDevice;
+    if (writeSelected) {
+      void Promise.resolve(writeSelected(nextUid))
+        .then((saved) => {
+          if (pcVoiceMountedRef.current && typeof saved === 'string' && saved.trim()) {
+            const normalized = saved.trim();
+            pcVoiceSelectedDeviceRef.current = normalized;
+            setPcVoiceSelectedDevice(normalized);
+          }
+        })
+        .catch(() => {});
+    }
+  }, []);
+  useEffect(() => {
+    if (!showPcVoiceMicSelect) return;
+    void refreshPcVoiceInputDevices();
+    if (typeof window === 'undefined') return;
+    const onWindowFocus = () => {
+      void refreshPcVoiceInputDevices();
+    };
+    window.addEventListener('focus', onWindowFocus);
+    return () => window.removeEventListener('focus', onWindowFocus);
+  }, [showPcVoiceMicSelect, refreshPcVoiceInputDevices]);
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && (inlineDesktopVoice || !hasText);
   const showMobileStackedAttachmentButton = isMobileLayout
     && isTransport
@@ -11435,6 +11497,41 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             🎙
           </button>
         )}
+        {showPcVoiceMicSelect && (() => {
+          const resolvedAutoPhysical = pcVoiceDevices.find((d) => d.isDefault && d.isPhysical)
+            ?? pcVoiceDevices.find((d) => d.isPhysical)
+            ?? null;
+          const autoMicLabel = resolvedAutoPhysical
+            ? `${t('voice.mic_auto_prefix')} · ${resolvedAutoPhysical.name}`
+            : t('voice.mic_auto');
+          const hasExplicitMissing = pcVoiceSelectedDevice !== 'auto'
+            && !pcVoiceDevices.some((d) => d.uid === pcVoiceSelectedDevice);
+          const selectedLabel = pcVoiceSelectedDevice === 'auto'
+            ? autoMicLabel
+            : (pcVoiceDevices.find((d) => d.uid === pcVoiceSelectedDevice)?.name ?? pcVoiceSelectedDevice);
+          return (
+            <select
+              class="pc-voice-mic-select"
+              data-testid="pc-voice-mic-select"
+              aria-label={t('voice.mic_select_label')}
+              title={selectedLabel}
+              value={pcVoiceSelectedDevice}
+              disabled={inputDisabled}
+              onFocus={() => { void refreshPcVoiceInputDevices(); }}
+              onPointerDown={() => { void refreshPcVoiceInputDevices(); }}
+              onInput={(e) => handlePcVoiceMicSelectChange((e.currentTarget as HTMLSelectElement).value)}
+              onChange={(e) => handlePcVoiceMicSelectChange((e.currentTarget as HTMLSelectElement).value)}
+            >
+              <option value="auto">{autoMicLabel}</option>
+              {hasExplicitMissing && (
+                <option value={pcVoiceSelectedDevice}>{pcVoiceSelectedDevice}</option>
+              )}
+              {pcVoiceDevices.map((dev) => (
+                <option key={dev.uid} value={dev.uid}>{dev.name}</option>
+              ))}
+            </select>
+          );
+        })()}
         {!isMobileLayout && (
           <button
             class="btn btn-primary"

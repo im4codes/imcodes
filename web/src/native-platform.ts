@@ -59,6 +59,14 @@ export interface PcAppSpeechModelStatus {
   modelDir?: string;
 }
 
+export interface PcAppVoiceInputDevice {
+  uid: string;
+  name: string;
+  transport: string;
+  isDefault: boolean;
+  isPhysical: boolean;
+}
+
 export interface PcAppBridge {
   platform?: string;
   isElectron?: boolean;
@@ -72,6 +80,11 @@ export interface PcAppBridge {
     getSpeechModel?: () => Promise<PcAppSpeechModelChoice>;
     setSpeechModel?: (model: PcAppSpeechModelChoice) => Promise<PcAppSpeechModelStatus>;
     getSpeechModelStatus?: () => Promise<PcAppSpeechModelStatus>;
+    getInputDevices?: () => Promise<PcAppVoiceInputDevice[]>;
+    getInputDevice?: () => Promise<string>;
+    setInputDevice?: (uid: string) => Promise<string>;
+    getSelectedInputDevice?: () => Promise<string>;
+    setSelectedInputDevice?: (uid: string) => Promise<string>;
     subscribe?: (listener: (event: PcAppVoiceEvent) => void) => () => void;
   };
 }
