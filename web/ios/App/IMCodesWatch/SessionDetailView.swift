@@ -328,8 +328,9 @@ struct SessionDetailView: View {
 
     private var replyComposer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            TextField("Reply…", text: $draft)
+            TextField("Reply…", text: $draft, axis: .vertical)
                 .font(.caption2)
+                .lineLimit(1...6)
                 .id("replyField")
 
             holdToTalkControl
