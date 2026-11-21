@@ -118,6 +118,13 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         var finishError: Error?
     }
 
+    private struct FileFingerprint: Equatable {
+        let size: Int64
+        let modificationDate: Date?
+    }
+
+    public typealias FileVerifier = @Sendable (URL, IosSpeechModelAsset) -> Bool
+
     public static let shared = IosSpeechModelDownloader()
 
     public let modelsDirectory: URL
@@ -130,6 +137,7 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
     private let customSessionConfiguration: URLSessionConfiguration?
     private let sessionIdentifier: String?
     private let retryCooldownSeconds: TimeInterval
+    private let fileVerifier: FileVerifier
 
     private lazy var urlSession: URLSession = {
         let config: URLSessionConfiguration
@@ -161,6 +169,7 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
     private var activeTasks: [Int: ActiveTaskState] = [:]
     private var backgroundSessionCompletionHandler: (() -> Void)?
     private var onReadyHandlers: [() -> Void] = []
+    private var _verifiedFingerprints: [String: FileFingerprint] = [:]
 
     public init(
         modelsDirectory: URL = IosSpeechModelDownloader.defaultModelsDirectory(),
@@ -168,7 +177,10 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         assets: [IosSpeechModelAsset] = IosSpeechModelDownloader.requiredAssets,
         sessionIdentifier: String? = IosSpeechModelDownloader.backgroundSessionIdentifier,
         urlSessionConfiguration: URLSessionConfiguration? = nil,
-        retryCooldownSeconds: TimeInterval = 60
+        retryCooldownSeconds: TimeInterval = 60,
+        fileVerifier: @escaping FileVerifier = { url, asset in
+            IosSpeechModelDownloader.verifyFile(at: url, asset: asset)
+        }
     ) {
         self.modelsDirectory = modelsDirectory
         self.mirrorOrigins = mirrorOrigins.isEmpty ? Self.defaultMirrorOrigins : mirrorOrigins
@@ -176,6 +188,7 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         self.sessionIdentifier = sessionIdentifier
         self.customSessionConfiguration = urlSessionConfiguration
         self.retryCooldownSeconds = retryCooldownSeconds
+        self.fileVerifier = fileVerifier
         super.init()
     }
 
@@ -190,30 +203,64 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         return _status
     }
 
-    /// Verifies the `.verified-<revision>` stamp plus exact byte size and CryptoKit SHA-256
-    /// across every required asset so partial, truncated, or same-size corrupted files never pass.
+    /// Non-blocking readiness check backed by in-process worker SHA-256 verification plus
+    /// constant-time file metadata (`size` + `modificationDate`) and `.verified-<revision>`.
+    /// Never performs SHA-256 hashing on the caller's thread.
     public var hasVerifiedLocalModels: Bool {
+        lock.lock()
+        let isReady = (_status == .ready)
+        let snapshots = _verifiedFingerprints
+        lock.unlock()
+
+        guard isReady else { return false }
         let markerURL = modelsDirectory.appendingPathComponent(Self.verifiedMarkerFilename)
         guard fileManager.isReadableFile(atPath: markerURL.path) else {
+            invalidateVerifiedState()
             return false
         }
-        return assets.allSatisfy { asset in
-            let url = modelsDirectory.appendingPathComponent(asset.filename)
-            return Self.verifyFile(at: url, asset: asset)
-        }
-    }
-
-    /// Full cryptographic SHA-256 + byte-size verification over every file in `modelsDirectory`.
-    @discardableResult
-    public func verifyAllAssetsOnDisk() -> Bool {
         for asset in assets {
             let url = modelsDirectory.appendingPathComponent(asset.filename)
-            if !Self.verifyFile(at: url, asset: asset) {
-                try? fileManager.removeItem(at: modelsDirectory.appendingPathComponent(Self.verifiedMarkerFilename))
+            guard let expected = snapshots[asset.filename],
+                  let current = Self.fileFingerprint(at: url, fileManager: fileManager),
+                  current.size == asset.expectedSize,
+                  current == expected else {
+                invalidateVerifiedState()
                 return false
             }
         }
         return true
+    }
+
+    /// Full cryptographic SHA-256 + byte-size verification over every file in `modelsDirectory`.
+    /// Intended for background worker verification (`workQueue` / `coordinator.worker`), never main thread.
+    @discardableResult
+    public func verifyAllAssetsOnDisk() -> Bool {
+        var snapshots: [String: FileFingerprint] = [:]
+        for asset in assets {
+            let url = modelsDirectory.appendingPathComponent(asset.filename)
+            guard fileVerifier(url, asset),
+                  let fp = Self.fileFingerprint(at: url, fileManager: fileManager) else {
+                invalidateVerifiedState(removeMarker: true)
+                return false
+            }
+            snapshots[asset.filename] = fp
+        }
+        lock.lock()
+        _verifiedFingerprints = snapshots
+        lock.unlock()
+        return true
+    }
+
+    private func invalidateVerifiedState(removeMarker: Bool = false) {
+        lock.lock()
+        if _status == .ready {
+            _status = .idle
+        }
+        _verifiedFingerprints.removeAll()
+        lock.unlock()
+        if removeMarker {
+            try? fileManager.removeItem(at: modelsDirectory.appendingPathComponent(Self.verifiedMarkerFilename))
+        }
     }
 
     public func addReadyObserver(_ handler: @escaping () -> Void) {
@@ -239,13 +286,11 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         _ = urlSession
     }
 
-    /// Ensures models are downloaded and SHA-256 verified in the background. Safe to call
-    /// repeatedly on app launch or foreground resume; concurrent calls share one run.
+    /// Ensures models are downloaded and SHA-256 verified asynchronously on `workQueue`.
+    /// Never hashes on the caller thread; safe to call on launch or foreground resume, with
+    /// concurrent callers sharing one single-flight worker operation.
     public func ensureDownloadedIfNeeded(forceRetry: Bool = false, completion: ((Bool) -> Void)? = nil) {
         if hasVerifiedLocalModels {
-            lock.lock()
-            _status = .ready
-            lock.unlock()
             completion?(true)
             return
         }
@@ -288,7 +333,7 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         }
 
         removeStalePartFiles()
-        ensureNonDownloadableFiles()
+        var verifiedSnapshots: [String: FileFingerprint] = [:]
 
         let downloadableAssets = assets.filter(\.downloadable)
         let totalDownloadBytes = max(1, downloadableAssets.reduce(Int64(0)) { $0 + $1.expectedSize })
@@ -297,8 +342,10 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
 
         for asset in downloadableAssets {
             let destURL = modelsDirectory.appendingPathComponent(asset.filename)
-            if Self.verifyFile(at: destURL, asset: asset, fileManager: fileManager) {
+            if fileVerifier(destURL, asset),
+               let fp = Self.fileFingerprint(at: destURL, fileManager: fileManager) {
                 Self.markExcludedFromBackup(destURL)
+                verifiedSnapshots[asset.filename] = fp
                 completedBytes += asset.expectedSize
             } else {
                 // Remove corrupt or truncated file so it is cleanly re-downloaded.
@@ -317,6 +364,12 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
                     completedBytes: completedBytes,
                     totalDownloadBytes: totalDownloadBytes
                 )
+                let destURL = modelsDirectory.appendingPathComponent(asset.filename)
+                guard let fp = Self.fileFingerprint(at: destURL, fileManager: fileManager),
+                      fp.size == asset.expectedSize else {
+                    throw DownloadError.missingOutput(asset.filename)
+                }
+                verifiedSnapshots[asset.filename] = fp
                 completedBytes += asset.expectedSize
                 updateDownloadingProgress(Double(completedBytes) / Double(totalDownloadBytes))
             } catch {
@@ -326,8 +379,11 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
             }
         }
 
-        ensureNonDownloadableFiles()
-        guard verifyAllAssetsOnDisk() else {
+        let nonDownloadableSnapshots = ensureNonDownloadableFiles()
+        for (name, fp) in nonDownloadableSnapshots {
+            verifiedSnapshots[name] = fp
+        }
+        guard verifiedSnapshots.count == assets.count else {
             finishPipeline(success: false, errorMessage: "Downloaded speech model failed final verification")
             return
         }
@@ -336,6 +392,9 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         try? Data(Self.revision.utf8).write(to: markerURL, options: .atomic)
         Self.markExcludedFromBackup(markerURL)
         Self.markExcludedFromBackup(modelsDirectory)
+        lock.lock()
+        _verifiedFingerprints = verifiedSnapshots
+        lock.unlock()
         finishPipeline(success: true, errorMessage: nil)
     }
 
@@ -347,14 +406,23 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         Self.markExcludedFromBackup(modelsDirectory)
     }
 
-    private func ensureNonDownloadableFiles() {
+    @discardableResult
+    private func ensureNonDownloadableFiles() -> [String: FileFingerprint] {
+        var snapshots: [String: FileFingerprint] = [:]
         for asset in assets where !asset.downloadable {
             let destURL = modelsDirectory.appendingPathComponent(asset.filename)
-            if !Self.verifyFile(at: destURL, asset: asset, fileManager: fileManager) {
+            var isValid = fileVerifier(destURL, asset)
+            if !isValid {
                 try? Data().write(to: destURL, options: .atomic)
+                isValid = fileVerifier(destURL, asset)
             }
             Self.markExcludedFromBackup(destURL)
+            if isValid,
+               let fp = Self.fileFingerprint(at: destURL, fileManager: fileManager) {
+                snapshots[asset.filename] = fp
+            }
         }
+        return snapshots
     }
 
     private func removeStalePartFiles() {
@@ -519,7 +587,7 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
         do {
             try? fileManager.removeItem(at: active.partURL)
             try fileManager.moveItem(at: location, to: active.partURL)
-            guard Self.verifyFile(at: active.partURL, asset: active.asset, fileManager: fileManager) else {
+            guard fileVerifier(active.partURL, active.asset) else {
                 try? fileManager.removeItem(at: active.partURL)
                 active.finishError = DownloadError.checksumMismatch(active.asset.filename)
                 lock.lock()
@@ -595,6 +663,18 @@ public final class IosSpeechModelDownloader: NSObject, URLSessionDownloadDelegat
             return nil
         }
         return number.int64Value
+    }
+
+    private static func fileFingerprint(at url: URL, fileManager: FileManager = .default) -> FileFingerprint? {
+        guard fileManager.isReadableFile(atPath: url.path),
+              let attrs = try? fileManager.attributesOfItem(atPath: url.path),
+              let number = attrs[.size] as? NSNumber else {
+            return nil
+        }
+        return FileFingerprint(
+            size: number.int64Value,
+            modificationDate: attrs[.modificationDate] as? Date
+        )
     }
 
     public static func sha256Hex(of url: URL) -> String? {

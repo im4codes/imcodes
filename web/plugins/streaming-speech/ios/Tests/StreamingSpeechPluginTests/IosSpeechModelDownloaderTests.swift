@@ -164,8 +164,82 @@ final class IosSpeechModelDownloaderTests: XCTestCase {
             try (name == "hotwords.txt" ? Data() : stubBytes).write(to: downloadedDir.appendingPathComponent(name))
         }
         try Data("v1".utf8).write(to: downloadedDir.appendingPathComponent(IosSpeechModelDownloader.verifiedMarkerFilename))
+
+        let exp = expectation(description: "async verification marks downloaded store ready")
+        store.ensureBackgroundModelDownloadIfNeeded { ok in
+            XCTAssertTrue(ok)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 5)
+
         XCTAssertEqual(store.modelRoot, downloadedDir)
         XCTAssertTrue(store.hasRequiredModelFiles)
+    }
+
+    func testEnsureDownloadedReturnsImmediatelyBeforeWorkerVerificationCompletes() throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelsDir = root.appendingPathComponent("models", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelsDir, withIntermediateDirectories: true)
+
+        let payload = Data("warm-model-payload".utf8)
+        let testAssets = [
+            IosSpeechModelAsset(filename: "config.json", expectedSize: Int64(payload.count), expectedSha256: sha256(payload)),
+            IosSpeechModelAsset(filename: "hotwords.txt", expectedSize: 0, expectedSha256: IosSpeechModelDownloader.emptyFileSha256, downloadable: false),
+        ]
+        try payload.write(to: modelsDir.appendingPathComponent("config.json"))
+        try Data().write(to: modelsDir.appendingPathComponent("hotwords.txt"))
+        try Data("v1".utf8).write(to: modelsDir.appendingPathComponent(IosSpeechModelDownloader.verifiedMarkerFilename))
+
+        let gateLock = NSLock()
+        var startedSignaled = false
+        let verificationStarted = DispatchSemaphore(value: 0)
+        let allowVerificationToFinish = DispatchSemaphore(value: 0)
+        var ranOffMainThread = false
+
+        let downloader = IosSpeechModelDownloader(
+            modelsDirectory: modelsDir,
+            assets: testAssets,
+            sessionIdentifier: nil,
+            urlSessionConfiguration: .ephemeral,
+            fileVerifier: { url, asset in
+                ranOffMainThread = !Thread.isMainThread
+                gateLock.lock()
+                let shouldSignal = !startedSignaled && asset.downloadable
+                if shouldSignal { startedSignaled = true }
+                gateLock.unlock()
+                if shouldSignal {
+                    verificationStarted.signal()
+                    allowVerificationToFinish.wait()
+                }
+                return IosSpeechModelDownloader.verifyFile(at: url, asset: asset)
+            }
+        )
+        defer { downloader.invalidateSession() }
+        let store = SharedSpeechRecognizerStore(downloader: downloader, bundleResourceURL: root.appendingPathComponent("no-bundle"))
+
+        var callbackResult: Bool?
+        let readyExp = expectation(description: "async verification completes off main thread")
+        store.ensureBackgroundModelDownloadIfNeeded { ok in
+            callbackResult = ok
+            readyExp.fulfill()
+        }
+
+        // Wait until worker starts hashing; verify caller returned non-blockingly and status is still downloading.
+        XCTAssertEqual(verificationStarted.wait(timeout: .now() + 2), .success)
+        XCTAssertNil(callbackResult)
+        XCTAssertTrue(downloader.status.isDownloading)
+        XCTAssertFalse(downloader.hasVerifiedLocalModels)
+        XCTAssertFalse(store.hasRequiredModelFiles)
+
+        allowVerificationToFinish.signal()
+        wait(for: [readyExp], timeout: 5)
+
+        XCTAssertEqual(callbackResult, true)
+        XCTAssertTrue(ranOffMainThread)
+        XCTAssertEqual(downloader.status, .ready)
+        XCTAssertTrue(downloader.hasVerifiedLocalModels)
+        XCTAssertEqual(store.modelRoot, modelsDir)
     }
 
     func testSameSizeCorruptFileFailsVerifyAllAssetsAndTriggersCleanRedownload() throws {
@@ -227,6 +301,29 @@ final class IosSpeechModelDownloaderTests: XCTestCase {
         XCTAssertTrue(ok)
         XCTAssertEqual(fetchCount, 1)
         XCTAssertTrue(downloader.verifyAllAssetsOnDisk())
+        XCTAssertTrue(downloader.hasVerifiedLocalModels)
         XCTAssertEqual(try Data(contentsOf: modelsDir.appendingPathComponent("config.json")), goodData)
+
+        // Post-ready same-size tampering must also invalidate the fingerprint snapshot immediately.
+        let configURL = modelsDir.appendingPathComponent("config.json")
+        try corruptData.write(to: configURL, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(10)],
+            ofItemAtPath: configURL.path
+        )
+        XCTAssertFalse(downloader.hasVerifiedLocalModels)
+
+        let exp2 = expectation(description: "re-downloads post-ready corrupted file")
+        var ok2 = false
+        downloader.ensureDownloadedIfNeeded { result in
+            ok2 = result
+            exp2.fulfill()
+        }
+        wait(for: [exp2], timeout: 10)
+
+        XCTAssertTrue(ok2)
+        XCTAssertEqual(fetchCount, 2)
+        XCTAssertTrue(downloader.hasVerifiedLocalModels)
+        XCTAssertEqual(try Data(contentsOf: configURL), goodData)
     }
 }

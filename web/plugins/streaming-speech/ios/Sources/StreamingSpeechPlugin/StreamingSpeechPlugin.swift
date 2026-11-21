@@ -1727,7 +1727,7 @@ final class SharedSpeechRecognizerStore {
     }
 
     func ensureBackgroundModelDownloadIfNeeded(completion: ((Bool) -> Void)? = nil) {
-        if bundledModelRoot != nil || downloader.hasVerifiedLocalModels {
+        if bundledModelRoot != nil {
             completion?(true)
             return
         }
