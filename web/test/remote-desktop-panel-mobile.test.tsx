@@ -1688,6 +1688,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(pointerButton).not.toHaveBeenCalled();
     act(() => { (keyboardButton as HTMLButtonElement).click(); });
     expect((keyboardButton as HTMLButtonElement).hidden).toBe(true);
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
+    });
 
     const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
     // Focus/composition target only -- what is typed lands on the remote
@@ -1756,6 +1759,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('clears the mobile IME input on a failed send, so a stuck value cannot poison every later keystroke', async () => {
     const { getByRole } = await renderPanel();
     act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
+    });
     const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
 
     // A transient failure (data channel momentarily not open, a
@@ -1802,23 +1808,32 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const keyboard = container.querySelector('.remote-desktop-mobile-keyboard');
     expect(keyboard).not.toBeNull();
     // A sibling of the stage, not a child of it -- so it takes its own space
-    // in the panel layout instead of covering the video.
+    // in the panel layout instead of covering the video. Defaults to the computer keyboard tab.
     expect(stage!.contains(keyboard)).toBe(false);
-    expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
-
-    act(() => {
-      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
-    });
-    expect(container.querySelector('[aria-label="remote_desktop.mobile_text_input"]')).toBeNull();
+    expect(getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }).getAttribute('aria-selected')).toBe('true');
     expect(container.querySelector('.remote-desktop-computer-keyboard')).not.toBeNull();
+    expect(container.querySelector('[aria-label="remote_desktop.mobile_text_input"]')).toBeNull();
 
     act(() => {
       (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
     });
-    expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
+    const imeInput = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
+    expect(imeInput).toBeDefined();
+    await vi.waitFor(() => {
+      expect(document.activeElement).toBe(imeInput);
+    });
+
+    // Closing and reopening resets back to the computer keyboard default tab and page.
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.close_mobile_keyboard' }) as HTMLButtonElement).click();
+    });
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    expect(getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }).getAttribute('aria-selected')).toBe('true');
+    expect(container.querySelector('.remote-desktop-computer-keyboard')).not.toBeNull();
+    expect(container.querySelector('[aria-label="remote_desktop.mobile_text_input"]')).toBeNull();
   });
 
-  it('notifies onMobileKeyboardOpenChange when opening ime or keys keyboard tabs and resets on close or unmount', async () => {
+  it('notifies onMobileKeyboardOpenChange when opening keys or ime keyboard tabs and resets on close or unmount', async () => {
     const onMobileKeyboardOpenChange = vi.fn();
     const manager = new RemoteDesktopConnectionManager();
     const rendered = render(
@@ -1844,10 +1859,10 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     act(() => { (rendered.getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
     expect(onMobileKeyboardOpenChange).toHaveBeenLastCalledWith(true);
 
-    // Switching from ime tab to virtual PC keys tab keeps keyboard open state true
+    // Switching from virtual PC keys tab to ime tab keeps keyboard open state true
     onMobileKeyboardOpenChange.mockClear();
     act(() => {
-      (rendered.getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+      (rendered.getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
     });
     expect(onMobileKeyboardOpenChange).not.toHaveBeenCalledWith(false);
 
@@ -1907,10 +1922,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(stylesheet).toMatch(/\.remote-desktop-touch-hint\[hidden\],[\s\S]*?\.remote-desktop-footer\[hidden\]\s*\{[^}]*display:\s*none/);
     expect(queryByRole('button', { name: 'remote_desktop.nerd_stats_show' })).toBeNull();
 
-    // The compact computer-keyboard tab consumes screen space too, so the
-    // same space-saving contract stays active when switching keyboard modes.
+    // Switching to the IME tab keeps the same space-saving contract active.
     act(() => {
-      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
     });
     expect((container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(true);
     expect((container.querySelector('.remote-desktop-footer') as HTMLElement).hidden).toBe(true);
@@ -2010,6 +2024,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('sends Backspace and Return from the phone keyboard even with nothing typed', async () => {
     const { getByRole } = await renderPanel();
     act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
+    });
     const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
     const sentKeys = () => key.mock.calls
       .filter((call) => (call as unknown[])[2] === true)
@@ -2415,6 +2432,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('keeps the phone keyboard up while the remote screen is operated', async () => {
     const { stage, getByRole, getByLabelText } = await renderPanel();
     act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
+    });
     const input = getByLabelText('remote_desktop.mobile_text_input') as HTMLTextAreaElement;
     act(() => input.focus());
     expect(document.activeElement).toBe(input);

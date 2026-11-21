@@ -553,7 +553,7 @@ export function RemoteDesktopPanel({
   const [fileDropActive, setFileDropActive] = useState(false);
   const [mobileTextOpen, setMobileTextOpen] = useState(false);
   const [mobileToolbarExpanded, setMobileToolbarExpanded] = useState(false);
-  const [mobileKeyboardTab, setMobileKeyboardTab] = useState<MobileKeyboardTab>('ime');
+  const [mobileKeyboardTab, setMobileKeyboardTab] = useState<MobileKeyboardTab>('keys');
   const [comboMode, setComboMode] = useState(false);
   // Modifiers latched down in combo mode, waiting for either a second tap
   // (release) or a non-modifier key tap (fire the chord, then auto-release).
@@ -2847,10 +2847,9 @@ export function RemoteDesktopPanel({
       setKeyboardFitSize({ width: stage.clientWidth, height: stage.clientHeight });
     }
     setMobileToolbarExpanded(false);
-    setMobileKeyboardTab('ime');
+    setMobileKeyboardTab('keys');
     setComputerKeyboardPage(REMOTE_DESKTOP_COMPUTER_KEYBOARD_DEFAULT_PAGE);
     setMobileTextOpen(true);
-    requestAnimationFrame(() => focusRemoteDesktopMobileInput(mobileTextInputRef.current));
   };
 
   // Re-measure whenever the panel is open: the OS keyboard can come and go
