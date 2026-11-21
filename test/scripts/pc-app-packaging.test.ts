@@ -38,6 +38,7 @@ import {
 } from '../../apps/pc-app/electron-builder.config.mjs';
 // @ts-expect-error ESM script module
 import {
+  buildMacosSpeechHelper,
   buildMacosSpeechMlxHelper,
   buildPcAppNodeExeEnv,
   DEFAULT_SPEECH_MLX_PKG_DIR,
@@ -570,5 +571,93 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
       join(appResourcesDir, 'imcodes-speech-mlx'),
     );
     expect((buildReport.verification as { mlxMetallibPresent?: boolean }).mlxMetallibPresent).toBe(true);
+  });
+
+  it('buildMacosSpeechHelper ad-hoc signs imcodes-speech with codes.im.pc identifier and tolerates missing codesign', () => {
+    const work = makeTempDir();
+    const swiftSrc = join(work, 'imcodes-speech.swift');
+    writeFileSync(swiftSrc, '// test swift helper\n', 'utf8');
+
+    // 1. Single-arch signs output with -i codes.im.pc
+    const singleCalls: Array<{ cmd: string; args: string[] }> = [];
+    const singleOut = join(work, 'single', 'imcodes-speech');
+    buildMacosSpeechHelper({
+      srcPath: swiftSrc,
+      outPath: singleOut,
+      arch: 'arm64',
+      execFn: (cmd: string, args: string[]) => {
+        singleCalls.push({ cmd, args });
+        if (cmd === 'swiftc') {
+          writeFileSync(args[args.indexOf('-o') + 1]!, '#!/bin/sh\necho ok\n', { mode: 0o755 });
+        }
+        return Buffer.alloc(0);
+      },
+    });
+    expect(singleCalls).toEqual([
+      {
+        cmd: 'swiftc',
+        args: ['-O', '-target', 'arm64-apple-macosx12.0', '-framework', 'Cocoa', '-framework', 'CoreGraphics', '-framework', 'ApplicationServices', swiftSrc, '-o', singleOut],
+      },
+      {
+        cmd: 'codesign',
+        args: ['--force', '--sign', '-', '-i', 'codes.im.pc', singleOut],
+      },
+    ]);
+
+    // 2. Universal arch creates fat binary with lipo and signs final output with -i codes.im.pc
+    const uniCalls: Array<{ cmd: string; args: string[] }> = [];
+    const uniOut = join(work, 'uni', 'imcodes-speech');
+    buildMacosSpeechHelper({
+      srcPath: swiftSrc,
+      outPath: uniOut,
+      arch: 'universal',
+      execFn: (cmd: string, args: string[]) => {
+        uniCalls.push({ cmd, args });
+        if (cmd === 'swiftc') {
+          writeFileSync(args[args.indexOf('-o') + 1]!, '#!/bin/sh\necho ok\n', { mode: 0o755 });
+        } else if (cmd === 'lipo') {
+          writeFileSync(args[args.indexOf('-output') + 1]!, '#!/bin/sh\necho ok\n', { mode: 0o755 });
+        }
+        return Buffer.alloc(0);
+      },
+    });
+    expect(uniCalls.at(-1)).toEqual({
+      cmd: 'codesign',
+      args: ['--force', '--sign', '-', '-i', 'codes.im.pc', uniOut],
+    });
+
+    // 3. Soft-ignores only ENOENT when codesign binary is absent; non-ENOENT failures still throw
+    const enoentOut = join(work, 'enoent', 'imcodes-speech');
+    expect(() =>
+      buildMacosSpeechHelper({
+        srcPath: swiftSrc,
+        outPath: enoentOut,
+        arch: 'arm64',
+        execFn: (cmd: string, args: string[]) => {
+          if (cmd === 'swiftc') {
+            writeFileSync(args[args.indexOf('-o') + 1]!, '#!/bin/sh\necho ok\n', { mode: 0o755 });
+            return Buffer.alloc(0);
+          }
+          const err = new Error('spawn codesign ENOENT') as NodeJS.ErrnoException;
+          err.code = 'ENOENT';
+          throw err;
+        },
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      buildMacosSpeechHelper({
+        srcPath: swiftSrc,
+        outPath: join(work, 'fail', 'imcodes-speech'),
+        arch: 'arm64',
+        execFn: (cmd: string, args: string[]) => {
+          if (cmd === 'swiftc') {
+            writeFileSync(args[args.indexOf('-o') + 1]!, '#!/bin/sh\necho ok\n', { mode: 0o755 });
+            return Buffer.alloc(0);
+          }
+          throw new Error('codesign failed');
+        },
+      }),
+    ).toThrow(/codesign failed/);
   });
 });

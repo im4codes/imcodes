@@ -180,6 +180,17 @@ function defaultBuildDevHelper(outPath: string, arch = process.arch === 'x64' ? 
       },
     );
     chmodSync(outPath, 0o755);
+    try {
+      execFileSync(
+        'codesign',
+        ['--force', '--sign', '-', '-i', 'codes.im.pc', outPath],
+        { stdio: 'pipe', timeout: 15_000 },
+      );
+    } catch (err) {
+      if (!(err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT')) {
+        throw err;
+      }
+    }
     return outPath;
   } catch {
     return null;

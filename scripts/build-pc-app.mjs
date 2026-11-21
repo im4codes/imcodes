@@ -130,6 +130,21 @@ export function resolveElectronBuilderMacAppPath(outDir, arch, productName = 'IM
   return join(resolve(outDir), subdir, `${productName}.app`);
 }
 
+const MACOS_SPEECH_HELPER_IDENTIFIER = 'codes.im.pc';
+
+function adHocSignMacosSpeechHelper(execFn, binPath) {
+  try {
+    execFn('codesign', ['--force', '--sign', '-', '-i', MACOS_SPEECH_HELPER_IDENTIFIER, binPath], {
+      stdio: 'pipe',
+    });
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') {
+      return;
+    }
+    throw err;
+  }
+}
+
 /**
  * Compile `apps/pc-app/native/imcodes-speech.swift` into a macOS binary (`universal`, `arm64`, or `x64`).
  */
@@ -153,6 +168,7 @@ export function buildMacosSpeechHelper({
       stdio: 'inherit',
     });
     chmodSync(absOut, 0o755);
+    adHocSignMacosSpeechHelper(execFn, absOut);
     return absOut;
   }
   const workDir = mkdtempSync(join(tmpdir(), 'imcodes-speech-build-'));
@@ -166,6 +182,7 @@ export function buildMacosSpeechHelper({
     });
     execFn('lipo', ['-create', ...thinBins, '-output', absOut], { stdio: 'inherit' });
     chmodSync(absOut, 0o755);
+    adHocSignMacosSpeechHelper(execFn, absOut);
     return absOut;
   } finally {
     rmSync(workDir, { recursive: true, force: true });

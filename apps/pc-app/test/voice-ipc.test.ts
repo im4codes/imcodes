@@ -1173,4 +1173,25 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     expect(w2.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
     await voice.dispose();
   });
+
+  it('aligns imcodes-speech.swift Unicode paste and dev helper ad-hoc signing with codes.im.pc', () => {
+    const swiftSrc = readFileSync(path.resolve(__dirname, '../native/imcodes-speech.swift'), 'utf8');
+    const pasteStart = swiftSrc.indexOf('func runPasteCommand(args: [String])');
+    const pasteBody = swiftSrc.slice(pasteStart, swiftSrc.indexOf('private extension Int32', pasteStart));
+    expect(pasteBody).toContain('let trusted = AXIsProcessTrustedWithOptions(options)');
+    expect(pasteBody).not.toContain('CGEventSource(stateID: .hidSystemState)');
+    expect(pasteBody).toContain('CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)');
+    expect(pasteBody).toContain('down.flags = []');
+    expect(pasteBody).toContain('up.flags = []');
+    expect(pasteBody).toContain('CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true)');
+    expect(pasteBody).toContain('retDown.flags = []');
+    expect(pasteBody).toContain('retUp.flags = []');
+    expect(pasteBody).toContain('waitForModifierRelease()');
+    expect(pasteBody).toContain('if !trusted && postedCount == 0');
+    expect(pasteBody).toContain('emitJson(["type": "ok", "length": utf16.count, "trusted": trusted])');
+
+    const voiceIpcSrc = readFileSync(path.resolve(__dirname, '../src/voice-ipc.ts'), 'utf8');
+    expect(voiceIpcSrc).toContain("'codesign'");
+    expect(voiceIpcSrc).toContain("'-i', 'codes.im.pc'");
+  });
 });
