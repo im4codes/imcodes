@@ -147,6 +147,7 @@ export interface PcAppShellInstance {
   voice: ReturnType<typeof createPcAppVoiceController>;
   getLocale: () => PcAppLocale;
   getWindow: () => ShellWindowLike | null;
+  getMainWindow: () => ShellWindowLike | null;
   ensureWindow: () => Promise<ShellWindowLike>;
   focusWindow: () => Promise<ShellWindowLike | null>;
   showServerPicker: () => Promise<void>;
@@ -633,6 +634,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     voice,
     getLocale: () => activeLocale,
     getWindow: () => mainWindow,
+    getMainWindow: () => mainWindow,
     ensureWindow,
     focusWindow,
     showServerPicker,

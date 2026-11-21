@@ -8,13 +8,12 @@ import {
   ipcMain,
   Menu,
   Notification,
-  screen,
   shell,
   systemPreferences,
   type MenuItemConstructorOptions,
 } from 'electron';
 import { createPcAppShell, type PcAppShellInstance } from './shell.js';
-import { createPcAppVoiceHud, type VoiceHudWindowLike } from './voice-hud.js';
+import { createPcAppVoiceHud } from './voice-hud.js';
 
 function resolveRuntimeIconPath(): string | undefined {
   const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -41,18 +40,8 @@ export async function startPcApp(): Promise<void> {
 
   let shellInstance: PcAppShellInstance | null = null;
   const voiceHud = createPcAppVoiceHud({
-    platform: process.platform,
     getLocale: () => shellInstance?.getLocale() ?? app.getLocale(),
-    getDisplayWorkArea: () => {
-      const cursor = screen.getCursorScreenPoint();
-      const display = screen.getDisplayNearestPoint(cursor) ?? screen.getPrimaryDisplay();
-      return display.workArea;
-    },
-    createWindow: (opts) =>
-      new BrowserWindow({
-        ...opts,
-        ...(process.platform === 'darwin' ? { type: 'panel' as const } : {}),
-      }) as unknown as VoiceHudWindowLike,
+    getWebContents: () => shellInstance?.getMainWindow()?.webContents ?? null,
   });
 
   const pcShell = createPcAppShell({
