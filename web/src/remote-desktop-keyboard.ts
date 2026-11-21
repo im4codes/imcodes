@@ -563,7 +563,7 @@ const shiftedKey = (code: string, key: string): RemoteDesktopComputerKeySpec => 
 /**
  * Row-major layout for the on-screen computer keyboard: modifiers, then
  * Esc/Tab/backtick/PrintScreen/ScrollLock/Pause, then three rows pairing
- * F1-F9 with Insert/Home/PageUp/Delete/End/PageDown/CapsLock, and finally
+ * F1-F9 with Insert/Home/PageUp/Delete/End/PageDown/ArrowUp/Enter, and finally
  * F10-F12 with the arrow cluster.
  */
 export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS: readonly (readonly RemoteDesktopComputerKeySpec[])[] = [
@@ -571,7 +571,7 @@ export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS: readonly (readonly RemoteDes
   [plainKey('Escape', 'Escape'), plainKey('Tab', 'Tab'), plainKey('Backquote', '`'), plainKey('PrintScreen', 'PrintScreen'), plainKey('ScrollLock', 'ScrollLock'), plainKey('Pause', 'Pause')],
   [plainKey('F1', 'F1'), plainKey('F2', 'F2'), plainKey('F3', 'F3'), plainKey('Insert', 'Insert'), plainKey('Home', 'Home'), plainKey('PageUp', 'PageUp')],
   [plainKey('F4', 'F4'), plainKey('F5', 'F5'), plainKey('F6', 'F6'), plainKey('Delete', 'Delete'), plainKey('End', 'End'), plainKey('PageDown', 'PageDown')],
-  [plainKey('F7', 'F7'), plainKey('F8', 'F8'), plainKey('F9', 'F9'), plainKey('CapsLock', 'CapsLock'), plainKey('ArrowUp', 'ArrowUp')],
+  [plainKey('F7', 'F7'), plainKey('F8', 'F8'), plainKey('F9', 'F9'), plainKey('ArrowUp', 'ArrowUp'), plainKey('Enter', 'Enter')],
   [plainKey('F10', 'F10'), plainKey('F11', 'F11'), plainKey('F12', 'F12'), plainKey('ArrowLeft', 'ArrowLeft'), plainKey('ArrowDown', 'ArrowDown'), plainKey('ArrowRight', 'ArrowRight')],
 ];
 

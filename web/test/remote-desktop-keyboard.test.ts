@@ -19,6 +19,7 @@ import {
   splitRemoteDesktopMobileTextEnter,
   REMOTE_DESKTOP_COMPUTER_CASE_KEY,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE3,
   isRemoteDesktopComputerLetterKey,
@@ -579,5 +580,13 @@ describe('iOS form accessory bar', () => {
     expect(remoteDesktopKeyboardAccessoryInset(ipadOs, 5)).toBe(IOS_FORM_ACCESSORY_BAR_PX);
     expect(remoteDesktopKeyboardAccessoryInset(ipadOs, 0)).toBe(0);
     expect(remoteDesktopKeyboardAccessoryInset(android, 5)).toBe(0);
+  });
+});
+
+describe('computer keyboard primary rows', () => {
+  it('places ArrowUp followed by Enter at the end of row 5', () => {
+    const row5 = REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS[4];
+    expect(row5.map((spec) => spec.code)).toEqual(['F7', 'F8', 'F9', 'ArrowUp', 'Enter']);
+    expect(remoteDesktopComputerKeyLabel(row5[4], 'windows')).toBe('↵');
   });
 });
