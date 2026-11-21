@@ -6,9 +6,13 @@ import {
   DOUBLE_TAP_MODIFIER_WINDOW_MS,
   MAX_MODIFIER_TAP_HOLD_MS,
   NATIVE_MODIFIER_PRESS_EVENT,
+  SINGLE_TAP_MODIFIER_DELAY_MS,
   createDoubleTapModifierDetector,
   installMacVoiceShortcutListener,
+  isAnyInlineVoiceComposerActive,
   isMacVoiceShortcutEnabled,
+  registerMacVoiceComposerHandler,
+  triggerMacVoiceComposerStopOnly,
 } from '../src/mac-voice-shortcut.js';
 import type { MacVoiceInlineModifier } from '../src/keyboard-shortcuts.js';
 
@@ -31,6 +35,7 @@ function modEvent(
 
 describe('mac-voice-shortcut double-tap modifier detector', () => {
   afterEach(() => {
+    vi.useRealTimers();
     document.body.innerHTML = '';
     delete (globalThis as Record<string, unknown>).__IMCODES_PC_APP__;
     vi.restoreAllMocks();
@@ -352,5 +357,123 @@ describe('mac-voice-shortcut double-tap modifier detector', () => {
     expect(onDoubleTap).toHaveBeenCalledTimes(2);
 
     plainCleanup();
+  });
+
+  it('fires onSingleTap only when shouldEmitSingleTap is true, cancels on fast double-tap or other key activity', () => {
+    vi.useFakeTimers();
+    let now = 5000;
+    let inlineActive = false;
+    const onSingleTap = vi.fn();
+    const onDoubleTap = vi.fn();
+    const detector = createDoubleTapModifierDetector({
+      getTargetModifier: () => 'shift',
+      isEnabled: () => true,
+      now: () => now,
+      shouldEmitSingleTap: () => inlineActive,
+      onSingleTap,
+      onDoubleTap,
+    });
+
+    // When idle (shouldEmitSingleTap() === false), single tap does not fire onSingleTap
+    detector.handleKeyDown(modEvent('Shift', 'ShiftLeft'));
+    now += 30;
+    detector.handleKeyUp(modEvent('Shift', 'ShiftLeft', { shiftKey: false }));
+    vi.advanceTimersByTime(DOUBLE_TAP_MODIFIER_WINDOW_MS + 100);
+    expect(onSingleTap).not.toHaveBeenCalled();
+    expect(onDoubleTap).not.toHaveBeenCalled();
+
+    // When active (shouldEmitSingleTap() === true), clean single tap fires onSingleTap after window
+    inlineActive = true;
+    now += 500;
+    detector.handleKeyDown(modEvent('Shift', 'ShiftLeft'));
+    now += 30;
+    detector.handleKeyUp(modEvent('Shift', 'ShiftLeft', { shiftKey: false }));
+    expect(onSingleTap).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(SINGLE_TAP_MODIFIER_DELAY_MS - 10);
+    expect(onSingleTap).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(20);
+    expect(onSingleTap).toHaveBeenCalledTimes(1);
+    expect(onDoubleTap).not.toHaveBeenCalled();
+
+    // Another single tap right after reset works as a fresh tap, not a double-tap
+    now += 200;
+    detector.handleKeyDown(modEvent('Shift', 'ShiftLeft'));
+    now += 30;
+    detector.handleKeyUp(modEvent('Shift', 'ShiftLeft', { shiftKey: false }));
+    vi.advanceTimersByTime(SINGLE_TAP_MODIFIER_DELAY_MS + 10);
+    expect(onSingleTap).toHaveBeenCalledTimes(2);
+    expect(onDoubleTap).not.toHaveBeenCalled();
+
+    // Fast double-tap cancels pending onSingleTap and fires onDoubleTap
+    now += 500;
+    detector.handleKeyDown(modEvent('Shift', 'ShiftLeft'));
+    now += 25;
+    detector.handleKeyUp(modEvent('Shift', 'ShiftLeft', { shiftKey: false }));
+    vi.advanceTimersByTime(100);
+    now += 100;
+    detector.handleKeyDown(modEvent('Shift', 'ShiftLeft'));
+    now += 25;
+    detector.handleKeyUp(modEvent('Shift', 'ShiftLeft', { shiftKey: false }));
+    expect(onDoubleTap).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(DOUBLE_TAP_MODIFIER_WINDOW_MS + 100);
+    expect(onSingleTap).toHaveBeenCalledTimes(2);
+
+    // Normal Shift+letter typing cancels pending single-tap timer (both held chord and post-tap key)
+    now += 500;
+    detector.handleKeyDown(modEvent('Shift', 'ShiftLeft'));
+    detector.handleKeyDown({ key: 'A', code: 'KeyA', ctrlKey: false, altKey: false, shiftKey: true, metaKey: false, repeat: false, isComposing: false });
+    now += 30;
+    detector.handleKeyUp(modEvent('Shift', 'ShiftLeft', { shiftKey: false }));
+    vi.advanceTimersByTime(SINGLE_TAP_MODIFIER_DELAY_MS + 50);
+    expect(onSingleTap).toHaveBeenCalledTimes(2);
+
+    now += 500;
+    detector.handleKeyDown(modEvent('Shift', 'ShiftLeft'));
+    now += 25;
+    detector.handleKeyUp(modEvent('Shift', 'ShiftLeft', { shiftKey: false }));
+    detector.handleKeyDown({ key: 'a', code: 'KeyA', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, repeat: false, isComposing: false });
+    vi.advanceTimersByTime(SINGLE_TAP_MODIFIER_DELAY_MS + 50);
+    expect(onSingleTap).toHaveBeenCalledTimes(2);
+  });
+
+  it('triggerMacVoiceComposerStopOnly invokes stopWithoutSubmit on active inline-voice handler without calling triggerToggleOrSubmit', () => {
+    let inlineActive = false;
+    const triggerToggleOrSubmit = vi.fn(() => true);
+    const stopWithoutSubmit = vi.fn(() => true);
+    const idleToggle = vi.fn(() => true);
+    const idleStop = vi.fn(() => true);
+
+    const unregIdle = registerMacVoiceComposerHandler({
+      isActive: () => true,
+      isInlineVoiceActive: () => false,
+      isFocused: () => true,
+      triggerToggleOrSubmit: idleToggle,
+      stopWithoutSubmit: idleStop,
+    });
+    const unregActive = registerMacVoiceComposerHandler({
+      isActive: () => true,
+      isInlineVoiceActive: () => inlineActive,
+      isFocused: () => false,
+      triggerToggleOrSubmit,
+      stopWithoutSubmit,
+    });
+
+    try {
+      expect(isAnyInlineVoiceComposerActive()).toBe(false);
+      expect(triggerMacVoiceComposerStopOnly()).toBe(false);
+      expect(idleStop).not.toHaveBeenCalled();
+      expect(stopWithoutSubmit).not.toHaveBeenCalled();
+
+      inlineActive = true;
+      expect(isAnyInlineVoiceComposerActive()).toBe(true);
+      expect(triggerMacVoiceComposerStopOnly()).toBe(true);
+      expect(stopWithoutSubmit).toHaveBeenCalledTimes(1);
+      expect(triggerToggleOrSubmit).not.toHaveBeenCalled();
+      expect(idleStop).not.toHaveBeenCalled();
+      expect(idleToggle).not.toHaveBeenCalled();
+    } finally {
+      unregActive();
+      unregIdle();
+    }
   });
 });

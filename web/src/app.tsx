@@ -143,7 +143,9 @@ import {
 import { taskPairDisplayTitle } from '@shared/task-pair-display.js';
 import {
   installMacVoiceShortcutListener,
+  isAnyInlineVoiceComposerActive,
   setFallbackMacVoiceModifier,
+  triggerMacVoiceComposerStopOnly,
   triggerRegisteredMacVoiceComposer,
 } from './mac-voice-shortcut.js';
 import {
@@ -8673,6 +8675,10 @@ function InternalMainApp() {
   useEffect(() => installMacVoiceShortcutListener({
     getTargetModifier: () => resolvedMacVoiceModifierRef.current,
     isBlocked: () => hasBlockingComposerOverlayRef.current,
+    shouldEmitSingleTap: () => isAnyInlineVoiceComposerActive(),
+    onSingleTap: () => {
+      triggerMacVoiceComposerStopOnly();
+    },
     onDoubleTap: () => {
       triggerRegisteredMacVoiceComposer();
     },

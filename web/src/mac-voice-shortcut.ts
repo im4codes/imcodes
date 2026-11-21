@@ -8,6 +8,7 @@ export function isMacVoiceShortcutEnabled(): boolean {
 }
 
 export const DOUBLE_TAP_MODIFIER_WINDOW_MS = 450;
+export const SINGLE_TAP_MODIFIER_DELAY_MS = 280;
 export const MAX_MODIFIER_TAP_HOLD_MS = 450;
 export const NATIVE_MODIFIER_PRESS_EVENT = 'imcodes:native-modifier-press';
 
@@ -23,15 +24,19 @@ export interface MacVoiceComposerHandler {
   isInlineVoiceActive: () => boolean;
   isFocused: () => boolean;
   triggerToggleOrSubmit: () => boolean;
+  stopWithoutSubmit?: () => boolean;
 }
 
 export interface DoubleTapModifierDetectorOptions {
   getTargetModifier: () => MacVoiceInlineModifier;
   onDoubleTap: () => void;
+  onSingleTap?: () => void;
+  shouldEmitSingleTap?: () => boolean;
   isEnabled?: () => boolean;
   isBlocked?: () => boolean;
   now?: () => number;
   doubleTapWindowMs?: number;
+  singleTapDelayMs?: number;
   maxHoldMs?: number;
 }
 
@@ -98,14 +103,24 @@ export function createDoubleTapModifierDetector(
   const isEnabled = options.isEnabled ?? isMacVoiceShortcutEnabled;
   const now = options.now ?? (() => Date.now());
   const doubleTapWindowMs = options.doubleTapWindowMs ?? DOUBLE_TAP_MODIFIER_WINDOW_MS;
+  const singleTapDelayMs = options.singleTapDelayMs ?? Math.min(doubleTapWindowMs, SINGLE_TAP_MODIFIER_DELAY_MS);
   const maxHoldMs = options.maxHoldMs ?? MAX_MODIFIER_TAP_HOLD_MS;
 
   let phase: 'idle' | 'pressed' | 'released_once' = 'idle';
   let downAt = 0;
   let firstTapUpAt: number | null = null;
   let dirty = false;
+  let pendingSingleTapTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearPendingSingleTap = () => {
+    if (pendingSingleTapTimer !== null) {
+      clearTimeout(pendingSingleTapTimer);
+      pendingSingleTapTimer = null;
+    }
+  };
 
   const reset = () => {
+    clearPendingSingleTap();
     phase = 'idle';
     downAt = 0;
     firstTapUpAt = null;
@@ -145,6 +160,7 @@ export function createDoubleTapModifierDetector(
     // Ignore duplicate keydown / native down for a press already in flight so
     // native UIKit + DOM events dedupe without resetting hold timer or dirty flag.
     if (phase === 'pressed') return false;
+    clearPendingSingleTap();
     phase = 'pressed';
     downAt = now();
     dirty = false;
@@ -169,6 +185,21 @@ export function createDoubleTapModifierDetector(
     }
     phase = 'released_once';
     firstTapUpAt = t;
+    if (options.onSingleTap && options.shouldEmitSingleTap?.()) {
+      clearPendingSingleTap();
+      pendingSingleTapTimer = setTimeout(() => {
+        pendingSingleTapTimer = null;
+        if (!isEnabled() || isShortcutRecordingActiveInDom() || options.isBlocked?.()) {
+          reset();
+          return;
+        }
+        const shouldEmit = options.shouldEmitSingleTap?.() ?? false;
+        reset();
+        if (shouldEmit) {
+          options.onSingleTap?.();
+        }
+      }, singleTapDelayMs);
+    }
     return false;
   };
 
@@ -254,6 +285,10 @@ function syncFallbackListener(): void {
   if (!fallbackCleanup) {
     fallbackCleanup = attachShortcutListenerInternal({
       getTargetModifier: () => fallbackModifier,
+      shouldEmitSingleTap: () => isAnyInlineVoiceComposerActive(),
+      onSingleTap: () => {
+        triggerMacVoiceComposerStopOnly();
+      },
       onDoubleTap: () => {
         triggerRegisteredMacVoiceComposer();
       },
@@ -268,6 +303,24 @@ export function registerMacVoiceComposerHandler(handler: MacVoiceComposerHandler
     composerHandlers.delete(handler);
     syncFallbackListener();
   };
+}
+
+export function isAnyInlineVoiceComposerActive(): boolean {
+  for (const h of composerHandlers) {
+    if (h.isInlineVoiceActive()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function triggerMacVoiceComposerStopOnly(): boolean {
+  for (const h of Array.from(composerHandlers)) {
+    if (h.isInlineVoiceActive()) {
+      if (h.stopWithoutSubmit?.()) return true;
+    }
+  }
+  return false;
 }
 
 export function triggerRegisteredMacVoiceComposer(): boolean {

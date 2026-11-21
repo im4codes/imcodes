@@ -6728,6 +6728,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return startInlineVoice();
   }, [startInlineVoice, stopInlineVoice]);
 
+  const handleMacVoiceShortcutStopOnly = useCallback((): boolean => {
+    if (inputDisabledRef.current || !inlineVoiceActiveRef.current) return false;
+    stopInlineVoice({ abort: false, restoreCaret: true });
+    return true;
+  }, [stopInlineVoice]);
+
   useEffect(() => registerMacVoiceComposerHandler({
     isActive: () => keyboardActiveRef.current !== false,
     isInlineVoiceActive: () => inlineVoiceActiveRef.current,
@@ -6735,7 +6741,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       typeof document !== 'undefined' && !!divRef.current && document.activeElement === divRef.current
     ),
     triggerToggleOrSubmit: handleMacVoiceShortcutTrigger,
-  }), [handleMacVoiceShortcutTrigger]);
+    stopWithoutSubmit: handleMacVoiceShortcutStopOnly,
+  }), [handleMacVoiceShortcutStopOnly, handleMacVoiceShortcutTrigger]);
 
   useEffect(() => {
     if (inputDisabled && (inlineVoiceActiveRef.current || inlineVoiceDrainingTokenRef.current !== null)) {
