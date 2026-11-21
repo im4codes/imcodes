@@ -618,8 +618,18 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
     let stdoutBuffer = '';
     let stderrBuffer = '';
+    let loggedFirstLevel = false;
+    let loggedFirstResult = false;
     const emitSafe = (payload: PcAppVoiceEvent) => {
-      if (payload.type === 'error') {
+      if (payload.type === 'level' && !loggedFirstLevel && payload.value > 0.01) {
+        loggedFirstLevel = true;
+        appendVoiceLog(`first level value=${payload.value.toFixed(4)}`);
+      } else if (payload.type === 'result' && !loggedFirstResult && payload.text.trim()) {
+        loggedFirstResult = true;
+        appendVoiceLog(
+          `first result isFinal=${payload.isFinal} len=${payload.text.trim().length} text=${JSON.stringify(payload.text.trim().slice(0, 80))}`,
+        );
+      } else if (payload.type === 'error') {
         appendVoiceLog(`helper error code=${payload.code} target=${payload.target ?? '-'} message=${payload.message ?? '-'}`);
       }
       if (options?.onEvent) {

@@ -8,9 +8,8 @@ import { PC_APP_LOCALES, tPcApp } from '../src/i18n.js';
 import { buildAppMenuTemplate, type MenuItemOptionsLike } from '../src/menu.js';
 import { MAIN_WINDOW_WEB_PREFERENCES } from '../src/security.js';
 import { buildWelcomeDataUrl, openAddServerPrompt } from '../src/server-prompt.js';
-import { PC_APP_MIC_TEST_CHANNELS } from '../src/mic-test.js';
+import { MIC_TEST_OVERLAY_ID } from '../src/mic-test.js';
 import { createPcAppShell, type ShellWindowLike } from '../src/shell.js';
-import type { PcAppIpcInvokeEventLike, PcAppIpcMainLike } from '../src/voice-ipc.js';
 
 function createFakeShellWindow(opts: {
   webPreferences: typeof MAIN_WINDOW_WEB_PREFERENCES;
@@ -852,32 +851,18 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     });
   });
 
-  it('opens Voice -> Microphone Test window with dedicated preload + scoped IPC, skips select rebuilds on level ticks, switches devices, and stops listening on close', async () => {
+  it('mounts in-page floating Microphone Test overlay inside mainWindow without opening a separate BrowserWindow, skips select rebuilds on level ticks, and stops listening on close', async () => {
     const menus: MenuItemOptionsLike[][] = [];
-    const handlers = new Map<string, (event: PcAppIpcInvokeEventLike, ...args: unknown[]) => unknown>();
-    const ipcMain: PcAppIpcMainLike = {
-      handle: (channel, listener) => { handlers.set(channel, listener); },
-      removeHandler: (channel) => { handlers.delete(channel); },
-    };
-    const promptWindows: Array<{
-      emitter: EventEmitter;
-      wc: EventEmitter & {
-        setWindowOpenHandler: (fn: (d: { url: string }) => { action: 'deny' }) => void;
-        send: ReturnType<typeof vi.fn>;
-      };
-      loadedUrls: string[];
-      focusSpy: ReturnType<typeof vi.fn>;
-      close: () => void;
-      isDestroyed: () => boolean;
-      webPreferences: Record<string, unknown>;
-    }> = [];
+    const createPromptWindowSpy = vi.fn(() => {
+      throw new Error('should not open separate BrowserWindow for mic test');
+    });
+    let mainWin: ReturnType<typeof createFakeShellWindow> | null = null;
     const spawnedChildren: Array<{
       args: string[];
       stdout: EventEmitter;
       stderr: EventEmitter;
       stdin: { write: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn> };
       kill: ReturnType<typeof vi.fn>;
-      emitter: EventEmitter;
     }> = [];
 
     const shell = createPcAppShell({
@@ -885,8 +870,6 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       appName: 'IM.codes',
       userDataDir: tempDir,
       welcomeLocale: 'en',
-      ipcMain,
-      micTestPreloadPath: '/tmp/mock-mic-test-preload.cjs',
       voiceDeps: {
         speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
         getMediaAccessStatus: () => 'granted',
@@ -909,47 +892,16 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
             kill: vi.fn(() => {
               em.emit('exit', 0);
             }),
-            emitter: em,
           });
           spawnedChildren.push(child);
           return child as unknown as import('node:child_process').ChildProcess;
         },
       },
-      createMainWindow: (opts) => createFakeShellWindow({ webPreferences: opts.webPreferences }),
-      createPromptWindow: (opts) => {
-        const emitter = new EventEmitter();
-        const wc = Object.assign(new EventEmitter(), {
-          setWindowOpenHandler: vi.fn(),
-          send: vi.fn(),
-        });
-        let destroyed = false;
-        const focusSpy = vi.fn();
-        const loadedUrls: string[] = [];
-        const record = {
-          emitter,
-          wc,
-          loadedUrls,
-          focusSpy,
-          webPreferences: opts.webPreferences as Record<string, unknown>,
-          isDestroyed: () => destroyed,
-          close: () => {
-            if (destroyed) return;
-            destroyed = true;
-            emitter.emit('closed');
-          },
-        };
-        promptWindows.push(record);
-        return {
-          loadURL: (u: string) => {
-            loadedUrls.push(u);
-          },
-          focus: focusSpy,
-          close: record.close,
-          isDestroyed: record.isDestroyed,
-          on: (ev: 'closed', fn: () => void) => emitter.on(ev, fn),
-          webContents: wc,
-        };
+      createMainWindow: (opts) => {
+        mainWin = createFakeShellWindow({ webPreferences: opts.webPreferences });
+        return mainWin;
       },
+      createPromptWindow: createPromptWindowSpy,
       setApplicationMenu: (template) => {
         menus.push(template);
       },
@@ -962,71 +914,165 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     const micTestItem = findMenuItem(menus.at(-1)!, 'voice:mic-test');
     expect(micTestItem).toBeDefined();
 
+    // While on welcome data: page (no trusted origin), clicking Microphone Test does not inject into data: or open a window
     micTestItem?.click?.();
-    await vi.waitFor(() => {
-      expect(promptWindows).toHaveLength(1);
-      expect(promptWindows[0].loadedUrls.length).toBeGreaterThan(0);
-    });
+    await new Promise((r) => setTimeout(r, 15));
+    expect(createPromptWindowSpy).not.toHaveBeenCalled();
+    expect(mainWin!.webContents.executeJavaScript).not.toHaveBeenCalled();
 
-    const modal = promptWindows[0];
-    expect(modal.webPreferences).toEqual({
-      nodeIntegration: false,
-      contextIsolation: true,
-      sandbox: true,
-      webviewTag: false,
-      partition: 'pc-app-mic-test-ephemeral',
-      preload: '/tmp/mock-mic-test-preload.cjs',
-    });
-    const html = decodeURIComponent(modal.loadedUrls[0]);
-    expect(html).toContain('id="device-select"');
-    expect(html).toContain('class="bar"');
-    expect(html).toContain('LG USB Audio');
-    expect(html).toContain('computeDevicesKey');
-    expect(html).toContain('devicesKey !== lastDevicesKey');
-    expect(html).not.toContain('window.location.href');
-
-    // Scoped IPC rejects non-modal senders
-    const actionHandler = handlers.get(PC_APP_MIC_TEST_CHANNELS.action)!;
-    expect(actionHandler).toBeDefined();
-    await expect(
-      actionHandler({ sender: { id: 'evil-or-main' } }, { action: 'start' }),
-    ).rejects.toThrow('Blocked untrusted mic-test IPC invocation');
-
-    // Re-opening while open focuses existing window without creating a second one
+    // Connect to a trusted server origin, then open Voice -> Microphone Test…
+    await shell.addAndSelectServer('https://app.im.codes', 'App');
     findMenuItem(menus.at(-1)!, 'voice:mic-test')?.click?.();
-    expect(promptWindows).toHaveLength(1);
-    expect(modal.focusSpy).toHaveBeenCalledTimes(1);
-
-    // Start test listening via scoped preload IPC
-    await expect(actionHandler({ sender: modal.wc }, { action: 'start' })).resolves.toEqual({ ok: true });
     await vi.waitFor(() => {
-      expect(spawnedChildren).toHaveLength(1);
+      expect(mainWin!.webContents.executeJavaScript).toHaveBeenCalledTimes(1);
     });
-    expect(spawnedChildren[0].args).toEqual(['listen', '--locale', 'en']);
+    expect(createPromptWindowSpy).not.toHaveBeenCalled();
 
-    spawnedChildren[0].stdout.emit('data', '{"type":"start"}\n{"type":"level","value":0.72}\n{"type":"result","text":"testing one two","isFinal":false}\n');
-    await vi.waitFor(() => {
-      const lastCall = modal.wc.send.mock.calls.at(-1);
-      expect(lastCall?.[0]).toBe(PC_APP_MIC_TEST_CHANNELS.state);
-      expect(lastCall?.[1]).toMatchObject({ level: 0.72, transcript: 'testing one two', listening: true });
-    });
+    const injectedScript = (mainWin!.webContents.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(injectedScript).toContain(MIC_TEST_OVERLAY_ID);
+    expect(injectedScript).toContain('window.__IMCODES_PC_APP__');
 
-    // Switching device while listening aborts current process and restarts on usb-1
-    await expect(actionHandler({ sender: modal.wc }, { action: 'select-device', payload: 'usb-1' })).resolves.toEqual({ ok: true });
-    await vi.waitFor(() => {
-      expect(spawnedChildren).toHaveLength(2);
-    });
-    expect(spawnedChildren[0].kill).toHaveBeenCalledWith('SIGTERM');
-    expect(shell.voice.getSelectedInputDevice()).toBe('usb-1');
-    expect(spawnedChildren[1].args).toEqual(['listen', '--locale', 'en', '--device', 'usb-1']);
+    // Execute the injected overlay script inside a minimal DOM/voice harness to verify UI behavior end-to-end
+    const elements = new Map<string, FakeDomElement>();
+    type FakeDomElement = {
+      id: string;
+      className: string;
+      tagName: string;
+      style: Record<string, string>;
+      textContent: string;
+      value: string;
+      children: FakeDomElement[];
+      options?: FakeDomElement[];
+      parentNode: FakeDomElement | null;
+      listeners: Map<string, Array<(ev?: unknown) => void>>;
+      _innerHTMLChanges: number;
+      appendChild: (child: FakeDomElement) => FakeDomElement;
+      removeChild: (child: FakeDomElement) => void;
+      addEventListener: (ev: string, fn: (ev?: unknown) => void) => void;
+      dispatchEvent: (ev: string, payload?: unknown) => void;
+      focus?: () => void;
+      get innerHTML(): string;
+      set innerHTML(v: string);
+    };
+    const makeEl = (tagName: string): FakeDomElement => {
+      const listeners = new Map<string, Array<(ev?: unknown) => void>>();
+      const el: FakeDomElement = {
+        id: '',
+        className: '',
+        tagName,
+        style: {},
+        textContent: '',
+        value: '',
+        children: [],
+        ...(tagName === 'select' ? { options: [] } : {}),
+        parentNode: null,
+        listeners,
+        _innerHTMLChanges: 0,
+        appendChild(child) {
+          child.parentNode = el;
+          el.children.push(child);
+          if (tagName === 'select') el.options = el.children;
+          if (child.id) elements.set(child.id, child);
+          return child;
+        },
+        removeChild(child) {
+          el.children = el.children.filter((c) => c !== child);
+          child.parentNode = null;
+          if (child.id) elements.delete(child.id);
+        },
+        addEventListener(ev, fn) {
+          const arr = listeners.get(ev) ?? [];
+          arr.push(fn);
+          listeners.set(ev, arr);
+        },
+        dispatchEvent(ev, payload) {
+          for (const fn of listeners.get(ev) ?? []) fn(payload);
+        },
+        get innerHTML() {
+          return '';
+        },
+        set innerHTML(_v: string) {
+          el._innerHTMLChanges += 1;
+          el.children = [];
+          if (tagName === 'select') el.options = [];
+        },
+      };
+      return el;
+    };
+    const bodyEl = makeEl('body');
+    const fakeDocument = {
+      body: bodyEl,
+      documentElement: bodyEl,
+      createElement: (tag: string) => makeEl(tag),
+      getElementById: (id: string) => elements.get(id) ?? null,
+    };
+    const voiceSubscribers = new Set<(ev: unknown) => void>();
+    const stopListeningMock = vi.fn(async () => {});
+    const startListeningMock = vi.fn(async () => ({ ok: true }));
+    const setInputDeviceMock = vi.fn(async (uid: string) => uid);
+    const fakeWindow: Record<string, unknown> = {
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      __IMCODES_PC_APP__: {
+        voice: {
+          getInputDevices: vi.fn(async () => [
+            { uid: 'bt-1', name: 'AirPods Pro', transport: 'bluetooth', isDefault: true, isPhysical: false },
+            { uid: 'usb-1', name: 'LG USB Audio', transport: 'usb', isDefault: false, isPhysical: true },
+          ]),
+          getInputDevice: vi.fn(async () => 'auto'),
+          setInputDevice: setInputDeviceMock,
+          startListening: startListeningMock,
+          stopListening: stopListeningMock,
+          subscribe: vi.fn((fn: (ev: unknown) => void) => {
+            voiceSubscribers.add(fn);
+            return () => { voiceSubscribers.delete(fn); };
+          }),
+        },
+      },
+    };
+    const runner = new Function('window', 'document', `return ${injectedScript}`);
+    expect(runner(fakeWindow, fakeDocument)).toEqual({ mounted: true });
 
-    // Closing the mic-test window aborts active test listening and blocks further IPC actions
-    modal.close();
+    const overlay = elements.get(MIC_TEST_OVERLAY_ID)!;
+    expect(overlay).toBeDefined();
+    expect(overlay.style.position).toBe('fixed');
+    const selectEl = elements.get('imcodes-mic-test-select')!;
+    const waveformEl = elements.get('imcodes-mic-test-waveform')!;
+    expect(waveformEl.children).toHaveLength(16);
+
     await vi.waitFor(() => {
-      expect(spawnedChildren[1].kill).toHaveBeenCalledWith('SIGTERM');
+      expect(selectEl.children).toHaveLength(3);
     });
-    await expect(
-      actionHandler({ sender: modal.wc }, { action: 'start' }),
-    ).rejects.toThrow('Blocked untrusted mic-test IPC invocation');
+    const initialRebuilds = selectEl._innerHTMLChanges;
+
+    // Click Start Test, emit level + transcript ticks, and verify <select> is NOT rebuilt on level updates
+    elements.get('imcodes-mic-test-toggle')!.dispatchEvent('click');
+    await vi.waitFor(() => expect(startListeningMock).toHaveBeenCalledTimes(1));
+
+    for (const sub of voiceSubscribers) {
+      sub({ type: 'start' });
+      sub({ type: 'level', value: 0.72 });
+      sub({ type: 'level', value: 0.45 });
+      sub({ type: 'result', text: 'floating mic test', isFinal: true });
+    }
+    expect(selectEl._innerHTMLChanges).toBe(initialRebuilds);
+    expect(elements.get('imcodes-mic-test-level-pct')!.textContent).toBe('45%');
+    expect(waveformEl.children[15].style.height).not.toBe('4px');
+    expect(elements.get('imcodes-mic-test-transcript')!.textContent).toBe('floating mic test');
+
+    // Switching device persists uid and aborts + restarts listening cleanly
+    selectEl.value = 'usb-1';
+    selectEl.dispatchEvent('change');
+    await vi.waitFor(() => {
+      expect(setInputDeviceMock).toHaveBeenCalledWith('usb-1');
+      expect(startListeningMock).toHaveBeenCalledTimes(2);
+    });
+    expect(stopListeningMock).toHaveBeenCalledWith({ abort: true });
+
+    // Closing overlay via × unsubscribes, stops active test listening, and removes DOM node
+    elements.get('imcodes-mic-test-close')!.dispatchEvent('click');
+    expect(elements.get(MIC_TEST_OVERLAY_ID)).toBeUndefined();
+    expect(voiceSubscribers.size).toBe(0);
+    expect(stopListeningMock).toHaveBeenLastCalledWith({ abort: true });
   });
 });

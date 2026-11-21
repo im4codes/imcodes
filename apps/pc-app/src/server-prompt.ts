@@ -429,13 +429,11 @@ export function buildServerPromptDataUrl(opts?: {
 export interface PromptWindowLike {
   loadURL(url: string): Promise<void> | void;
   close(): void;
-  focus?(): void;
   isDestroyed(): boolean;
   on(event: 'closed', listener: () => void): unknown;
   webContents: {
     on(event: 'will-navigate', listener: (event: { preventDefault(): void }, url: string) => void): unknown;
     setWindowOpenHandler(handler: (details: { url: string }) => { action: 'deny' }): void;
-    send?(channel: string, ...args: unknown[]): void;
   };
 }
 
@@ -447,7 +445,7 @@ export type PromptWindowFactory = (options: {
   maximizable: boolean;
   modal: boolean;
   title: string;
-  webPreferences: typeof MAIN_WINDOW_WEB_PREFERENCES & { partition: string; preload?: string };
+  webPreferences: typeof MAIN_WINDOW_WEB_PREFERENCES & { partition: string };
 }) => PromptWindowLike;
 
 /**

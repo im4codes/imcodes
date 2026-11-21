@@ -23,9 +23,9 @@ function resolveRuntimeIconPath(): string | undefined {
   return candidates.find((p) => existsSync(p));
 }
 
-function resolveRuntimePreloadPath(filename = 'preload.cjs'): string | undefined {
+function resolveRuntimePreloadPath(): string | undefined {
   const moduleDir = dirname(fileURLToPath(import.meta.url));
-  const candidate = resolve(moduleDir, filename);
+  const candidate = resolve(moduleDir, 'preload.cjs');
   return existsSync(candidate) ? candidate : undefined;
 }
 
@@ -42,8 +42,7 @@ export async function startPcApp(): Promise<void> {
     appName: 'IM.codes',
     userDataDir: app.getPath('userData'),
     welcomeLocale: app.getLocale(),
-    preloadPath: resolveRuntimePreloadPath('preload.cjs'),
-    micTestPreloadPath: resolveRuntimePreloadPath('mic-test-preload.cjs'),
+    preloadPath: resolveRuntimePreloadPath(),
     ipcMain,
     voiceDeps: {
       resourcesPath: process.resourcesPath,

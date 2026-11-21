@@ -735,13 +735,17 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
 
     expect(await voice.startListening({ locale: 'en-US' })).toEqual({ ok: true });
     spawned.stderr.emit('data', '[imcodes-speech] input deviceID=42 bindStatus=0 sampleRate=48000 channels=1\n');
-    spawned.stdout.emit('data', '{"type":"error","code":"no_audio_input"}\n');
+    spawned.stdout.emit('data', '{"type":"level","value":0.005}\n{"type":"level","value":0.24}\n{"type":"level","value":0.65}\n{"type":"result","text":"   ","isFinal":false}\n{"type":"result","text":"hello world","isFinal":false}\n{"type":"result","text":"hello world final","isFinal":true}\n{"type":"error","code":"no_audio_input"}\n');
     spawned.emit('exit', 1, null);
 
     expect(statSync(voiceLogPath).size).toBeLessThanOrEqual(64 * 1024);
     const logContent = readFileSync(voiceLogPath, 'utf8');
     expect(logContent).toContain('startListening model=system device=auto');
     expect(logContent).toContain('helper stderr: [imcodes-speech] input deviceID=42 bindStatus=0 sampleRate=48000 channels=1');
+    expect(logContent).toContain('first level value=0.2400');
+    expect(logContent).not.toContain('first level value=0.6500');
+    expect(logContent).toContain('first result isFinal=false len=11 text="hello world"');
+    expect(logContent).not.toContain('hello world final');
     expect(logContent).toContain('helper error code=no_audio_input');
     expect(logContent).toContain('helper exit code=1');
     await voice.dispose();

@@ -69,7 +69,6 @@ export interface PcAppShellDeps {
   appName: string;
   userDataDir: string;
   preloadPath?: string;
-  micTestPreloadPath?: string;
   ipcMain?: PcAppIpcMainLike;
   voiceDeps?: Partial<
     Pick<
@@ -436,17 +435,10 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     ...(deps.voiceDeps ?? {}),
   });
   const micTest = createPcAppMicTestController({
-    createPromptWindow: deps.createPromptWindow,
-    preloadPath: deps.micTestPreloadPath,
-    ipcMain: deps.ipcMain,
+    getMainWindow: () => mainWindow,
+    getCurrentTrustedOrigin: () => controller.currentTrustedOrigin(),
     getLocale: () => activeLocale,
-    getInputDevices: () => voice.getInputDevices(),
-    getInputDevicesSync: () => voice.getInputDevicesSync(),
-    getSelectedInputDevice: () => voice.getSelectedInputDevice(),
-    setSelectedInputDevice: (uid) => voice.setSelectedInputDevice(uid),
-    startTestListening: (onEvent, locale) => voice.startListening({ locale, onEvent }),
-    stopTestListening: (options) => voice.stopListening(options),
-    onDeviceChanged: () => rebuildMenu(),
+    stopListening: (options) => voice.stopListening(options),
   });
   if (deps.ipcMain) {
     voice.registerIpc(deps.ipcMain);
