@@ -437,12 +437,17 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     writeFileSync(join(fakePkgDir, 'Package.swift'), '// swift-tools-version: 5.9\n');
 
     const warnings: string[] = [];
+    const fallbackCalls: Array<{ cmd: string; args: string[] }> = [];
     const builtNoMetallib = buildMacosSpeechMlxHelper({
       pkgDir: fakePkgDir,
       outDir: join(work, 'out-no-metallib'),
       arch: 'arm64',
       warnFn: (m) => warnings.push(m),
       execFn: vi.fn((cmd, args) => {
+        fallbackCalls.push({ cmd, args });
+        if (cmd === 'xcodebuild') {
+          throw new Error('xcodebuild unavailable');
+        }
         expect(cmd).toBe('swift');
         expect(args).toEqual(['build', '--package-path', fakePkgDir, '--arch', 'arm64', '-c', 'release']);
         const relDir = join(fakePkgDir, '.build', 'arm64-apple-macosx', 'release');
@@ -451,27 +456,44 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
         return '';
       }),
     });
+    expect(fallbackCalls.map((c) => c.cmd)).toEqual(['xcodebuild', 'swift']);
     expect(builtNoMetallib?.binPath).toBe(join(work, 'out-no-metallib', 'imcodes-speech-mlx'));
     expect(builtNoMetallib?.metallibPath).toBeNull();
+    expect(warnings.some((w) => w.includes('xcodebuild for Qwen3-ASR MLX failed'))).toBe(true);
     expect(warnings.some((w) => w.includes('MetalToolchain'))).toBe(true);
 
-    expect(buildMacosSpeechMlxHelper({ pkgDir: fakePkgDir, outDir: join(work, 'out-x64'), arch: 'x64' })).toBeNull();
+    const x64Exec = vi.fn();
+    expect(buildMacosSpeechMlxHelper({ pkgDir: fakePkgDir, outDir: join(work, 'out-x64'), arch: 'x64', execFn: x64Exec })).toBeNull();
+    expect(x64Exec).not.toHaveBeenCalled();
 
-    // Now simulate release build emitting both imcodes-speech-mlx and default.metallib
+    // Primary xcodebuild path: emits imcodes-speech-mlx and default.metallib under .build/xcode-dd/Build/Products/Release
     const outWithMetallib = join(work, 'out-with-metallib');
+    const xcodeExec = vi.fn((cmd, args) => {
+      expect(cmd).toBe('xcodebuild');
+      expect(args).toEqual([
+        '-scheme',
+        'ImcodesSpeechMlx',
+        '-configuration',
+        'Release',
+        '-destination',
+        'platform=macOS,arch=arm64',
+        '-derivedDataPath',
+        join(fakePkgDir, '.build', 'xcode-dd'),
+      ]);
+      const releaseDir = join(fakePkgDir, '.build', 'xcode-dd', 'Build', 'Products', 'Release');
+      const bundleResDir = join(releaseDir, 'mlx-swift_Cmlx.bundle', 'Contents', 'Resources');
+      mkdirSync(bundleResDir, { recursive: true });
+      writeFileSync(join(releaseDir, 'imcodes-speech-mlx'), '#!/bin/sh\necho "{}"\n', { mode: 0o755 });
+      writeFileSync(join(bundleResDir, 'default.metallib'), 'METALLIB');
+      return '';
+    });
     const builtFull = buildMacosSpeechMlxHelper({
       pkgDir: fakePkgDir,
       outDir: outWithMetallib,
       arch: 'universal',
-      execFn: vi.fn(() => {
-        const relDir = join(fakePkgDir, '.build', 'arm64-apple-macosx', 'release');
-        const bundleResDir = join(relDir, 'mlx-swift_Cmlx.bundle', 'Contents', 'Resources');
-        mkdirSync(bundleResDir, { recursive: true });
-        writeFileSync(join(relDir, 'imcodes-speech-mlx'), '#!/bin/sh\necho "{}"\n', { mode: 0o755 });
-        writeFileSync(join(bundleResDir, 'default.metallib'), 'METALLIB');
-        return '';
-      }),
+      execFn: xcodeExec,
     });
+    expect(xcodeExec).toHaveBeenCalledTimes(1);
     expect(builtFull).toEqual({
       binPath: join(outWithMetallib, 'imcodes-speech-mlx'),
       metallibPath: join(outWithMetallib, 'mlx.metallib'),

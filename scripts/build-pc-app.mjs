@@ -195,8 +195,9 @@ function findReleaseMetallib(rootDir) {
 }
 
 /**
- * Compile the macOS Apple Silicon Qwen3-ASR MLX helper (`imcodes-speech-mlx`) via SwiftPM release build
- * and locate any generated `mlx.metallib` / `default.metallib`.
+ * Compile the macOS Apple Silicon Qwen3-ASR MLX helper (`imcodes-speech-mlx`) via `xcodebuild`
+ * (required so `mlx-swift` Metal shaders compile into `mlx.metallib` / `default.metallib`),
+ * falling back to `swift build` when `xcodebuild` is unavailable or fails.
  * Returns `null` on Intel-only (`x64`) builds or when the host lacks MLX build support (system fallback).
  */
 export function buildMacosSpeechMlxHelper({
@@ -216,26 +217,70 @@ export function buildMacosSpeechMlxHelper({
   }
   const absPkgDir = resolve(pkgDir);
   const absOutDir = resolve(outDir);
+  const derivedDataDir = join(absPkgDir, '.build', 'xcode-dd');
+
+  let builtBin = null;
+  let builtMetallib = null;
+
   try {
-    execFn('swift', ['build', '--package-path', absPkgDir, '--arch', 'arm64', '-c', 'release'], {
-      cwd: absPkgDir,
-      stdio: 'inherit',
-    });
+    execFn(
+      'xcodebuild',
+      [
+        '-scheme',
+        'ImcodesSpeechMlx',
+        '-configuration',
+        'Release',
+        '-destination',
+        'platform=macOS,arch=arm64',
+        '-derivedDataPath',
+        derivedDataDir,
+      ],
+      {
+        cwd: absPkgDir,
+        stdio: 'inherit',
+      },
+    );
+    const xcodeReleaseDir = join(derivedDataDir, 'Build', 'Products', 'Release');
+    const xcodeBin = join(xcodeReleaseDir, 'imcodes-speech-mlx');
+    if (existsSync(xcodeBin)) {
+      builtBin = xcodeBin;
+      builtMetallib = findReleaseMetallib(xcodeReleaseDir);
+    } else {
+      warnFn(
+        `[pc-app build] xcodebuild produced no imcodes-speech-mlx binary under ${xcodeReleaseDir}; falling back to swift build`,
+      );
+    }
   } catch (err) {
     warnFn(
-      `[pc-app build] swift build for Qwen3-ASR MLX failed (${err instanceof Error ? err.message : String(err)}); falling back to system speech`,
+      `[pc-app build] xcodebuild for Qwen3-ASR MLX failed (${err instanceof Error ? err.message : String(err)}); falling back to swift build`,
     );
-    return null;
   }
 
-  const binCandidates = [
-    join(absPkgDir, '.build', 'release', 'imcodes-speech-mlx'),
-    join(absPkgDir, '.build', 'arm64-apple-macosx', 'release', 'imcodes-speech-mlx'),
-  ];
-  const builtBin = binCandidates.find((p) => existsSync(p));
   if (!builtBin) {
-    warnFn(`[pc-app build] imcodes-speech-mlx binary not produced under ${absPkgDir}/.build; falling back to system speech`);
-    return null;
+    try {
+      execFn('swift', ['build', '--package-path', absPkgDir, '--arch', 'arm64', '-c', 'release'], {
+        cwd: absPkgDir,
+        stdio: 'inherit',
+      });
+    } catch (err) {
+      warnFn(
+        `[pc-app build] swift build for Qwen3-ASR MLX failed (${err instanceof Error ? err.message : String(err)}); falling back to system speech`,
+      );
+      return null;
+    }
+
+    const binCandidates = [
+      join(absPkgDir, '.build', 'release', 'imcodes-speech-mlx'),
+      join(absPkgDir, '.build', 'arm64-apple-macosx', 'release', 'imcodes-speech-mlx'),
+    ];
+    builtBin = binCandidates.find((p) => existsSync(p)) ?? null;
+    if (!builtBin) {
+      warnFn(`[pc-app build] imcodes-speech-mlx binary not produced under ${absPkgDir}/.build; falling back to system speech`);
+      return null;
+    }
+    builtMetallib =
+      findReleaseMetallib(join(absPkgDir, '.build', 'arm64-apple-macosx', 'release'))
+      ?? findReleaseMetallib(join(absPkgDir, '.build', 'release'));
   }
 
   mkdirSync(absOutDir, { recursive: true });
@@ -243,9 +288,6 @@ export function buildMacosSpeechMlxHelper({
   cpSync(builtBin, destBin);
   chmodSync(destBin, 0o755);
 
-  const builtMetallib =
-    findReleaseMetallib(join(absPkgDir, '.build', 'arm64-apple-macosx', 'release'))
-    ?? findReleaseMetallib(join(absPkgDir, '.build', 'release'));
   let destMetallib = null;
   if (builtMetallib) {
     destMetallib = join(absOutDir, 'mlx.metallib');
