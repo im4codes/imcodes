@@ -802,6 +802,13 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: AVAudioSession.interruptionNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(engineConfigurationChanged(_:)), name: .AVAudioEngineConfigurationChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(didReceiveMemoryWarning(_:)), name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        SharedSpeechRecognizerStore.shared.ensureBackgroundModelDownloadIfNeeded { [weak self] ready in
+            guard ready else { return }
+            self?.warmUpRecognizerOnWorkerIfIdle()
+        }
+    }
+
+    private func warmUpRecognizerOnWorkerIfIdle() {
         coordinator.worker.async { [weak self] in
             guard let self = self, let recognizer = self.ensureRecognizer() else { return }
             recognizer.warmupMetalIfNeeded { [weak self] in
@@ -861,7 +868,14 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         guard isMetalDeviceAvailable() else { return false }
         return SharedSpeechRecognizerStore.shared.hasRequiredModelFiles
     }
-    @objc public func available(_ call: CAPPluginCall) { call.resolve(["available": modelAvailable]) }
+    @objc public func available(_ call: CAPPluginCall) {
+        let downloadStatus = SharedSpeechRecognizerStore.shared.downloadStatus
+        call.resolve([
+            "available": modelAvailable,
+            "downloading": downloadStatus.isDownloading,
+            "progress": downloadStatus.progress,
+        ])
+    }
     func requestRecordPermission(
         requester: @escaping (@escaping (Bool) -> Void) -> Void = { completion in
             AVAudioSession.sharedInstance().requestRecordPermission(completion)
@@ -1351,6 +1365,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
     }
     @objc private func didBecomeActive(_ notification: Notification) {
         coordinator.setBackgrounded(false)
+        SharedSpeechRecognizerStore.shared.ensureBackgroundModelDownloadIfNeeded { [weak self] ready in
+            guard ready else { return }
+            self?.warmUpRecognizerOnWorkerIfIdle()
+        }
     }
     @objc public func stop(_ call: CAPPluginCall) {
         DispatchQueue.main.async {
@@ -1657,30 +1675,74 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
 final class SharedSpeechRecognizerStore {
     static let shared = SharedSpeechRecognizerStore()
     private let lock = NSLock()
+    private let downloader: IosSpeechModelDownloader
+    private let bundleResourceURL: URL?
+    private let fileManager: FileManager
     private var cachedRecognizer: SpeechRecognizer?
     private var phoneCaptureActive = false
 
-    private init() {}
+    init(
+        downloader: IosSpeechModelDownloader = .shared,
+        bundleResourceURL: URL? = Bundle.module.resourceURL,
+        fileManager: FileManager = .default
+    ) {
+        self.downloader = downloader
+        self.bundleResourceURL = bundleResourceURL
+        self.fileManager = fileManager
+    }
+
+    static func directoryContainsRequiredModelFiles(_ root: URL, fileManager: FileManager = .default) -> Bool {
+        ["config.json", "model.safetensors", "vocab.json", "merges.txt", "tokenizer_config.json", "hotwords.txt"].allSatisfy {
+            fileManager.isReadableFile(atPath: root.appendingPathComponent($0).path)
+        }
+    }
+
+    var bundledModelRoot: URL? {
+        guard let root = bundleResourceURL?.appendingPathComponent("ios-models", isDirectory: true),
+              Self.directoryContainsRequiredModelFiles(root, fileManager: fileManager) else {
+            return nil
+        }
+        return root
+    }
 
     var modelRoot: URL? {
-        Bundle.module.resourceURL?.appendingPathComponent("ios-models", isDirectory: true)
+        if downloader.hasVerifiedLocalModels {
+            return downloader.modelsDirectory
+        }
+        return bundledModelRoot
     }
 
     var hasRequiredModelFiles: Bool {
         guard let root = modelRoot else { return false }
-        return ["config.json", "model.safetensors", "vocab.json", "merges.txt", "tokenizer_config.json", "hotwords.txt"].allSatisfy {
-            FileManager.default.isReadableFile(atPath: root.appendingPathComponent($0).path)
-        }
+        return Self.directoryContainsRequiredModelFiles(root, fileManager: fileManager)
     }
 
     var modelAvailable: Bool {
         SpeechRecognizer.isMetalSupported && hasRequiredModelFiles
     }
 
+    var downloadStatus: IosSpeechDownloadStatus {
+        if hasRequiredModelFiles { return .ready }
+        return downloader.status
+    }
+
+    func ensureBackgroundModelDownloadIfNeeded(completion: ((Bool) -> Void)? = nil) {
+        if bundledModelRoot != nil || downloader.hasVerifiedLocalModels {
+            completion?(true)
+            return
+        }
+        downloader.ensureDownloadedIfNeeded(completion: completion)
+    }
+
     func ensureRecognizer() -> SpeechRecognizer? {
         lock.lock(); defer { lock.unlock() }
         if let existing = cachedRecognizer { return existing }
-        guard modelAvailable, let root = modelRoot, let created = SpeechRecognizer(root: root) else { return nil }
+        guard modelAvailable, let root = modelRoot else { return nil }
+        if root == downloader.modelsDirectory && !downloader.verifyAllAssetsOnDisk() {
+            downloader.ensureDownloadedIfNeeded(forceRetry: true)
+            return nil
+        }
+        guard let created = SpeechRecognizer(root: root) else { return nil }
         cachedRecognizer = created
         return created
     }

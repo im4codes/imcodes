@@ -1,5 +1,6 @@
 import UIKit
 import Capacitor
+import StreamingSpeechPlugin
 import UserNotifications
 import WebKit
 
@@ -187,6 +188,20 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // Feel free to add additional processing here, but if you want the App API to support
         // tracking app url opens, make sure to keep this call
         return ApplicationDelegateProxy.shared.application(application, continue: userActivity, restorationHandler: restorationHandler)
+    }
+
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        if IosSpeechModelDownloader.handleBackgroundSessionEvents(
+            identifier: identifier,
+            completionHandler: completionHandler
+        ) {
+            return
+        }
+        completionHandler()
     }
 
     private func registerLocalPluginsIfNeeded() {
