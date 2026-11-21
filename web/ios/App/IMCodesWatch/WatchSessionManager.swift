@@ -31,6 +31,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     private static let cachedGlobalTasksKey = "imcodes.watch.cachedGlobalTasks.v1"
+    private static let cachedGlobalTasksFileName = "imcodes.watch.cachedGlobalTasks.v1.json"
     private static let selectedServerIdKey = "watchSelectedServerId"
     private static let selectedTaskServerIdsKey = "watchSelectedTaskServerIds"
     private static let manualSessionsKeyPrefix = "watchManualSessions:"
@@ -131,6 +132,36 @@ final class WatchSessionManager: NSObject, ObservableObject {
         "\(cachedSessionsKeyPrefix)\(serverId)"
     }
 
+    private static func sanitizedCacheComponent(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._"))
+        let mapped = value.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+        let result = String(mapped)
+        return result.isEmpty || result == "." || result == ".." ? "_" : result
+    }
+
+    private static func cachedSessionsFileName(for serverId: String) -> String {
+        "imcodes.watch.cachedSessions.\(sanitizedCacheComponent(serverId)).json"
+    }
+
+    private static func cacheFileURL(named name: String) -> URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent(name, isDirectory: false)
+    }
+
+    private static func readCacheData(named name: String) -> Data? {
+        guard let url = cacheFileURL(named: name) else { return nil }
+        return try? Data(contentsOf: url)
+    }
+
+    private static func writeCacheData(_ data: Data, named name: String) {
+        guard let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return
+        }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(name, isDirectory: false)
+        try? data.write(to: url, options: .atomic)
+    }
+
     private func hydrateCachedSessions(for serverId: String) {
         if serverId == Self.allPinnedServerId {
             for server in displayServers {
@@ -138,7 +169,17 @@ final class WatchSessionManager: NSObject, ObservableObject {
             }
             return
         }
-        guard let data = UserDefaults.standard.data(forKey: Self.cachedSessionsKey(for: serverId)),
+        let fileName = Self.cachedSessionsFileName(for: serverId)
+        let legacyKey = Self.cachedSessionsKey(for: serverId)
+        var data = Self.readCacheData(named: fileName)
+        if data == nil, let legacyData = UserDefaults.standard.data(forKey: legacyKey) {
+            data = legacyData
+            Self.writeCacheData(legacyData, named: fileName)
+        }
+        if UserDefaults.standard.object(forKey: legacyKey) != nil {
+            UserDefaults.standard.removeObject(forKey: legacyKey)
+        }
+        guard let data,
               let decoded = try? JSONDecoder().decode([WatchSessionRow].self, from: data) else {
             return
         }
@@ -583,7 +624,25 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     private func hydrateCachedContext() {
-        if let cachedTaskData = UserDefaults.standard.data(forKey: Self.cachedGlobalTasksKey),
+        var cachedTaskData = Self.readCacheData(named: Self.cachedGlobalTasksFileName)
+        if cachedTaskData == nil, let legacyTaskData = UserDefaults.standard.data(forKey: Self.cachedGlobalTasksKey) {
+            cachedTaskData = legacyTaskData
+            Self.writeCacheData(legacyTaskData, named: Self.cachedGlobalTasksFileName)
+        }
+        if UserDefaults.standard.object(forKey: Self.cachedGlobalTasksKey) != nil {
+            UserDefaults.standard.removeObject(forKey: Self.cachedGlobalTasksKey)
+        }
+        for key in UserDefaults.standard.dictionaryRepresentation().keys where key.hasPrefix(Self.cachedSessionsKeyPrefix) {
+            let serverId = String(key.dropFirst(Self.cachedSessionsKeyPrefix.count))
+            if let legacyData = UserDefaults.standard.data(forKey: key), !serverId.isEmpty {
+                let fileName = Self.cachedSessionsFileName(for: serverId)
+                if Self.readCacheData(named: fileName) == nil {
+                    Self.writeCacheData(legacyData, named: fileName)
+                }
+            }
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        if let cachedTaskData,
            let decodedTasks = try? JSONDecoder().decode([WatchGlobalTaskRow].self, from: cachedTaskData) {
             globalTasks = decodedTasks
         }
@@ -677,7 +736,11 @@ final class WatchSessionManager: NSObject, ObservableObject {
             networkLoadedSessionServers.insert(serverId)
             let rowsToCache = prepareSessionsForCache(response.sessions, serverId: serverId)
             if let encoded = try? JSONEncoder().encode(rowsToCache) {
-                UserDefaults.standard.set(encoded, forKey: Self.cachedSessionsKey(for: serverId))
+                Self.writeCacheData(encoded, named: Self.cachedSessionsFileName(for: serverId))
+            }
+            let legacyKey = Self.cachedSessionsKey(for: serverId)
+            if UserDefaults.standard.object(forKey: legacyKey) != nil {
+                UserDefaults.standard.removeObject(forKey: legacyKey)
             }
             isUsingFallbackSnapshot = false
             lastErrorMessage = nil
@@ -703,7 +766,10 @@ final class WatchSessionManager: NSObject, ObservableObject {
             let nextTasks = try await restClient.fetchGlobalTasks(baseUrl: baseUrl, apiKey: apiKey)
             globalTasks = nextTasks
             if let encoded = try? JSONEncoder().encode(nextTasks) {
-                UserDefaults.standard.set(encoded, forKey: Self.cachedGlobalTasksKey)
+                Self.writeCacheData(encoded, named: Self.cachedGlobalTasksFileName)
+            }
+            if UserDefaults.standard.object(forKey: Self.cachedGlobalTasksKey) != nil {
+                UserDefaults.standard.removeObject(forKey: Self.cachedGlobalTasksKey)
             }
         } catch {
             // Task status visibility is additive; keep cached tasks without failing server/session loads.
