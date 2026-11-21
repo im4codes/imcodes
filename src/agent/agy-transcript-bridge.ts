@@ -21,7 +21,7 @@ export interface AgyTranscriptCursor {
 const BACKGROUND_TASK_RUNNING_RE = /Tool is running as a background task with task id:/i;
 const isFiniteNonNegative = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0;
-function isAgyCompactionTranscriptRow(row: AgyTranscriptRow): boolean {
+export function isAgyCompactionTranscriptRow(row: AgyTranscriptRow): boolean {
   if (row.status !== 'DONE' || typeof row.content !== 'string') return false;
   const trimmed = row.content.trimStart();
   return (row.type === 'USER_INPUT' && row.source === 'USER_EXPLICIT' && trimmed.startsWith('<CONTEXT_SUMMARY>'))

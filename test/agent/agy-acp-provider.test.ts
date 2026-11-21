@@ -5292,4 +5292,110 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       output_tokens: 1000,
     });
   });
+
+  it('falls back to ACP PromptResponse outputTokens when the final PLANNER_RESPONSE omits output_tokens while preserving 324k ctx', async () => {
+    const { provider, root } = await setup('usage-cumulative');
+    const id = 'deck_agy_partial_output';
+    await provider.createSession({
+      sessionKey: id,
+      sessionName: id,
+      cwd: root,
+      agentId: 'model-a',
+      resumeId: 'native-1',
+    });
+
+    const logsDir = path.join(root, '.gemini/antigravity-cli/brain/native-1/.system_generated/logs');
+    await mkdir(logsDir, { recursive: true });
+    const fullPath = path.join(logsDir, 'transcript_full.jsonl');
+    await writeFile(fullPath, '');
+
+    const logFile = path.join(root, 'rpc.jsonl');
+    const holdFile = `${logFile}.hold`;
+    await writeFile(holdFile, 'hold');
+
+    const usageEvents: Array<{ finalized?: boolean; usage: any }> = [];
+    const completes: any[] = [];
+    provider.onUsage((_sid, evt) => usageEvents.push(evt));
+    provider.onComplete((_sid, msg) => completes.push(msg));
+
+    await provider.send(id, 'partial step output');
+
+    // Step 1 reports output_tokens=400, final Step 2 reports 324k ctx WITHOUT output_tokens.
+    await appendFile(fullPath, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: '', tool_calls: [{ name: 'run_command', args: {} }], input_tokens: 3100, cache_read_tokens: 211000, output_tokens: 400 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 211000)).toBe(true), { timeout: 5000 });
+    await appendFile(fullPath, JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'done', input_tokens: 3324, cache_read_tokens: 320676 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 320676 && e.usage.input_tokens === 3324)).toBe(true), { timeout: 5000 });
+
+    await unlink(holdFile);
+    await vi.waitFor(() => expect(completes).toHaveLength(1), { timeout: 5000 });
+
+    expect(completes[0].metadata.usage).toMatchObject({
+      input_tokens: 3324,
+      cache_read_input_tokens: 320676,
+      output_tokens: 22308,
+    });
+    const finalizedEvent = usageEvents.find((e) => e.finalized === true);
+    expect(finalizedEvent?.usage).toMatchObject({
+      input_tokens: 3324,
+      cache_read_input_tokens: 320676,
+      output_tokens: 22308,
+    });
+  });
+
+  it('clears pre-compaction agyLatestStepUsage and resets to summary estimate when mid-turn CHECKPOINT arrives before turn end', async () => {
+    const { provider, root } = await setup('usage-cumulative');
+    const id = 'deck_agy_midturn_compact';
+    await provider.createSession({
+      sessionKey: id,
+      sessionName: id,
+      cwd: root,
+      agentId: 'model-a',
+      resumeId: 'native-1',
+    });
+
+    const logsDir = path.join(root, '.gemini/antigravity-cli/brain/native-1/.system_generated/logs');
+    await mkdir(logsDir, { recursive: true });
+    const fullPath = path.join(logsDir, 'transcript_full.jsonl');
+    await writeFile(fullPath, '');
+
+    const logFile = path.join(root, 'rpc.jsonl');
+    const holdFile = `${logFile}.hold`;
+    await writeFile(holdFile, 'hold');
+
+    const usageEvents: Array<{ finalized?: boolean; usage: any }> = [];
+    const completes: any[] = [];
+    provider.onUsage((_sid, evt) => usageEvents.push(evt));
+    provider.onComplete((_sid, msg) => completes.push(msg));
+
+    await provider.send(id, 'compact mid-turn');
+
+    // Step 1 reports 214,100 ctx, then CHECKPOINT compaction (~1000 tokens) occurs with no subsequent PLANNER_RESPONSE.
+    await appendFile(fullPath, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: '', tool_calls: [{ name: 'run_command', args: {} }], input_tokens: 3100, cache_read_tokens: 211000, output_tokens: 400 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 211000)).toBe(true), { timeout: 5000 });
+
+    const beforeCompactCount = usageEvents.length;
+    await appendFile(fullPath, JSON.stringify({ step_index: 2, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T08:00:00Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.length).toBeGreaterThan(beforeCompactCount), { timeout: 5000 });
+    const afterCompactLive = usageEvents.at(-1)!.usage;
+    expect(afterCompactLive.context_usage_estimated).toBe(true);
+    expect(afterCompactLive.cache_read_input_tokens).toBe(0);
+    expect(afterCompactLive.input_tokens).toBeLessThan(5000);
+
+    await unlink(holdFile);
+    await vi.waitFor(() => expect(completes).toHaveLength(1), { timeout: 5000 });
+
+    const finalUsage = completes[0].metadata.usage;
+    expect(finalUsage.context_usage_estimated).toBe(true);
+    expect(finalUsage.cache_read_input_tokens).toBe(0);
+    expect(finalUsage.input_tokens).toBeGreaterThan(500);
+    expect(finalUsage.input_tokens).toBeLessThan(5000);
+    expect(finalUsage.output_tokens).toBe(400);
+    const finalizedEvent = usageEvents.find((e) => e.finalized === true);
+    expect(finalizedEvent?.usage).toMatchObject({
+      context_usage_estimated: true,
+      cache_read_input_tokens: 0,
+      output_tokens: 400,
+    });
+    expect(finalizedEvent?.usage.input_tokens).toBeLessThan(5000);
+  });
 });

@@ -17,6 +17,10 @@ export class AgyContextUsage {
   private nativeCreated = 0;
   private hasNative = false;
 
+  get hasNativeOccupancy(): boolean {
+    return this.hasNative;
+  }
+
   resetToSummary(tokens: number): void {
     this.tokens = Math.max(0, tokens);
     this.nativeUsed = undefined;
@@ -50,7 +54,8 @@ export class AgyContextUsage {
       this.nativeCreated = 0;
       this.hasNative = true;
     }
-    const rawOccupancy = (input ?? 0) + (cache ?? 0) + (created ?? 0);
+    const isEstimatedInput = raw.context_usage_estimated === true;
+    const rawOccupancy = isEstimatedInput ? 0 : (input ?? 0) + (cache ?? 0) + (created ?? 0);
     if (!this.nativeUsed && rawOccupancy > 0) {
       this.nativeInput = input ?? 0;
       this.nativeCache = cache ?? 0;

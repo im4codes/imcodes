@@ -1,5 +1,6 @@
 import { AgyForegroundOwnership } from '../agy-foreground-ownership.js';
-import { AgyTranscriptBridge, agyTranscriptFile, type AgyTranscriptCursor, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
+import { AgyTranscriptBridge, agyTranscriptFile, isAgyCompactionTranscriptRow, type AgyTranscriptCursor, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
+import { countTokensFallback } from '../../context/tokenizer.js';
 import { AgySubagentTracker, extractAgySubagentEvidenceChildIds, isAgyInteractiveTool, isAgySubagentTool, normalizeAgyToolName, stableJson } from '../agy-subagents.js';
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
 import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_RECOVERY_HINT } from '../../../shared/agy-agent.js';
@@ -361,7 +362,9 @@ interface KimiSdkSessionState {
   lastTurnUsage?: Record<string, unknown>;
   agyLatestStepUsage?: Record<string, unknown>;
   agyTurnOutputTokens?: number;
+  agyTurnOutputComplete?: boolean;
   agyNativeUsedInTurn?: boolean;
+  agyCompactedInTurn?: boolean;
   agyContextUsage?: AgyContextUsage;
   agyCompactionWatermark?: AgyCompactionWatermark;
   agySubagents?: AgySubagentTracker;
@@ -1553,13 +1556,28 @@ export class KimiSdkProvider implements TransportProvider {
       }
       return;
     }
-    if (state.promptInFlight || state.agyReactive) {
+    if (isAgyCompactionTranscriptRow(row)) {
+      state.agyLatestStepUsage = undefined;
+      state.agyNativeUsedInTurn = undefined;
+      state.agyCompactedInTurn = true;
+      (state.agyContextUsage ??= new AgyContextUsage()).resetToSummary(countTokensFallback(row.content ?? ''));
+      if (state.promptInFlight || state.agyReactive) {
+        state.lastActivityAt = Date.now();
+        this.emitAgyUsage(sessionId, state);
+      }
+    } else if (state.promptInFlight || state.agyReactive) {
       state.lastActivityAt = Date.now();
       const belongsToCurrentTurn = claimedByForeground || !state.agyReactive || !state.promptInFlight;
       if (row.type === 'PLANNER_RESPONSE' && belongsToCurrentTurn) {
         const hasInput = typeof row.input_tokens === 'number' && Number.isFinite(row.input_tokens) && row.input_tokens >= 0;
         const hasCache = typeof row.cache_read_tokens === 'number' && Number.isFinite(row.cache_read_tokens) && row.cache_read_tokens >= 0;
         const hasOutput = typeof row.output_tokens === 'number' && Number.isFinite(row.output_tokens) && row.output_tokens >= 0;
+        if (hasOutput) {
+          state.agyTurnOutputTokens = (state.agyTurnOutputTokens ?? 0) + row.output_tokens!;
+          if (state.agyTurnOutputComplete === undefined) state.agyTurnOutputComplete = true;
+        } else {
+          state.agyTurnOutputComplete = false;
+        }
         if (hasInput || hasCache) {
           const stepUsage: Record<string, unknown> = {
             ...(hasInput ? { input_tokens: row.input_tokens } : {}),
@@ -1567,9 +1585,7 @@ export class KimiSdkProvider implements TransportProvider {
             ...(hasOutput ? { output_tokens: row.output_tokens } : {}),
           };
           state.agyLatestStepUsage = stepUsage;
-          if (hasOutput) {
-            state.agyTurnOutputTokens = (state.agyTurnOutputTokens ?? 0) + row.output_tokens!;
-          }
+          state.agyCompactedInTurn = false;
           this.emitAgyUsage(sessionId, state, stepUsage);
         } else {
           this.emitAgyUsage(sessionId, state);
@@ -1651,8 +1667,9 @@ export class KimiSdkProvider implements TransportProvider {
         : undefined;
       const supersededByBridge = bridgeStep !== undefined
         && watermark.compactionStepIndex !== undefined
-        && bridgeStep > watermark.compactionStepIndex;
-      if (!watermark.hasPostCompactionPlannerResponse && !supersededByBridge) {
+        && bridgeStep > watermark.compactionStepIndex
+        && Boolean(state.agyContextUsage?.hasNativeOccupancy);
+      if (!supersededByBridge) {
         (state.agyContextUsage ??= new AgyContextUsage()).resetToSummary(watermark.summaryTokens);
       }
     }
@@ -1959,7 +1976,9 @@ export class KimiSdkProvider implements TransportProvider {
     state.lastTurnUsage = undefined;
     state.agyLatestStepUsage = undefined;
     state.agyTurnOutputTokens = undefined;
+    state.agyTurnOutputComplete = undefined;
     state.agyNativeUsedInTurn = undefined;
+    state.agyCompactedInTurn = undefined;
     // NOTE: currentText/currentMessageId are cleared AFTER ensureSessionReady
     // inside startTurn — not here. `loadSession` replays the full conversation
     // history as `agent_message_chunk` notifications, and if we cleared before
@@ -3507,10 +3526,14 @@ export class KimiSdkProvider implements TransportProvider {
     const previousTurnModel = state.turnModel;
     const agyLatestStepUsage = state.agyLatestStepUsage;
     const agyTurnOutputTokens = state.agyTurnOutputTokens;
+    const agyTurnOutputComplete = state.agyTurnOutputComplete;
     const agyNativeUsedInTurn = state.agyNativeUsedInTurn;
+    const agyCompactedInTurn = state.agyCompactedInTurn;
     state.agyLatestStepUsage = undefined;
     state.agyTurnOutputTokens = undefined;
+    state.agyTurnOutputComplete = undefined;
     state.agyNativeUsedInTurn = undefined;
+    state.agyCompactedInTurn = undefined;
 
     try {
       if (steeringFailure !== undefined) {
@@ -3553,25 +3576,34 @@ export class KimiSdkProvider implements TransportProvider {
       // → recorded in context_turn_usage with the turn's eventId.
       const preferStepUsage = this.id === AGY_SDK_PROVIDER_ID && agyLatestStepUsage && !agyNativeUsedInTurn;
       const rawLastTurnUsage = state.lastTurnUsage;
+      const acpOutputTokens = typeof rawLastTurnUsage?.output_tokens === 'number' && Number.isFinite(rawLastTurnUsage.output_tokens) && rawLastTurnUsage.output_tokens >= 0
+        ? rawLastTurnUsage.output_tokens
+        : typeof rawLastTurnUsage?.outputTokens === 'number' && Number.isFinite(rawLastTurnUsage.outputTokens) && rawLastTurnUsage.outputTokens >= 0
+          ? rawLastTurnUsage.outputTokens
+          : undefined;
+      const resolvedOutputTokens = agyTurnOutputComplete === true && agyTurnOutputTokens !== undefined
+        ? agyTurnOutputTokens
+        : (acpOutputTokens ?? agyTurnOutputTokens);
       const effectiveTurnUsage = preferStepUsage
         ? {
             ...agyLatestStepUsage,
-            ...(agyTurnOutputTokens !== undefined
-              ? { output_tokens: agyTurnOutputTokens }
-              : rawLastTurnUsage?.output_tokens !== undefined
-                ? { output_tokens: rawLastTurnUsage.output_tokens }
-                : rawLastTurnUsage?.outputTokens !== undefined
-                  ? { output_tokens: rawLastTurnUsage.outputTokens }
-                  : {}),
+            ...(resolvedOutputTokens !== undefined ? { output_tokens: resolvedOutputTokens } : {}),
           }
-        : rawLastTurnUsage;
+        : (this.id === AGY_SDK_PROVIDER_ID && agyCompactedInTurn && !agyNativeUsedInTurn)
+          ? { ...(resolvedOutputTokens !== undefined ? { output_tokens: resolvedOutputTokens } : {}) }
+          : rawLastTurnUsage;
       const turnUsage = this.id === AGY_SDK_PROVIDER_ID
-        ? (preferStepUsage
+        ? ((preferStepUsage || (agyCompactedInTurn && !agyNativeUsedInTurn))
           ? (state.agyContextUsage ??= new AgyContextUsage()).normalize(effectiveTurnUsage)
           : { ...effectiveTurnUsage, ...(state.agyContextUsage ??= new AgyContextUsage()).normalize(effectiveTurnUsage) })
         : rawLastTurnUsage;
       state.lastTurnUsage = undefined;
-      this.emitAgyUsage(sessionId, state, turnUsage, true);
+      if (this.id === AGY_SDK_PROVIDER_ID) {
+        for (const cb of this.usageCallbacks) cb(sessionId, {
+          messageId: state.currentMessageId ?? undefined, finalized: true, usage: turnUsage as NonNullable<ProviderUsageUpdate['usage']>,
+          model: this.profile.strictModelSelection ? (state.turnModel ?? state.confirmedModel) : state.model,
+        });
+      }
       if (sessionSystemTextToCommit) state.sessionSystemTextInjected = sessionSystemTextToCommit;
 
       const isLengthLimited = stopReason === 'max_tokens' || stopReason === 'max_turn_requests';
@@ -3848,7 +3880,9 @@ export class KimiSdkProvider implements TransportProvider {
     state.lastTurnUsage = undefined;
     state.agyLatestStepUsage = undefined;
     state.agyTurnOutputTokens = undefined;
+    state.agyTurnOutputComplete = undefined;
     state.agyNativeUsedInTurn = undefined;
+    state.agyCompactedInTurn = undefined;
     state.steeringTerminal = undefined;
     state.steeringFailure = undefined;
     state.currentText = '';
