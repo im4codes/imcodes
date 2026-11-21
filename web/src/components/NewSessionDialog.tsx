@@ -136,8 +136,8 @@ export function NewSessionDialog({
   const [project, setProject] = useState("");
   const [dir, setDir] = useState("~/");
   const [gitRemoteUrl, setGitRemoteUrl] = useState("");
-  const [agentType, setAgentType] = useState<AgentType>("claude-code-sdk");
-  const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>("claude-code-sdk");
+  const [agentType, setAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
+  const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
   const [customProviderSdk, setCustomProviderSdk] = useState(false);
   const [requestedModel, setRequestedModel] = useState("");
   const [error, setError] = useState("");
@@ -218,6 +218,7 @@ export function NewSessionDialog({
   const selectAgentType = (nextAgentType: AgentType) => {
     if (!isSessionAgentTypeSelectable(nextAgentType)) return;
     if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextAgentType)) return;
+    if (nextAgentType !== agentType) setRequestedModel("");
     setAgentType(nextAgentType);
     if (!customProviderSdk) setLastUnlockedAgentType(nextAgentType);
     setError("");
@@ -230,10 +231,12 @@ export function NewSessionDialog({
       if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
       if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType)) {
         setLastUnlockedAgentType(agentType);
+        setRequestedModel("");
         setAgentType("claude-code-sdk");
       }
       return;
     }
+    if (lastUnlockedAgentType !== agentType) setRequestedModel("");
     setAgentType(lastUnlockedAgentType);
   };
   const selectedCcPreset = useMemo(
@@ -449,7 +452,10 @@ export function NewSessionDialog({
     // re-runs on every `agentType` change, immediately reverted it — so the
     // session still started as `claude-code-sdk` while the UI had briefly shown
     // otherwise. Mirrors the same guard in StartSubSessionDialog.
-    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType)) setAgentType("claude-code-sdk");
+    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType)) {
+      setRequestedModel("");
+      setAgentType("claude-code-sdk");
+    }
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [agentType, ccPreset, ccPresets, customProviderSdk]);
 

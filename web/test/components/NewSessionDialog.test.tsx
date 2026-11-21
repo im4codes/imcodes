@@ -175,9 +175,9 @@ describe('NewSessionDialog', () => {
     const options = groups.flatMap((group) => Array.from(group.querySelectorAll<HTMLButtonElement>('[data-agent-type]')).map((button) => button.dataset.agentType));
     expect(options.slice(0, 19)).toEqual([
       AGY_SDK_PROVIDER_ID,
+      'codex-sdk',
       'claude-code-sdk',
       CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
-      'codex-sdk',
       'qoder-sdk',
       'copilot-sdk',
       'cursor-headless',
@@ -202,9 +202,12 @@ describe('NewSessionDialog', () => {
     ]);
   });
 
-  it('defaults agent type to claude-code-sdk', () => {
+  it('defaults agent type to Antigravity (agy-sdk) with Codex second', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
+    expect(getAgentButton(AGY_SDK_PROVIDER_ID).getAttribute('aria-pressed')).toBe('true');
+    const sdkButtons = Array.from(document.querySelectorAll('.session-agent-group:first-child [data-agent-type]'))
+      .map((el) => el.getAttribute('data-agent-type'));
+    expect(sdkButtons.slice(0, 2)).toEqual([AGY_SDK_PROVIDER_ID, 'codex-sdk']);
     expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
     expect(screen.getByText('qwen_provider_hint')).toBeDefined();
   });
@@ -233,8 +236,8 @@ describe('NewSessionDialog', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', {
       project: 'my-app',
       dir: '~/projects/my-app',
-      agentType: 'claude-code-sdk',
-      thinking: 'high',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestedModel: AGY_DEFAULT_MODEL_ID,
     });
   });
 
@@ -246,7 +249,7 @@ describe('NewSessionDialog', () => {
     expect(hidden.style.display).toBe('none');
     expect(hidden.disabled).toBe(true);
     fireEvent.click(hidden);
-    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
+    expect(getAgentButton(AGY_SDK_PROVIDER_ID).getAttribute('aria-pressed')).toBe('true');
     expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
     fireEvent.click(screen.getByRole('button', { name: /claude_code_cli/i }));
     expect(getAgentButton('claude-code').getAttribute('aria-pressed')).toBe('true');
@@ -352,7 +355,7 @@ describe('NewSessionDialog', () => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       project: '测试',
-      agentType: 'claude-code-sdk',
+      agentType: AGY_SDK_PROVIDER_ID,
     }));
 
     act(() => ws.emit({
@@ -520,7 +523,7 @@ describe('NewSessionDialog', () => {
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    // Default agent type is claude-code-sdk, which now runs third-party CC presets via the CC SDK transport.
+    selectAgent('claude-code-sdk');
     expect(screen.getByText('api_provider')).toBeDefined();
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
@@ -672,6 +675,34 @@ describe('NewSessionDialog', () => {
       expect(screen.getByText('custom_provider_preset')).toBeDefined();
       expect((screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement).checked).toBe(true);
     });
+  });
+
+  it('restores Antigravity and clears stale AGY model when switching agents or toggling custom provider mode', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    expect(getAgentButton(AGY_SDK_PROVIDER_ID).getAttribute('aria-pressed')).toBe('true');
+
+    // Switching from default agy-sdk to claude-code-sdk clears stale AGY requestedModel
+    selectAgent('claude-code-sdk');
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'cc-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/cc-app' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    const ccPayload = ws.sendSessionCommand.mock.calls[0]?.[1];
+    expect(ccPayload?.agentType).toBe('claude-code-sdk');
+    expect(ccPayload?.requestedModel).toBeUndefined();
+
+    // Switch back to agy-sdk, then toggle custom provider mode on & off: restores agy-sdk
+    selectAgent(AGY_SDK_PROVIDER_ID);
+    await waitFor(() => expect(getAgentButton(AGY_SDK_PROVIDER_ID).getAttribute('aria-pressed')).toBe('true'));
+
+    const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
+    fireEvent.click(toggle);
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(getAgentButton(AGY_SDK_PROVIDER_ID).getAttribute('aria-pressed')).toBe('true'));
   });
 
   it('resets the model when switching third-party provider presets even if catalogs overlap', async () => {
@@ -943,7 +974,7 @@ describe('NewSessionDialog', () => {
       fireEvent.click(hidden);
       expect(hidden.getAttribute('aria-pressed')).toBe('false');
     }
-    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
+    expect(getAgentButton(AGY_SDK_PROVIDER_ID).getAttribute('aria-pressed')).toBe('true');
   });
 
   it('uses dynamically discovered kimi-sdk models when starting a session', async () => {

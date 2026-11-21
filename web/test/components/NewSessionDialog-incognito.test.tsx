@@ -120,7 +120,7 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     await waitFor(() => {
       expect(wsCap.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
         project: 'privproj',
-        agentType: 'claude-code-sdk',
+        agentType: 'agy-sdk',
         incognito: true,
       }));
     });
