@@ -158,10 +158,27 @@ function defaultBuildDevHelper(outPath: string, arch = process.arch === 'x64' ? 
   if (!srcPath) return null;
   try {
     mkdirSync(dirname(outPath), { recursive: true });
-    execFileSync('swiftc', ['-O', '-target', `${arch}-apple-macosx12.0`, srcPath, '-o', outPath], {
-      stdio: 'pipe',
-      timeout: 60_000,
-    });
+    execFileSync(
+      'swiftc',
+      [
+        '-O',
+        '-target',
+        `${arch}-apple-macosx12.0`,
+        '-framework',
+        'Cocoa',
+        '-framework',
+        'CoreGraphics',
+        '-framework',
+        'ApplicationServices',
+        srcPath,
+        '-o',
+        outPath,
+      ],
+      {
+        stdio: 'pipe',
+        timeout: 60_000,
+      },
+    );
     chmodSync(outPath, 0o755);
     return outPath;
   } catch {
@@ -183,6 +200,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let lastProgressNotifiedAt = 0;
 
   interface ActiveWorkerUtterance {
+    source?: 'in-app' | 'global';
     onEvent?: (event: PcAppVoiceEvent) => void;
     loggedFirstLevel: boolean;
     loggedFirstResult: boolean;
@@ -788,7 +806,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   const emitWorkerUtteranceEvent = (utt: ActiveWorkerUtterance | null, payload: PcAppVoiceEvent): void => {
     if (!utt) return;
     logVoiceEvent(payload, utt);
-    notifyVoiceEvent(payload);
+    if (utt.source !== 'global') {
+      notifyVoiceEvent(payload);
+    }
     if (utt.onEvent) {
       utt.onEvent(payload);
       return;
@@ -1167,8 +1187,10 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
   const startListening = async (options?: {
     locale?: string;
+    source?: 'in-app' | 'global';
     onEvent?: (event: PcAppVoiceEvent) => void;
   }): Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }> => {
+    const isGlobalSource = options?.source === 'global';
     if (deps.platform !== 'darwin') {
       return { ok: false, error: 'unsupported_platform' };
     }
@@ -1188,15 +1210,24 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       if (mlxBin && shouldUseResidentMlxWorker()) {
         const alreadyReady = Boolean(mlxWorker && mlxWorker.variant === variant && mlxWorker.state === 'ready');
         if (!alreadyReady) {
-          notifyVoiceEvent({ type: 'loading', variant });
+          if (isGlobalSource) {
+            options?.onEvent?.({ type: 'loading', variant });
+          } else {
+            notifyVoiceEvent({ type: 'loading', variant });
+          }
         }
         const worker = await ensureResidentMlxWorker(variant, { skipVerify: alreadyReady });
         if (worker && worker.state !== 'stopping' && !serveUnsupported) {
           await stopListening({ abort: true });
           if (worker.state !== 'ready') {
-            notifyVoiceEvent({ type: 'loading', variant });
+            if (isGlobalSource) {
+              options?.onEvent?.({ type: 'loading', variant });
+            } else {
+              notifyVoiceEvent({ type: 'loading', variant });
+            }
           }
           const utterance: ActiveWorkerUtterance = {
+            source: options?.source,
             onEvent: options?.onEvent,
             loggedFirstLevel: false,
             loggedFirstResult: false,
@@ -1226,7 +1257,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       }
 
       if (mlxBin) {
-        notifyVoiceEvent({ type: 'loading', variant });
+        if (isGlobalSource) {
+          options?.onEvent?.({ type: 'loading', variant });
+        } else {
+          notifyVoiceEvent({ type: 'loading', variant });
+        }
       }
       const verified = mlxBin ? await downloader.verifyModelFilesOnDisk(variant) : false;
       if (mlxBin && verified) {
@@ -1255,13 +1290,13 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
     if (!bin) {
       if (perms.speech !== 'granted') {
-        notifyVoiceEvent({ type: 'end' });
+        if (!isGlobalSource) notifyVoiceEvent({ type: 'end' });
         appendVoiceLog(`startListening denied target=speech selectedModel=${selectedModel} device=${selectedInputDevice}`);
         return { ok: false, error: 'permission_denied', target: 'speech' };
       }
       bin = resolveSpeechHelperPath();
       if (!bin) {
-        notifyVoiceEvent({ type: 'end' });
+        if (!isGlobalSource) notifyVoiceEvent({ type: 'end' });
         appendVoiceLog(`startListening speech_helper_unavailable selectedModel=${selectedModel} device=${selectedInputDevice}`);
         return { ok: false, error: 'speech_helper_unavailable' };
       }
@@ -1276,7 +1311,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
     await stopListening({ abort: true });
     if (isMlxHelper && variant) {
-      notifyVoiceEvent({ type: 'loading', variant });
+      if (isGlobalSource) {
+        options?.onEvent?.({ type: 'loading', variant });
+      } else {
+        notifyVoiceEvent({ type: 'loading', variant });
+      }
     }
 
     appendVoiceLog(`startListening model=${selectedModel} device=${selectedInputDevice} bin=${bin} args=${JSON.stringify(args)}`);
@@ -1308,7 +1347,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       } else if (payload.type === 'error') {
         appendVoiceLog(`helper error code=${payload.code} target=${payload.target ?? '-'} message=${payload.message ?? '-'}`);
       }
-      notifyVoiceEvent(payload);
+      if (!isGlobalSource) {
+        notifyVoiceEvent(payload);
+      }
       if (options?.onEvent) {
         options.onEvent(payload);
         return;
@@ -1588,6 +1629,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
   return {
     isTrustedSender,
+    getSpeechHelperPath: resolveSpeechHelperPath,
     getPermissions,
     requestPermissions,
     ensureMediaAccessOnWebPermissionRequest,

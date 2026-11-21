@@ -45,6 +45,7 @@ export const DOCS_HELP_URL = 'https://docs.im.codes';
 export interface ShellWindowLike extends TrustedWindowLike {
   on(event: 'closed', listener: () => void): unknown;
   isMinimized?(): boolean;
+  isFocused?(): boolean;
   restore?(): void;
   show?(): void;
   focus?(): void;
@@ -126,6 +127,8 @@ export interface PcAppShellDeps {
   welcomeLocale?: string;
   onLocaleChanged?: (locale: PcAppLocale) => void;
   onOpenSettings?: () => void;
+  getGlobalVoiceEnabled?: () => boolean;
+  onToggleGlobalVoice?: (enabled: boolean) => void;
   onBindFallback?: (trustedOrigin: string | null) => Promise<void> | void;
   bindDeps?: Partial<
     Omit<
@@ -393,6 +396,8 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       onOpenMicTest: () => {
         void micTest.open();
       },
+      globalVoiceEnabled: deps.getGlobalVoiceEnabled?.(),
+      onToggleGlobalVoice: deps.onToggleGlobalVoice,
       onSelectServer: (origin) => void handleSelectServer(origin),
       onAddServer: () => void handleAddServer(),
       onSwitchServer: () => void showServerPicker(),

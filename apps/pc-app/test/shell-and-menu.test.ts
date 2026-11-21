@@ -566,6 +566,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       expect(findMenuItem(menu, 'voice:model-qwen3-0.6b')?.label).toBe(tPcApp(locale, 'menu.voice.qwen06b'));
       expect(findMenuItem(menu, 'voice:model-qwen3-1.7b')?.label).toBe(tPcApp(locale, 'menu.voice.qwen17b'));
       expect(findMenuItem(menu, 'voice:mic-test')?.label).toBe(tPcApp(locale, 'menu.voice.micTest'));
+      expect(findMenuItem(menu, 'voice:global-input')?.label).toBe(tPcApp(locale, 'menu.voice.globalInput'));
       expect(findMenuItem(menu, 'help:docs')?.label).toBe(tPcApp(locale, 'menu.help.docs'));
       expect(menu.find((m) => m.label === tPcApp(locale, 'menu.edit.label'))).toBeDefined();
       expect(menu.find((m) => m.label === tPcApp(locale, 'menu.view.label'))).toBeDefined();

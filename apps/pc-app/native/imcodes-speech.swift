@@ -1,6 +1,9 @@
+import ApplicationServices
 import AudioToolbox
 import AVFoundation
+import Cocoa
 import CoreAudio
+import CoreGraphics
 import Foundation
 import Speech
 
@@ -662,6 +665,472 @@ final class SpeechSession {
   }
 }
 
+// MARK: - Global Double-Tap Ctrl Hotkey Monitor
+
+final class CtrlDoubleTapDetector {
+  private let tapWindowSeconds: TimeInterval = 0.40
+  private let maxHoldSeconds: TimeInterval = 0.35
+  private let debounceSeconds: TimeInterval = 0.35
+
+  private var ctrlDown = false
+  private var ctrlDownAt: Date?
+  private var otherKeyPressedWhileCtrlDown = false
+  private var lastTapUpAt: Date?
+  private var lastEmitAt = Date.distantPast
+
+  func handleFlagsChanged(flags: NSEvent.ModifierFlags, keyCode: UInt16) -> Bool {
+    // Only clean Control taps (no Shift/Option/Command/Fn mixed in)
+    let extraModifiers: NSEvent.ModifierFlags = [.shift, .command, .option, .function]
+    if !flags.intersection(extraModifiers).isEmpty {
+      otherKeyPressedWhileCtrlDown = true
+      lastTapUpAt = nil
+    }
+
+    let isCtrlNow = flags.contains(.control)
+    let now = Date()
+
+    if !ctrlDown && isCtrlNow && (keyCode == 59 || keyCode == 62 || flags.contains(.control)) {
+      ctrlDown = true
+      ctrlDownAt = now
+      otherKeyPressedWhileCtrlDown = !flags.intersection(extraModifiers).isEmpty
+      return false
+    }
+
+    if ctrlDown && !isCtrlNow {
+      ctrlDown = false
+      let heldDuration = ctrlDownAt.map { now.timeIntervalSince($0) } ?? (maxHoldSeconds + 1)
+      ctrlDownAt = nil
+      let wasCleanTap = !otherKeyPressedWhileCtrlDown && heldDuration <= maxHoldSeconds
+      otherKeyPressedWhileCtrlDown = false
+
+      if !wasCleanTap {
+        lastTapUpAt = nil
+        return false
+      }
+
+      if let prevUp = lastTapUpAt, now.timeIntervalSince(prevUp) <= tapWindowSeconds {
+        lastTapUpAt = nil
+        if now.timeIntervalSince(lastEmitAt) >= debounceSeconds {
+          lastEmitAt = now
+          return true
+        }
+        return false
+      }
+
+      lastTapUpAt = now
+      return false
+    }
+
+    return false
+  }
+
+  func handleKeyDown() {
+    if ctrlDown || lastTapUpAt != nil {
+      otherKeyPressedWhileCtrlDown = true
+      lastTapUpAt = nil
+    }
+  }
+}
+
+func runHotkeyCommand() -> Int32 {
+  let app = NSApplication.shared
+  app.setActivationPolicy(.prohibited)
+
+  let detector = CtrlDoubleTapDetector()
+  let lock = NSLock()
+
+  var globalMonitor: Any?
+  var localMonitor: Any?
+
+  let processEvent: (NSEvent) -> Void = { event in
+    lock.lock()
+    defer { lock.unlock() }
+    switch event.type {
+    case .flagsChanged:
+      if detector.handleFlagsChanged(flags: event.modifierFlags, keyCode: event.keyCode) {
+        emitJson(["type": "toggle"])
+      }
+    case .keyDown:
+      detector.handleKeyDown()
+    default:
+      break
+    }
+  }
+
+  globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { event in
+    processEvent(event)
+  }
+  localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { event in
+    processEvent(event)
+    return event
+  }
+
+  signal(SIGTERM, SIG_IGN)
+  signal(SIGINT, SIG_IGN)
+  let termSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+  termSrc.setEventHandler { NSApp.terminate(nil) }
+  termSrc.resume()
+  let intSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+  intSrc.setEventHandler { NSApp.terminate(nil) }
+  intSrc.resume()
+
+  DispatchQueue.global(qos: .utility).async {
+    while readLine(strippingNewline: true) != nil {}
+    DispatchQueue.main.async {
+      NSApp.terminate(nil)
+    }
+  }
+
+  app.run()
+
+  if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
+  if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+  return 0
+}
+
+// MARK: - Non-Activating Floating Voice Overlay (NSPanel)
+
+final class GlobalVoiceOverlayController {
+  private let panelWidth: CGFloat = 364
+  private let basePanelHeight: CGFloat = 56
+  private let barCount = 16
+
+  private let panel: NSPanel
+  private let logoView = NSImageView()
+  private let dotView = NSView()
+  private let titleLabel = NSTextField(labelWithString: "")
+  private let textLabel = NSTextField(wrappingLabelWithString: "")
+  private var barViews: [NSView] = []
+  private var barHistory: [Double] = []
+  private var tickCount = 0
+  private var loadedIconPath: String?
+  private var hasLogo = false
+
+  init(initialIconPath: String?) {
+    let style: NSWindow.StyleMask = [.borderless, .nonactivatingPanel]
+    let p = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: basePanelHeight),
+      styleMask: style,
+      backing: .buffered,
+      defer: false
+    )
+    p.isFloatingPanel = true
+    p.becomesKeyOnlyIfNeeded = true
+    p.hidesOnDeactivate = false
+    p.ignoresMouseEvents = true
+    p.isOpaque = false
+    p.backgroundColor = .clear
+    p.hasShadow = true
+    p.level = .popUpMenu
+    p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+    self.panel = p
+
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: basePanelHeight))
+    container.wantsLayer = true
+    container.layer?.backgroundColor = NSColor(calibratedRed: 0.06, green: 0.09, blue: 0.16, alpha: 0.88).cgColor
+    container.layer?.cornerRadius = 16
+    container.layer?.borderWidth = 1
+    container.layer?.borderColor = NSColor(calibratedWhite: 1.0, alpha: 0.16).cgColor
+    p.contentView = container
+
+    logoView.imageScaling = .scaleProportionallyUpOrDown
+    logoView.wantsLayer = true
+    logoView.layer?.cornerRadius = 7
+    logoView.layer?.masksToBounds = true
+    logoView.isHidden = true
+    container.addSubview(logoView)
+
+    dotView.wantsLayer = true
+    dotView.layer?.cornerRadius = 4.5
+    dotView.layer?.backgroundColor = NSColor.systemOrange.cgColor
+    dotView.frame = NSRect(x: 16, y: 24, width: 9, height: 9)
+    dotView.autoresizingMask = [.minYMargin]
+    container.addSubview(dotView)
+
+    titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+    titleLabel.textColor = NSColor(calibratedWhite: 0.98, alpha: 1.0)
+    titleLabel.lineBreakMode = .byTruncatingTail
+    titleLabel.frame = NSRect(x: 32, y: 19, width: 128, height: 18)
+    titleLabel.autoresizingMask = [.minYMargin]
+    container.addSubview(titleLabel)
+
+    let barsStartX: CGFloat = panelWidth - 16 - CGFloat(barCount) * 5.5
+    for i in 0..<barCount {
+      let bar = NSView(frame: NSRect(x: barsStartX + CGFloat(i) * 5.5, y: 24, width: 3, height: 4))
+      bar.wantsLayer = true
+      bar.layer?.cornerRadius = 1.5
+      bar.layer?.backgroundColor = NSColor(calibratedRed: 0.13, green: 0.83, blue: 0.93, alpha: 0.85).cgColor
+      bar.autoresizingMask = [.minYMargin]
+      container.addSubview(bar)
+      barViews.append(bar)
+      barHistory.append(0)
+    }
+
+    textLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+    textLabel.textColor = NSColor(calibratedRed: 0.88, green: 0.92, blue: 0.98, alpha: 0.95)
+    textLabel.maximumNumberOfLines = 2
+    textLabel.lineBreakMode = .byTruncatingHead
+    textLabel.isHidden = true
+    container.addSubview(textLabel)
+
+    applyIconPath(initialIconPath)
+  }
+
+  private func applyIconPath(_ rawPath: String?) {
+    let trimmed = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let path = trimmed, !path.isEmpty else { return }
+    if loadedIconPath == path { return }
+    loadedIconPath = path
+    if let img = NSImage(contentsOfFile: path) {
+      logoView.image = img
+      logoView.isHidden = false
+      hasLogo = true
+    }
+  }
+
+  private func targetScreen() -> NSScreen? {
+    let mouseLoc = NSEvent.mouseLocation
+    if let hit = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) {
+      return hit
+    }
+    return NSScreen.main ?? NSScreen.screens.first
+  }
+
+  private func reposition(height: CGFloat) {
+    let frame = targetScreen()?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let x = round(frame.midX - panelWidth / 2)
+    let y = round(frame.minY + 28)
+    panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: height), display: true)
+    panel.contentView?.frame = NSRect(x: 0, y: 0, width: panelWidth, height: height)
+  }
+
+  func show(state: String, title: String, text: String, level: Double, iconPath: String? = nil) {
+    applyIconPath(iconPath)
+    titleLabel.stringValue = title
+    let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if state == "loading" {
+      dotView.layer?.backgroundColor = NSColor.systemOrange.cgColor
+    } else if state == "draining" {
+      dotView.layer?.backgroundColor = NSColor.systemYellow.cgColor
+    } else {
+      dotView.layer?.backgroundColor = NSColor(calibratedRed: 0.13, green: 0.83, blue: 0.93, alpha: 1.0).cgColor
+    }
+
+    let showBars = (state == "listening")
+    if showBars {
+      tickCount += 1
+      let clamped = max(0.0, min(1.0, level))
+      barHistory.removeFirst()
+      barHistory.append(clamped)
+    } else {
+      barHistory = Array(repeating: 0.0, count: barCount)
+    }
+
+    let hasText = !trimmedText.isEmpty
+    let textHeight: CGFloat = hasText ? 34 : 0
+    let totalHeight = basePanelHeight + (hasText ? textHeight + 6 : 0)
+    reposition(height: totalHeight)
+
+    let topRowY = totalHeight - 36
+    let contentLeftX: CGFloat = hasLogo ? 50 : 16
+    if hasLogo {
+      logoView.frame = NSRect(x: 14, y: topRowY - 3, width: 28, height: 28)
+    }
+    dotView.frame = NSRect(x: contentLeftX, y: topRowY + 5, width: 9, height: 9)
+    titleLabel.frame = NSRect(x: contentLeftX + 15, y: topRowY + 1, width: panelWidth - contentLeftX - 15 - CGFloat(barCount) * 5.5 - 22, height: 18)
+
+    let barsStartX: CGFloat = panelWidth - 16 - CGFloat(barCount) * 5.5
+    for i in 0..<barCount {
+      let bar = barViews[i]
+      bar.isHidden = !showBars
+      if showBars {
+        let sample = barHistory[i]
+        let centerDist = abs(Double(i) - Double(barCount - 1) / 2.0) / (Double(barCount - 1) / 2.0)
+        let envelope = 1.0 - centerDist * 0.25
+        let jitter = sample > 0.01 ? (0.85 + 0.15 * sin(Double(tickCount + i) * 0.9)) : 1.0
+        let h = CGFloat(round(4.0 + min(1.0, sample * envelope * jitter) * 20.0))
+        let y = topRowY + (20.0 - h) / 2.0
+        bar.frame = NSRect(x: barsStartX + CGFloat(i) * 5.5, y: y, width: 3, height: h)
+        bar.layer?.opacity = sample > 0.02 ? 1.0 : 0.45
+      }
+    }
+
+    if hasText {
+      textLabel.stringValue = trimmedText
+      textLabel.isHidden = false
+      textLabel.frame = NSRect(x: contentLeftX, y: 8, width: panelWidth - contentLeftX - 16, height: textHeight)
+    } else {
+      textLabel.stringValue = ""
+      textLabel.isHidden = true
+    }
+
+    panel.orderFrontRegardless()
+  }
+
+  func hide() {
+    panel.orderOut(nil)
+  }
+}
+
+func runOverlayCommand(args: [String]) -> Int32 {
+  var initialIconPath: String?
+  var idx = 1
+  while idx < args.count {
+    if args[idx] == "--icon", idx + 1 < args.count {
+      initialIconPath = args[idx + 1]
+      idx += 2
+    } else {
+      idx += 1
+    }
+  }
+
+  let app = NSApplication.shared
+  app.setActivationPolicy(.prohibited)
+
+  let controller = GlobalVoiceOverlayController(initialIconPath: initialIconPath)
+
+  signal(SIGTERM, SIG_IGN)
+  signal(SIGINT, SIG_IGN)
+  let termSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+  termSrc.setEventHandler {
+    controller.hide()
+    NSApp.terminate(nil)
+  }
+  termSrc.resume()
+  let intSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+  intSrc.setEventHandler {
+    controller.hide()
+    NSApp.terminate(nil)
+  }
+  intSrc.resume()
+
+  DispatchQueue.global(qos: .userInitiated).async {
+    while let line = readLine(strippingNewline: true) {
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.isEmpty { continue }
+      guard let data = trimmed.data(using: .utf8),
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let cmd = obj["cmd"] as? String else {
+        continue
+      }
+      DispatchQueue.main.async {
+        if cmd == "hide" {
+          controller.hide()
+        } else if cmd == "show" {
+          let state = (obj["state"] as? String) ?? "listening"
+          let title = (obj["title"] as? String) ?? ""
+          let text = (obj["text"] as? String) ?? ""
+          let iconPath = obj["iconPath"] as? String
+          let level = (obj["level"] as? Double) ?? (obj["level"] as? NSNumber)?.doubleValue ?? 0.0
+          controller.show(state: state, title: title, text: text, level: level, iconPath: iconPath)
+        }
+      }
+    }
+    DispatchQueue.main.async {
+      controller.hide()
+      NSApp.terminate(nil)
+    }
+  }
+
+  app.run()
+  return 0
+}
+
+// MARK: - Accessibility Unicode Paste (16-UniChar Chunks)
+
+func waitForControlRelease(timeoutSeconds: TimeInterval = 1.5) {
+  let deadline = Date().addingTimeInterval(timeoutSeconds)
+  while Date() < deadline {
+    let leftCtrl = CGEventSource.keyState(.hidSystemState, key: 59)
+    let rightCtrl = CGEventSource.keyState(.hidSystemState, key: 62)
+    let flagsCtrl = CGEventSource.flagsState(.hidSystemState).contains(.maskControl)
+    if !leftCtrl && !rightCtrl && !flagsCtrl {
+      return
+    }
+    usleep(10_000)
+  }
+}
+
+func runPasteCommand(args: [String]) -> Int32 {
+  var prompt = false
+  var useStdin = false
+  var argText: String?
+  var idx = 1
+  while idx < args.count {
+    if args[idx] == "--prompt" {
+      prompt = true
+      idx += 1
+    } else if args[idx] == "--stdin" {
+      useStdin = true
+      idx += 1
+    } else if args[idx] == "--text", idx + 1 < args.count {
+      argText = args[idx + 1]
+      idx += 2
+    } else {
+      idx += 1
+    }
+  }
+
+  let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
+  if !AXIsProcessTrustedWithOptions(options) {
+    emitJson(["type": "error", "code": "accessibility_denied"])
+    return 1
+  }
+
+  let text: String
+  if let argText {
+    text = argText
+  } else if useStdin || !isatty(STDIN_FILENO).boolValue {
+    let data = FileHandle.standardInput.readDataToEndOfFile()
+    text = String(data: data, encoding: .utf8) ?? ""
+  } else {
+    text = ""
+  }
+
+  waitForControlRelease()
+
+  let utf16 = Array(text.utf16)
+  if utf16.isEmpty {
+    emitJson(["type": "ok", "length": 0])
+    return 0
+  }
+
+  guard let source = CGEventSource(stateID: .hidSystemState) else {
+    emitJson(["type": "error", "code": "event_source_failed"])
+    return 1
+  }
+
+  var offset = 0
+  let chunkSize = 16
+  while offset < utf16.count {
+    let end = min(offset + chunkSize, utf16.count)
+    let chunk = Array(utf16[offset..<end])
+    if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+       let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
+      chunk.withUnsafeBufferPointer { buf in
+        if let base = buf.baseAddress {
+          down.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: base)
+          up.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: base)
+        }
+      }
+      down.post(tap: .cghidEventTap)
+      up.post(tap: .cghidEventTap)
+    }
+    offset = end
+    if offset < utf16.count {
+      usleep(2_000)
+    }
+  }
+
+  emitJson(["type": "ok", "length": utf16.count])
+  return 0
+}
+
+private extension Int32 {
+  var boolValue: Bool { self != 0 }
+}
+
 let args = Array(CommandLine.arguments.dropFirst())
 let cmd = args.first ?? "status"
 
@@ -684,6 +1153,12 @@ case "devices":
     fflush(stdout)
   }
   exit(0)
+case "hotkey":
+  exit(runHotkeyCommand())
+case "overlay":
+  exit(runOverlayCommand(args: args))
+case "paste":
+  exit(runPasteCommand(args: args))
 case "listen":
   var localeTag: String?
   var deviceUID: String?

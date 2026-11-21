@@ -147,8 +147,9 @@ export function buildMacosSpeechHelper({
   const targetArchs = arch === 'universal'
     ? ['arm64', 'x86_64']
     : [arch === 'x64' ? 'x86_64' : 'arm64'];
+  const frameworkArgs = ['-framework', 'Cocoa', '-framework', 'CoreGraphics', '-framework', 'ApplicationServices'];
   if (targetArchs.length === 1) {
-    execFn('swiftc', ['-O', '-target', `${targetArchs[0]}-apple-macosx12.0`, srcPath, '-o', absOut], {
+    execFn('swiftc', ['-O', '-target', `${targetArchs[0]}-apple-macosx12.0`, ...frameworkArgs, srcPath, '-o', absOut], {
       stdio: 'inherit',
     });
     chmodSync(absOut, 0o755);
@@ -158,7 +159,7 @@ export function buildMacosSpeechHelper({
   try {
     const thinBins = targetArchs.map((targetArch) => {
       const binPath = join(workDir, `imcodes-speech-${targetArch}`);
-      execFn('swiftc', ['-O', '-target', `${targetArch}-apple-macosx12.0`, srcPath, '-o', binPath], {
+      execFn('swiftc', ['-O', '-target', `${targetArch}-apple-macosx12.0`, ...frameworkArgs, srcPath, '-o', binPath], {
         stdio: 'inherit',
       });
       return binPath;

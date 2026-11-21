@@ -35,6 +35,8 @@ export interface AppMenuOptions {
   onSelectInputDevice?: (uid: string) => void;
   onRefreshInputDevices?: () => void;
   onOpenMicTest?: () => void;
+  globalVoiceEnabled?: boolean;
+  onToggleGlobalVoice?: (enabled: boolean) => void;
   onSelectServer: (origin: string) => void;
   onAddServer: () => void;
   onSwitchServer?: () => void;
@@ -353,6 +355,14 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
                 click: () => options.onRefreshInputDevices?.(),
               },
             ],
+          },
+          { type: 'separator' },
+          {
+            id: 'voice:global-input',
+            label: t('menu.voice.globalInput'),
+            type: 'checkbox',
+            checked: options.globalVoiceEnabled ?? true,
+            click: () => options.onToggleGlobalVoice?.(!(options.globalVoiceEnabled ?? true)),
           },
           { type: 'separator' },
           {

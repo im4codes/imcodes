@@ -12,6 +12,7 @@ import {
   systemPreferences,
   type MenuItemConstructorOptions,
 } from 'electron';
+import { createPcAppGlobalVoice, type PcAppGlobalVoiceController } from './global-voice.js';
 import { createPcAppShell, type PcAppShellInstance } from './shell.js';
 import { createPcAppVoiceHud } from './voice-hud.js';
 
@@ -39,6 +40,7 @@ export async function startPcApp(): Promise<void> {
   }
 
   let shellInstance: PcAppShellInstance | null = null;
+  let globalVoice: PcAppGlobalVoiceController | null = null;
   const voiceHud = createPcAppVoiceHud({
     getLocale: () => shellInstance?.getLocale() ?? app.getLocale(),
     getWebContents: () => shellInstance?.getMainWindow()?.webContents ?? null,
@@ -52,6 +54,10 @@ export async function startPcApp(): Promise<void> {
     preloadPath: resolveRuntimePreloadPath(),
     ipcMain,
     onLocaleChanged: (locale) => voiceHud.setLocale(locale),
+    getGlobalVoiceEnabled: () => globalVoice?.isEnabled() ?? true,
+    onToggleGlobalVoice: (enabled) => {
+      void globalVoice?.setEnabled(enabled);
+    },
     voiceDeps: {
       resourcesPath: process.resourcesPath,
       speechModelsDir: join(app.getPath('appData'), 'imcodes-pc-app', 'speech-models'),
@@ -112,10 +118,25 @@ export async function startPcApp(): Promise<void> {
   shellInstance = pcShell;
   voiceHud.setLocale(pcShell.getLocale());
 
+  globalVoice = createPcAppGlobalVoice({
+    platform: process.platform,
+    userDataDir: app.getPath('userData'),
+    resourcesPath: process.resourcesPath,
+    iconPath: runtimeIconPath ?? undefined,
+    getLocale: () => pcShell.getLocale(),
+    getMainWindow: () => pcShell.getMainWindow(),
+    getSpeechHelperPath: () => pcShell.voice.getSpeechHelperPath(),
+    voice: pcShell.voice,
+    onStateChanged: () => pcShell.rebuildMenu(),
+  });
+  pcShell.rebuildMenu();
+  globalVoice.start();
+
   await pcShell.ensureWindow();
   await pcShell.checkLaunchAgent();
 
   app.on('before-quit', () => {
+    void globalVoice?.dispose();
     voiceHud.dispose();
   });
 
