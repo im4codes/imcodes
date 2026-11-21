@@ -328,9 +328,36 @@ struct SessionDetailView: View {
 
     private var replyComposer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            TextField("Reply…", text: $draft, axis: .vertical)
+            if !draft.isEmpty {
+                HStack(alignment: .top, spacing: 4) {
+                    Text(draft)
+                        .font(.caption2)
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Button {
+                        if voiceManager.isRecording || voiceManager.state == .transcribing || isHoldingVoice {
+                            cancelHoldVoiceInput(restoreDraft: false)
+                        }
+                        voiceSessionActive = false
+                        voiceBaseDraft = ""
+                        draft = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear draft")
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+
+            TextField(draft.isEmpty ? "Reply…" : "Edit…", text: $draft)
                 .font(.caption2)
-                .lineLimit(1...6)
                 .id("replyField")
 
             holdToTalkControl
