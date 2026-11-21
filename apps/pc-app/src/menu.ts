@@ -195,6 +195,12 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     return variantState === 'ready' ? sel : 'system';
   })();
 
+  const formatDownloadPercent = (raw: unknown): string => {
+    const num = Number(raw);
+    const clamped = Number.isFinite(num) ? Math.max(0, Math.min(1, num)) : 0;
+    return (clamped * 100).toFixed(3);
+  };
+
   const formatMlxModelItem = (
     choice: Exclude<PcAppSpeechModelChoice, 'system'>,
     baseLabel: string,
@@ -222,7 +228,7 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
         return {
           label: t('menu.voice.modelDownloading', {
             label: baseLabel,
-            progress: Math.round((vStatus?.progress ?? speechStatus.progress) * 100),
+            progress: formatDownloadPercent(vStatus?.progress ?? speechStatus.progress),
           }),
           enabled: false,
           checked: false,
@@ -263,7 +269,7 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
         ? downloadingEntry.progress
         : speechStatus.progress;
       return t('menu.voice.statusDownloading', {
-        progress: Math.round(rawProgress * 100),
+        progress: formatDownloadPercent(rawProgress),
       });
     }
     if (speechStatus.state === 'failed') {

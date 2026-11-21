@@ -402,10 +402,11 @@ export function buildMicTestOverlayScript(localeRaw: string): string {
     var dlChoice = st.downloadingModel || (st.state === 'downloading' ? st.selectedModel : null);
     if (dlChoice && dlChoice !== 'system' && (st.state === 'downloading' || (st.models && st.models[dlChoice] && st.models[dlChoice].state === 'downloading'))) {
       var dlProgress = st.models && st.models[dlChoice] ? st.models[dlChoice].progress : st.progress;
-      var pct = Math.max(0, Math.min(100, Math.round((Number(dlProgress) || 0) * 100)));
+      var rawPct = Number(dlProgress);
+      var pct = (Number.isFinite(rawPct) ? Math.max(0, Math.min(100, rawPct * 100)) : 0).toFixed(3);
       var dlText = STRINGS.modelDownloading
         .replace('{{model}}', formatModelChoice(dlChoice))
-        .replace('{{progress}}', String(pct));
+        .replace('{{progress}}', pct);
       modelBadgeEl.textContent = activeName + ' · ' + dlText;
       modelBadgeEl.style.color = '#38bdf8';
       return;

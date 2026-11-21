@@ -175,6 +175,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let lastProgressNotifiedState: PcAppSpeechModelStatus['state'] | null = null;
   let lastProgressNotifiedDownloading: PcAppSpeechVariant | null = null;
   let lastProgressNotifiedMlx: boolean | null = cachedMlxSupport;
+  let lastProgressNotifiedAt = 0;
 
   const modelStore = new PcAppSpeechModelStore(deps.userDataDir);
   const loadedModel = modelStore.load();
@@ -428,13 +429,18 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
   const notifyStatusChanged = (force = false) => {
     const status = computeStatusSync();
-    const bucket = status.state === 'downloading' ? Math.floor(status.progress * 100) : -1;
+    const clampedProgress = Number.isFinite(status.progress) ? Math.max(0, Math.min(1, status.progress)) : 0;
+    const bucket = status.state === 'downloading' ? Math.floor(clampedProgress * 100000) : -1;
+    const now = Date.now();
+    const sameContext =
+      status.state === lastProgressNotifiedState
+      && downloadingVariant === lastProgressNotifiedDownloading
+      && status.mlxSupported === lastProgressNotifiedMlx;
     if (
       !force
-      && status.state === lastProgressNotifiedState
-      && bucket === lastProgressNotifiedBucket
-      && downloadingVariant === lastProgressNotifiedDownloading
-      && status.mlxSupported === lastProgressNotifiedMlx
+      && sameContext
+      && (bucket === lastProgressNotifiedBucket
+        || (status.state === 'downloading' && now - lastProgressNotifiedAt < 200))
     ) {
       return;
     }
@@ -442,6 +448,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     lastProgressNotifiedBucket = bucket;
     lastProgressNotifiedDownloading = downloadingVariant;
     lastProgressNotifiedMlx = status.mlxSupported;
+    lastProgressNotifiedAt = now;
     deps.onSpeechModelStatusChanged?.(status);
   };
 

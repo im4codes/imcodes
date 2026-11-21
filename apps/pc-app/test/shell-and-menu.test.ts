@@ -1025,14 +1025,14 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
             selectedModel: 'system',
             activeBackend: 'system',
             state: 'downloading',
-            progress: 0.42,
-            downloadedBytes: 42,
-            totalBytes: 100,
+            progress: 0.42125,
+            downloadedBytes: 42125,
+            totalBytes: 100000,
             mlxSupported: true,
             downloadingModel: 'qwen3-0.6b',
             models: {
-              'qwen3-0.6b': { state: 'downloading', progress: 0.42, downloadedBytes: 42, totalBytes: 100, modelDir: '/m/06' },
-              'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 100, modelDir: '/m/17' },
+              'qwen3-0.6b': { state: 'downloading', progress: 0.42125, downloadedBytes: 42125, totalBytes: 100000, modelDir: '/m/06' },
+              'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 100000, modelDir: '/m/17' },
             },
           })),
           startListening: startListeningMock,
@@ -1056,7 +1056,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
 
     await vi.waitFor(() => {
       expect(selectEl.children).toHaveLength(3);
-      expect(elements.get('imcodes-mic-test-model-badge')!.textContent).toContain('Qwen3-ASR 0.6B (42%)');
+      expect(elements.get('imcodes-mic-test-model-badge')!.textContent).toContain('Qwen3-ASR 0.6B (42.125%)');
     });
     const initialRebuilds = selectEl._innerHTMLChanges;
 
@@ -1103,7 +1103,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
           mlxSupported: true,
           downloadingModel: 'qwen3-0.6b',
           models: {
-            'qwen3-0.6b': { state: 'downloading', progress: 0.37, downloadedBytes: 370, totalBytes: 1000, modelDir: '/tmp/06' },
+            'qwen3-0.6b': { state: 'downloading', progress: 0.37125, downloadedBytes: 37125, totalBytes: 100000, modelDir: '/tmp/06' },
             'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 2000, modelDir: '/tmp/17' },
           },
         },
@@ -1118,7 +1118,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
         onOpenDocs: () => {},
       }),
       'voice:status',
-    )?.label).toBe('Status: Downloading (37%)…');
+    )?.label).toBe('Status: Downloading (37.125%)…');
 
     // Closing overlay via × unsubscribes, stops active test listening, and removes DOM node
     elements.get('imcodes-mic-test-close')!.dispatchEvent('click');
@@ -1151,21 +1151,57 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
         selectedModel: 'system',
         activeBackend: 'system',
         state: 'downloading',
-        progress: 0.42,
-        downloadedBytes: 42,
-        totalBytes: 100,
+        progress: 0.42125,
+        downloadedBytes: 42125,
+        totalBytes: 100000,
         mlxSupported: true,
         downloadingModel: 'qwen3-0.6b',
         models: {
-          'qwen3-0.6b': { state: 'downloading', progress: 0.42, downloadedBytes: 42, totalBytes: 100, modelDir: '/m/06' },
-          'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 100, modelDir: '/m/17' },
+          'qwen3-0.6b': { state: 'downloading', progress: 0.42125, downloadedBytes: 42125, totalBytes: 100000, modelDir: '/m/06' },
+          'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 100000, modelDir: '/m/17' },
         },
       },
     });
     expect(findMenuItem(downloadingMenu, 'voice:model-system')?.checked).toBe(true);
     expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-0.6b')?.checked).toBe(false);
     expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-0.6b')?.enabled).toBe(false);
-    expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-0.6b')?.label).toContain('Downloading 42%');
+    expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-0.6b')?.label).toContain('Downloading 42.125%');
+
+    // Boundary check: NaN clamps to 0.000% and >1 clamps to 100.000%
+    const clampedMenu = buildAppMenuTemplate({
+      ...baseOpts,
+      speechModelStatus: {
+        selectedModel: 'system',
+        activeBackend: 'system',
+        state: 'downloading',
+        progress: Number.NaN,
+        downloadedBytes: 0,
+        totalBytes: 100,
+        mlxSupported: true,
+        downloadingModel: 'qwen3-0.6b',
+        models: {
+          'qwen3-0.6b': { state: 'downloading', progress: 1.5, downloadedBytes: 150, totalBytes: 100, modelDir: '/m/06' },
+          'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 100, modelDir: '/m/17' },
+        },
+      },
+    });
+    expect(findMenuItem(clampedMenu, 'voice:model-qwen3-0.6b')?.label).toContain('Downloading 100.000%');
+    expect(findMenuItem(clampedMenu, 'voice:status')?.label).toBe('Status: Downloading (100.000%)…');
+
+    const nanMenu = buildAppMenuTemplate({
+      ...baseOpts,
+      speechModelStatus: {
+        selectedModel: 'system',
+        activeBackend: 'system',
+        state: 'downloading',
+        progress: Number.NaN,
+        downloadedBytes: 0,
+        totalBytes: 100,
+        mlxSupported: true,
+        downloadingModel: null,
+      },
+    });
+    expect(findMenuItem(nanMenu, 'voice:status')?.label).toBe('Status: Downloading (0.000%)…');
     expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-1.7b')?.checked).toBe(false);
     expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-1.7b')?.enabled).toBe(true);
     expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-1.7b')?.label).toContain('Not Downloaded');

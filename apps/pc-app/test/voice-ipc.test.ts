@@ -859,8 +859,8 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     await voiceNoWrite.dispose();
   });
 
-  it('notifies speech model download status at 1% increments without per-chunk spam while keeping selectedModel=system', async () => {
-    const payload = Buffer.alloc(100, 65);
+  it('notifies speech model download status at 3-decimal increments with 200ms rate limit while keeping selectedModel=system', async () => {
+    const payload = Buffer.alloc(100000, 65);
     const sha = createHash('sha256').update(payload).digest('hex');
     const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
       '0.6b': {
@@ -879,59 +879,69 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       },
     };
 
-    const statuses: Array<{ state: string; progress: number; selectedModel: string; downloadingModel?: string | null }> = [];
-    const ctx = setupController({
-      micStatus: 'granted',
-      mlxHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech-mlx',
-      isMlxSupported: () => true,
-      manifests,
-      mirrorOrigins: ['https://hf-mirror.com'],
-      onSpeechModelStatusChanged: (st) => {
-        statuses.push({
-          state: st.state,
-          progress: st.progress,
-          selectedModel: st.selectedModel,
-          downloadingModel: st.downloadingModel,
-        });
-      },
-      fetchModel: async () => {
-        const stream = new ReadableStream<Uint8Array>({
-          async start(controller) {
-            // Emit 1 byte (1%), then duplicate 1% bucket edge, then 2%, 3%, then rest
-            controller.enqueue(payload.subarray(0, 1));
-            await new Promise((r) => setTimeout(r, 2));
-            // Enqueue 1-byte chunks hitting 2% and 3%
-            controller.enqueue(payload.subarray(1, 2));
-            await new Promise((r) => setTimeout(r, 2));
-            controller.enqueue(payload.subarray(2, 3));
-            await new Promise((r) => setTimeout(r, 2));
-            controller.enqueue(payload.subarray(3, 15));
-            await new Promise((r) => setTimeout(r, 2));
-            controller.enqueue(payload.subarray(15));
-            controller.close();
-          },
-        });
-        return new Response(stream, {
-          status: 200,
-          headers: { 'content-length': String(payload.length) },
-        });
-      },
-    });
+    let fakeNow = 1_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => fakeNow);
+    try {
+      const statuses: Array<{ state: string; progress: number; selectedModel: string; downloadingModel?: string | null }> = [];
+      const ctx = setupController({
+        micStatus: 'granted',
+        mlxHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech-mlx',
+        isMlxSupported: () => true,
+        manifests,
+        mirrorOrigins: ['https://hf-mirror.com'],
+        onSpeechModelStatusChanged: (st) => {
+          statuses.push({
+            state: st.state,
+            progress: st.progress,
+            selectedModel: st.selectedModel,
+            downloadingModel: st.downloadingModel,
+          });
+        },
+        fetchModel: async () => {
+          const stream = new ReadableStream<Uint8Array>({
+            async start(controller) {
+              // 1.234% (1234 bytes) at t=+250ms -> notifies
+              fakeNow += 250;
+              controller.enqueue(payload.subarray(0, 1234));
+              await new Promise((r) => setTimeout(r, 2));
+              // 1.235% (1235 bytes) at t=+50ms (< 200ms) -> throttled
+              fakeNow += 50;
+              controller.enqueue(payload.subarray(1234, 1235));
+              await new Promise((r) => setTimeout(r, 2));
+              // 1.236% (1236 bytes) at t=+210ms (>= 200ms) -> notifies 0.001% precision update
+              fakeNow += 210;
+              controller.enqueue(payload.subarray(1235, 1236));
+              await new Promise((r) => setTimeout(r, 2));
+              // Remaining bytes -> ready notifies immediately (force=true even if < 200ms)
+              fakeNow += 10;
+              controller.enqueue(payload.subarray(1236));
+              controller.close();
+            },
+          });
+          return new Response(stream, {
+            status: 200,
+            headers: { 'content-length': String(payload.length) },
+          });
+        },
+      });
 
-    await ctx.voice.setSpeechModel('qwen3-0.6b');
-    await vi.waitFor(async () => {
-      const st = await ctx.voice.getSpeechModelStatus();
-      expect(st.state).toBe('ready');
-    });
+      await ctx.voice.setSpeechModel('qwen3-0.6b');
+      await vi.waitFor(async () => {
+        const st = await ctx.voice.getSpeechModelStatus();
+        expect(st.state).toBe('ready');
+      });
 
-    const dlPercents = statuses
-      .filter((s) => s.state === 'downloading')
-      .map((s) => Math.floor(s.progress * 100));
-    expect(dlPercents).toEqual(expect.arrayContaining([1, 2, 3, 15]));
-    expect(new Set(dlPercents).size).toBe(dlPercents.length);
-    const midDownload = statuses.find((s) => s.state === 'downloading' && Math.floor(s.progress * 100) === 2);
-    expect(midDownload?.selectedModel).toBe('system');
-    expect(midDownload?.downloadingModel).toBe('qwen3-0.6b');
-    await ctx.voice.dispose();
+      const dlBuckets = statuses
+        .filter((s) => s.state === 'downloading')
+        .map((s) => Math.floor(s.progress * 100000));
+      expect(dlBuckets).toEqual([0, 1234, 1236]);
+      expect(statuses.some((s) => s.state === 'ready')).toBe(true);
+      const midDownload = statuses.find((s) => s.state === 'downloading' && Math.floor(s.progress * 100000) === 1236);
+      expect(midDownload?.selectedModel).toBe('system');
+      expect(midDownload?.downloadingModel).toBe('qwen3-0.6b');
+      await ctx.voice.dispose();
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });
