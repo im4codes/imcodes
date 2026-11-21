@@ -1303,7 +1303,9 @@ describe('direct file transfer worker boundary', () => {
       const token = tryClaimClientUpload('upload-progressing');
       expect(token).not.toBeNull();
       const before = clientUploadClaimLastProgressAt('upload-progressing');
-      await new Promise((resolve) => setTimeout(resolve, 2));
+      for (let i = 0; i < 20 && Date.now() <= (before ?? 0); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
       touchClientUploadClaim('upload-progressing', token!);
       const after = clientUploadClaimLastProgressAt('upload-progressing');
       expect(after).toBeGreaterThan(before ?? 0);
