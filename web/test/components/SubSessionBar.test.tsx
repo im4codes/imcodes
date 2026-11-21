@@ -1032,9 +1032,9 @@ describe('SubSessionBar', () => {
     expect((view.getByTestId('subsession-preview-sub-b') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[1]);
   });
 
-  it('progressively mounts expanded preview cards instead of mounting every card in the first render', async () => {
+  it('progressively mounts expanded preview cards beyond the initial 8-card batch instead of mounting every card in the first render', async () => {
     vi.useFakeTimers();
-    const subSessions = Array.from({ length: 8 }, (_, index) => makeSubSession({
+    const subSessions = Array.from({ length: 14 }, (_, index) => makeSubSession({
       id: `sub-${index + 1}`,
       sessionName: `deck_sub_sub-${index + 1}`,
       label: `worker-${index + 1}`,
@@ -1056,18 +1056,18 @@ describe('SubSessionBar', () => {
       />,
     );
 
-    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(2);
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(8);
     expect(view.container.querySelectorAll('.subcard-preview-placeholder')).toHaveLength(6);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(6);
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(12);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(32);
     });
-    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(8);
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(14);
     expect(view.container.querySelectorAll('.subcard-preview-placeholder')).toHaveLength(0);
   });
 
@@ -2953,5 +2953,74 @@ describe('SubSessionBar', () => {
     expect(privBtn?.classList.contains('open')).toBe(true);
     expect(privBtn?.classList.contains('focused')).toBe(true);
     expect(normBtn?.classList.contains('incognito')).toBe(false);
+  });
+
+  it('hydrates up to 8 expanded card previews synchronously on first frame when switching tabs without placeholder flash', () => {
+    const tabASubs = Array.from({ length: 4 }, (_, i) =>
+      makeSubSession({ id: `tabA-${i + 1}`, sessionName: `deck_sub_tabA_${i + 1}`, label: `tabA-${i + 1}` }),
+    );
+    const tabBSubs = Array.from({ length: 8 }, (_, i) =>
+      makeSubSession({ id: `tabB-${i + 1}`, sessionName: `deck_sub_tabB_${i + 1}`, label: `tabB-${i + 1}` }),
+    );
+
+    const view = render(
+      <SubSessionBar
+        subSessions={tabASubs}
+        openIds={new Set()}
+        collapsed={false}
+        desktopLayoutCapable
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(4);
+    expect(view.container.querySelectorAll('.subcard-preview-placeholder')).toHaveLength(0);
+
+    // Switch to another main session tab with 8 sub-sessions -> all 8 cards render live previews on frame 1
+    view.rerender(
+      <SubSessionBar
+        subSessions={tabBSubs}
+        openIds={new Set()}
+        collapsed={false}
+        desktopLayoutCapable
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(8);
+    expect(view.container.querySelectorAll('.subcard-preview-placeholder')).toHaveLength(0);
+
+    // Lists larger than 8 still bound synchronous first-frame preview hydration to 8
+    const tabCSubs = Array.from({ length: 10 }, (_, i) =>
+      makeSubSession({ id: `tabC-${i + 1}`, sessionName: `deck_sub_tabC_${i + 1}`, label: `tabC-${i + 1}` }),
+    );
+    view.rerender(
+      <SubSessionBar
+        subSessions={tabCSubs}
+        openIds={new Set()}
+        collapsed={false}
+        desktopLayoutCapable
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(8);
+    expect(view.container.querySelectorAll('.subcard-preview-placeholder')).toHaveLength(2);
+    view.unmount();
   });
 });

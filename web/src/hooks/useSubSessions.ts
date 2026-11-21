@@ -160,9 +160,12 @@ export function useSubSessions(
 ) {
   const [subSessions, setSubSessionsRaw] = useState<SubSession[]>([]);
   const [loadedServerId, setLoadedServerId] = useState<string | null>(null);
+  const loadedServerIdRef = useRef<string | null>(loadedServerId);
+  loadedServerIdRef.current = loadedServerId;
   const rebuiltRef = useRef(false);
   const serverIdRef = useRef<string | null>(serverId);
   serverIdRef.current = serverId;
+  const cachedByServerRef = useRef<Map<string, SubSession[]>>(new Map());
   const incognitoByServerRef = useRef<Map<string, SubSession[]>>(new Map());
   const pendingIncognitoCreateIdsByServerRef = useRef<Map<string, Set<string>>>(new Map());
   const prevServerIdForEffectRef = useRef<string | null>(serverId);
@@ -184,12 +187,16 @@ export function useSubSessions(
   const setSubSessions = useCallback((
     updater: SubSession[] | ((prev: SubSession[]) => SubSession[]),
     explicitServerId?: string | null,
+    markCacheAuthoritative = false,
   ) => {
     const targetServerId = explicitServerId === undefined ? serverIdRef.current : explicitServerId;
     setSubSessionsRaw((prev) => {
       const next = typeof updater === 'function' ? updater(prev) : updater;
       if (targetServerId && serverIdRef.current === targetServerId) {
         syncIncognitoStore(targetServerId, next);
+        if (markCacheAuthoritative || loadedServerIdRef.current === targetServerId) {
+          cachedByServerRef.current.set(targetServerId, next);
+        }
       }
       return next;
     });
@@ -202,20 +209,35 @@ export function useSubSessions(
     const serverChanged = prevServerIdForEffectRef.current !== serverId;
     prevServerIdForEffectRef.current = serverId;
     if (!serverId) {
+      loadedServerIdRef.current = null;
       setSubSessionsRaw([]);
       setLoadedServerId(null);
       return;
     }
     const savedIncognito = incognitoByServerRef.current.get(serverId) ?? [];
     if (serverChanged) {
-      // Seed preserved in-memory incognito sub-sessions for this server immediately
-      // without clearing or touching other servers' incognito entries.
-      setSubSessionsRaw(savedIncognito);
-      if (!disableHttpLoad) setLoadedServerId(null);
+      const cached = !disableHttpLoad ? cachedByServerRef.current.get(serverId) : undefined;
+      if (cached) {
+        const nonIncognito = cached.filter((s) => !s.incognito);
+        const mergedIncognito = mergeIncognitoSubSessions(savedIncognito, cached);
+        const seeded = mergedIncognito.length > 0 ? [...nonIncognito, ...mergedIncognito] : [...nonIncognito];
+        loadedServerIdRef.current = serverId;
+        setSubSessionsRaw(seeded);
+        setLoadedServerId(serverId);
+      } else {
+        // Seed preserved in-memory incognito sub-sessions for this server immediately
+        // without clearing or touching other servers' incognito entries.
+        setSubSessionsRaw(savedIncognito);
+        if (!disableHttpLoad) {
+          loadedServerIdRef.current = null;
+          setLoadedServerId(null);
+        }
+      }
     }
     if (disableHttpLoad) {
       const gen = ++loadGenRef.current;
       loadedGenRef.current = gen;
+      loadedServerIdRef.current = serverId;
       setLoadedServerId(serverId);
       rebuiltRef.current = false;
       return;
@@ -245,7 +267,8 @@ export function useSubSessions(
               incognitoByServerRef.current.get(serverId!) ?? [],
             ).filter((s) => !loadedIds.has(s.id));
             return preservedIncognito.length > 0 ? [...loaded, ...preservedIncognito] : loaded;
-          }, serverId);
+          }, serverId, true);
+          loadedServerIdRef.current = serverId;
           setLoadedServerId(serverId);
         })
         .catch((err) => {
@@ -292,7 +315,8 @@ export function useSubSessions(
         ccPresetId: null,
         supervisionMode: item.supervisionMode ?? null,
       }, previousById.get(item.subSessionId)));
-    });
+    }, serverIdForShare, true);
+    loadedServerIdRef.current = serverIdForShare;
     setLoadedServerId(serverIdForShare);
   }, []);
 

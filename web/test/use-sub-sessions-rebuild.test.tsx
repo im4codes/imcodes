@@ -259,4 +259,83 @@ describe('useSubSessions rebuild gating', () => {
     view.rerender(<Harness serverId="srv2" activeSession="deck_srv2_brain" />);
     expect(state.visibleSubSessions).toEqual([]);
   });
+
+  it('immediately restores cached sub-sessions and loadedServerId when switching back to a previously visited server without leaking to unvisited servers or dropping incognito', async () => {
+    const handlers: Array<(msg: any) => void> = [];
+    const ws = {
+      subSessionRebuildAll: vi.fn(),
+      onMessage: vi.fn((cb: (msg: any) => void) => { handlers.push(cb); return () => {}; }),
+    } as any;
+    const fire = (msg: any) => { for (const h of [...handlers]) h(msg); };
+    const srv1Sub = {
+      id: 's1',
+      serverId: 'srv1',
+      type: 'shell',
+      shellBin: null,
+      cwd: null,
+      label: 'S1',
+      parentSession: 'deck_srv1_brain',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    const srv2Sub = {
+      id: 's2',
+      serverId: 'srv2',
+      type: 'shell',
+      shellBin: null,
+      cwd: null,
+      label: 'S2',
+      parentSession: 'deck_srv2_brain',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    listSubSessions.mockResolvedValueOnce([srv1Sub]);
+
+    let state!: ReturnType<typeof useSubSessions>;
+    function Harness(props: { serverId: string; activeSession: string | null }) {
+      state = useSubSessions(props.serverId, ws, true, props.activeSession);
+      return null;
+    }
+
+    const view = render(<Harness serverId="srv1" activeSession="deck_srv1_brain" />);
+    await waitFor(() => expect(state.loadedServerId).toBe('srv1'));
+    expect(state.visibleSubSessions.map((s) => s.id)).toEqual(['s1']);
+
+    // Add an incognito sub-session on srv1 before switching away.
+    await act(async () => {
+      fire({
+        type: 'subsession.created',
+        id: 'inc1',
+        sessionName: 'deck_sub_inc1',
+        sessionType: 'claude-code',
+        parentSession: 'deck_srv1_brain',
+        incognito: true,
+      });
+    });
+    expect(state.visibleSubSessions.map((s) => s.id)).toEqual(['s1', 'inc1']);
+
+    // Switching to an unvisited server (srv2) must still leave loadedServerId null until first load.
+    const srv2Pending = deferred<any[]>();
+    listSubSessions.mockReturnValueOnce(srv2Pending.promise);
+    view.rerender(<Harness serverId="srv2" activeSession="deck_srv2_brain" />);
+    expect(state.loadedServerId).toBeNull();
+    expect(state.visibleSubSessions).toEqual([]);
+
+    srv2Pending.resolve([srv2Sub]);
+    await waitFor(() => expect(state.loadedServerId).toBe('srv2'));
+    expect(state.visibleSubSessions.map((s) => s.id)).toEqual(['s2']);
+
+    // Switching back to srv1 must seed cached s1 + preserved inc1 immediately with loadedServerId === 'srv1'
+    // while listSubSessions('srv1') refreshes in the background.
+    const srv1Refresh = deferred<any[]>();
+    listSubSessions.mockReturnValueOnce(srv1Refresh.promise);
+    view.rerender(<Harness serverId="srv1" activeSession="deck_srv1_brain" />);
+    expect(state.loadedServerId).toBe('srv1');
+    expect(state.visibleSubSessions.map((s) => s.id)).toEqual(['s1', 'inc1']);
+
+    srv1Refresh.resolve([srv1Sub]);
+    await waitFor(() => expect(listSubSessions).toHaveBeenCalledTimes(3));
+    expect(state.loadedServerId).toBe('srv1');
+    expect(state.visibleSubSessions.map((s) => s.id)).toEqual(['s1', 'inc1']);
+  });
 });
