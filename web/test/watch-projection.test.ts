@@ -1053,4 +1053,48 @@ describe('watch projection store', () => {
     const row = store.getSnapshot().sessions.find((s) => s.sessionName === 'deck_aip_brain');
     expect(row?.state).toBe('idle');
   });
+
+  it('includes all sessions when main session count <= 5, and filters to pinned mains + their sub-sessions when > 5', () => {
+    const { store } = makeSnapshotStore(6_000);
+    const server = { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' };
+
+    // Boundary: exactly 5 main sessions -> all 5 mains and their sub-sessions are included
+    store.updateFromSessionListWithSubs(
+      server,
+      [
+        { name: 'deck_m1_brain', project: 'M1', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+        { name: 'deck_m2_brain', project: 'M2', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+        { name: 'deck_m3_brain', project: 'M3', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+        { name: 'deck_m4_brain', project: 'M4', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+        { name: 'deck_m5_brain', project: 'M5', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+      ],
+      [
+        { sessionName: 'deck_sub_m1', sessionType: 'claude-code-sdk', state: 'idle', parentSession: 'deck_m1_brain' },
+      ],
+    );
+    expect(store.getSnapshot().sessions.map((s) => s.sessionName)).toHaveLength(6);
+
+    // > 5 main sessions (e.g. 7 mains, 2 pinned) -> only pinned mains + sub-sessions of pinned mains
+    localStorage.setItem('rcc_sync_tab_pinned', JSON.stringify(['deck_m2_brain', 'deck_m6_brain']));
+    store.updateFromSessionListWithSubs(
+      server,
+      [
+        { name: 'deck_m1_brain', project: 'M1', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+        { name: 'deck_m2_brain', project: 'M2', role: 'brain', agentType: 'claude-code-sdk', state: 'working' },
+        { name: 'deck_m3_brain', project: 'M3', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+        { name: 'deck_m4_brain', project: 'M4', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+        { name: 'deck_m5_brain', project: 'M5', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+        { name: 'deck_m6_brain', project: 'M6', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+        { name: 'deck_m7_brain', project: 'M7', role: 'brain', agentType: 'claude-code-sdk', state: 'idle' },
+      ],
+      [
+        { sessionName: 'deck_sub_m1', sessionType: 'claude-code-sdk', state: 'idle', parentSession: 'deck_m1_brain' },
+        { sessionName: 'deck_sub_m2', sessionType: 'claude-code-sdk', state: 'working', parentSession: 'deck_m2_brain' },
+        { sessionName: 'deck_sub_orphan', sessionType: 'claude-code-sdk', state: 'idle' },
+      ],
+    );
+
+    const names = store.getSnapshot().sessions.map((s) => s.sessionName);
+    expect(names).toEqual(['deck_m2_brain', 'deck_m6_brain', 'deck_sub_m2']);
+  });
 });

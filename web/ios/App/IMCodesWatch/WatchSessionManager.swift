@@ -26,6 +26,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
     private static let selectedServerIdKey = "watchSelectedServerId"
     private static let manualSessionsKeyPrefix = "watchManualSessions:"
     private static let cachedSessionsKeyPrefix = "watchCachedSessions:"
+    private static let autoShowAllMainSessionLimit = 5
 
     private let restClient = WatchRestClient()
     private var pendingRoute: WatchRoute?
@@ -81,6 +82,9 @@ final class WatchSessionManager: NSObject, ObservableObject {
         current.insert(trimmed)
         manualSessionsByServer[serverId] = current
         UserDefaults.standard.set(Array(current).sorted(), forKey: Self.manualSessionsKey(for: serverId))
+        if loadedSessionsServerId == serverId {
+            seedVisibleHistoriesIfNeeded(serverId: serverId)
+        }
     }
 
     func removeManualSession(_ sessionName: String, serverId: String) {
@@ -509,7 +513,8 @@ final class WatchSessionManager: NSObject, ObservableObject {
             sessionRows = response.sessions
             loadedSessionsServerId = serverId
             networkLoadedSessionServers.insert(serverId)
-            if let encoded = try? JSONEncoder().encode(response.sessions) {
+            let rowsToCache = prepareSessionsForCache(response.sessions, serverId: serverId)
+            if let encoded = try? JSONEncoder().encode(rowsToCache) {
                 UserDefaults.standard.set(encoded, forKey: Self.cachedSessionsKey(for: serverId))
             }
             isUsingFallbackSnapshot = false
@@ -607,8 +612,52 @@ final class WatchSessionManager: NSObject, ObservableObject {
         historyByRoute[route.id] = seededHistoryState(for: route)
     }
 
+    private static func isSubSessionRow(_ row: WatchSessionRow) -> Bool {
+        row.isSubSession || row.sessionName.hasPrefix("deck_sub_") || row.parentSessionName != nil
+    }
+
+    private func visibleSessionNameSet(in sessions: [WatchSessionRow], serverId: String) -> Set<String> {
+        let mainRows = sessions.filter { !Self.isSubSessionRow($0) }
+        guard mainRows.count > Self.autoShowAllMainSessionLimit else {
+            return Set(sessions.map(\.sessionName))
+        }
+        let manual = manualSessionNames(for: serverId)
+        let visibleMainNames = Set(
+            mainRows
+                .filter { ($0.isPinned ?? false) || manual.contains($0.sessionName) }
+                .map(\.sessionName)
+        )
+        var visible = visibleMainNames
+        for row in sessions where Self.isSubSessionRow(row) {
+            if let parent = row.parentSessionName, visibleMainNames.contains(parent) {
+                visible.insert(row.sessionName)
+            }
+        }
+        return visible
+    }
+
+    private func prepareSessionsForCache(_ sessions: [WatchSessionRow], serverId: String) -> [WatchSessionRow] {
+        let mainCount = sessions.reduce(into: 0) { count, row in
+            if !Self.isSubSessionRow(row) { count += 1 }
+        }
+        guard mainCount > Self.autoShowAllMainSessionLimit else {
+            return sessions
+        }
+        let visibleNames = visibleSessionNameSet(in: sessions, serverId: serverId)
+        return sessions.map { row in
+            if visibleNames.contains(row.sessionName) {
+                return row
+            }
+            var stripped = row
+            stripped.recentText = nil
+            return stripped
+        }
+    }
+
     private func seedVisibleHistoriesIfNeeded(serverId: String) {
-        for row in displaySessions(for: serverId) {
+        let serverSessions = displaySessions(for: serverId)
+        let visibleNames = visibleSessionNameSet(in: serverSessions, serverId: serverId)
+        for row in serverSessions where visibleNames.contains(row.sessionName) {
             let route = WatchRoute(serverId: row.serverId, sessionName: row.sessionName, title: row.title)
             if historyByRoute[route.id] == nil {
                 historyByRoute[route.id] = seededHistoryState(for: route)

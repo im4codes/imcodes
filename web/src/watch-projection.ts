@@ -151,6 +151,7 @@ type WatchSessionLike = {
 
 const DEFAULT_DEBOUNCE_MS = 1000;
 const SNAPSHOT_RETRY_MS = 5_000;
+const WATCH_SNAPSHOT_AUTO_INCLUDE_MAIN_LIMIT = 5;
 const PREVIEW_MIN_LENGTH = 10;
 const PREVIEW_MAX_LENGTH = 120;
 const PREVIEW_SCAN_CHAR_LIMIT = 4_096;
@@ -453,7 +454,7 @@ export class WatchProjectionStore {
       generatedAt: this.generatedAt,
       currentServerId: this.currentServerId,
       servers: cloneServerRows(this.servers),
-      sessions: this.buildSessions(),
+      sessions: this.filterSnapshotSessions(this.buildSessions()),
       apiKey: this.resolveApiKey(),
     };
   }
@@ -885,6 +886,32 @@ export class WatchProjectionStore {
         if (titleDiff !== 0) return titleDiff;
         return a.sessionName.localeCompare(b.sessionName, undefined, { sensitivity: 'base' });
       });
+  }
+
+  private filterSnapshotSessions(sessions: WatchSessionRow[]): WatchSessionRow[] {
+    const mainCountByServer = new Map<string, number>();
+    for (const row of sessions) {
+      if (!row.isSubSession) {
+        mainCountByServer.set(row.serverId, (mainCountByServer.get(row.serverId) ?? 0) + 1);
+      }
+    }
+
+    const includedMainKeys = new Set<string>();
+    for (const row of sessions) {
+      if (row.isSubSession) continue;
+      const mainCount = mainCountByServer.get(row.serverId) ?? 0;
+      if (mainCount <= WATCH_SNAPSHOT_AUTO_INCLUDE_MAIN_LIMIT || row.isPinned === true) {
+        includedMainKeys.add(`${row.serverId}:${row.sessionName}`);
+      }
+    }
+
+    return sessions.filter((row) => {
+      const mainCount = mainCountByServer.get(row.serverId) ?? 0;
+      if (mainCount <= WATCH_SNAPSHOT_AUTO_INCLUDE_MAIN_LIMIT) return true;
+      if (!row.isSubSession) return row.isPinned === true;
+      const parentName = row.parentSessionName ?? this.parentSessionByName.get(row.sessionName) ?? null;
+      return parentName !== null && includedMainKeys.has(`${row.serverId}:${parentName}`);
+    });
   }
 
   private pruneCaches(nextSessions: Map<string, WatchSessionRow>): void {
