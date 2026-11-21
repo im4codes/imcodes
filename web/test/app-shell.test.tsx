@@ -52,7 +52,7 @@ const {
 } = vi.hoisted(() => ({
   syncedPrefs: { enabled: false, get: vi.fn(), save: vi.fn() },
   apiFetchMock: vi.fn(),
-  autoRegisterChatScrollState: { enabled: false, mainCalls: [] as string[], subCalls: [] as string[] },
+  autoRegisterChatScrollState: { enabled: false, mainCalls: [] as string[], subCalls: [] as string[], staleMainOnce: new Set<string>() },
   chatScrollMock: vi.fn(),
   clearApiKeyMock: vi.fn(),
   clearAuthKeyMock: vi.fn(async () => undefined),
@@ -667,6 +667,19 @@ vi.mock('../src/components/SessionPane.js', () => ({
         autoRegisterChatScrollState.mainCalls.push(session.name);
       });
     }, [session.name]);
+    useEffect(() => {
+      if (!autoRegisterChatScrollState.enabled || !isActive) return undefined;
+      if (!autoRegisterChatScrollState.staleMainOnce.has(session.name)) return undefined;
+      autoRegisterChatScrollState.staleMainOnce.delete(session.name);
+      onChatScrollFnLatest.current?.(() => false);
+      const timer = window.setTimeout(() => {
+        onChatScrollFnLatest.current?.(() => {
+          autoRegisterChatScrollState.mainCalls.push(session.name);
+          return true;
+        });
+      }, 25);
+      return () => window.clearTimeout(timer);
+    }, [isActive, session.name]);
     return (
     <div
       data-testid={`session-pane-${session.name}`}
@@ -1284,6 +1297,7 @@ beforeEach(() => {
   autoRegisterChatScrollState.enabled = false;
   autoRegisterChatScrollState.mainCalls = [];
   autoRegisterChatScrollState.subCalls = [];
+  autoRegisterChatScrollState.staleMainOnce.clear();
   chatScrollMock.mockReset();
   clearApiKeyMock.mockReset();
   clearAuthKeyMock.mockReset();
@@ -12497,7 +12511,8 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       autoRegisterChatScrollState.mainCalls = [];
       autoRegisterChatScrollState.subCalls = [];
 
-      // 1) Shortcut tab switch (Alt+l) -> beta tab chat scrolls to bottom
+      // 1) Shortcut tab switch (Alt+l) -> beta tab chat scrolls to bottom even if initial fn is stale (returns false)
+      autoRegisterChatScrollState.staleMainOnce.add('deck_beta_brain');
       alphaInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true }));
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'), { timeout: 5000 });
       const betaInput = screen.getByTestId('pane-composer-deck_beta_brain');

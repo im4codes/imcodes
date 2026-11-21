@@ -689,4 +689,100 @@ describe('ChatView — scroll ownership across commits', () => {
     expect(geometry.scrollTop).toBeGreaterThanOrEqual(2400 - geometry.clientHeight);
     expect(view.container.querySelector('.chat-scroll-btn')).toBeNull();
   });
+
+  it('honors onScrollBottomFn called while visible=false once visible transitions to true and keeps autoScroll engaged', async () => {
+    let scrollBottomFn: (() => void) | null = null;
+    geometry.scrollHeight = 2160;
+    geometry.scrollTop = 2160 - geometry.clientHeight;
+    const view = render(
+      <ChatView
+        events={events(30) as never}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId={SESSION}
+        visible={true}
+        onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+      />,
+    );
+    flushFrames();
+    const scrollEl = view.container.querySelector('.chat-view') as HTMLDivElement;
+
+    // User scrolls up (disengages autoScroll), then pane becomes hidden (visible=false).
+    geometry.scrollTop = 320;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    expect(view.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(30) as never}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId={SESSION}
+          visible={false}
+          onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+        />,
+      );
+    });
+
+    // Background update while hidden must not snap scrollTop to bottom while still visible=false.
+    geometry.scrollHeight = 2240;
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(31) as never}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId={SESSION}
+          visible={false}
+          onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+        />,
+      );
+    });
+    flushFrames();
+    expect(geometry.scrollTop).toBe(320);
+
+    // Shortcut switch invokes onScrollBottomFn BEFORE Preact commits visible=true.
+    act(() => {
+      scrollBottomFn?.();
+    });
+    flushFrames();
+    // Still hidden, so DOM scrollTop hasn't jumped yet, but the scroll button is cleared.
+    expect(view.container.querySelector('.chat-scroll-btn')).toBeNull();
+
+    // Now visible transitions false -> true: pending scroll-to-bottom must fire and re-engage follow.
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(31) as never}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId={SESSION}
+          visible={true}
+          onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+        />,
+      );
+    });
+    flushFrames();
+    expect(geometry.scrollTop).toBeGreaterThanOrEqual(2240 - geometry.clientHeight);
+    expect(view.container.querySelector('.chat-scroll-btn')).toBeNull();
+
+    // Subsequent incoming events continue to auto-follow bottom.
+    geometry.scrollHeight = 2360;
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(32) as never}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId={SESSION}
+          visible={true}
+          onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+        />,
+      );
+    });
+    flushFrames();
+    expect(geometry.scrollTop).toBeGreaterThanOrEqual(2360 - geometry.clientHeight);
+  });
 });

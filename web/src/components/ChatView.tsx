@@ -3936,6 +3936,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     }
     if (pendingPinnedLocateIdRef.current === pin.id) return;
     pendingPinnedLocateIdRef.current = pin.id;
+    pendingVisibleScrollToBottomRef.current = false;
     setPinnedLocateError(false);
     setPendingPinnedLocate(pin);
   }, [sessionId]);
@@ -4040,6 +4041,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // set state right after is unchanged.
   const pendingScrollFrameRef = useRef<number | null>(null);
   const pendingEngageFollowRef = useRef(false);
+  const pendingVisibleScrollToBottomRef = useRef(false);
+  const isMountedRef = useRef(true);
   const hasInitialPinCompletedRef = useRef(false);
   const lastVisibleTsRef = useRef(0);
   const visibleRef = useRef(visible);
@@ -4061,9 +4064,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   };
 
   const scrollToBottom = (engageFollow: boolean = true) => {
-    if (!visibleRef.current) return undefined;
-    const el = scrollRef.current;
-    if (!el) return;
     if (engageFollow) {
       userScrollUpUntilRef.current = 0;
       autoScrollRef.current = true;
@@ -4072,15 +4072,42 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       setNewSinceUnfollow(0);
       countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
       setShowScrollBtn(false);
+      suppressLoadOlder();
     }
-    suppressLoadOlder();
+    if (!visibleRef.current) {
+      if (engageFollow) {
+        pendingVisibleScrollToBottomRef.current = true;
+      }
+      return undefined;
+    }
+    const el = scrollRef.current;
+    if (!el) {
+      if (engageFollow) {
+        pendingVisibleScrollToBottomRef.current = true;
+      }
+      return undefined;
+    }
+    if (!engageFollow) {
+      suppressLoadOlder();
+    }
     if (pendingScrollFrameRef.current !== null) return;
     pendingScrollFrameRef.current = requestAnimationFrame(() => {
       pendingScrollFrameRef.current = null;
       const shouldEngage = pendingEngageFollowRef.current;
       pendingEngageFollowRef.current = false;
+      if (!visibleRef.current) {
+        if (shouldEngage) {
+          pendingVisibleScrollToBottomRef.current = true;
+        }
+        return;
+      }
       const node = scrollRef.current;
-      if (!node || !visibleRef.current) return;
+      if (!node) {
+        if (shouldEngage) {
+          pendingVisibleScrollToBottomRef.current = true;
+        }
+        return;
+      }
       // A wheel/touch scroll-away can land between scheduling and this frame.
       // Follow intent is re-checked HERE (not only when scheduled) so a reader
       // is never snapped back down by a pin that was queued before they moved.
@@ -4255,17 +4282,32 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     };
   }, []);
 
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
   // Expose scroll-to-bottom fn to parent via stable ref delegate so retained/hidden
   // parents never invoke a stale closure after `visible` transitions false -> true.
   useEffect(() => {
-    onScrollBottomFn?.(() => scrollToBottomRef.current(true));
+    onScrollBottomFn?.(() => {
+      if (!isMountedRef.current) return false;
+      scrollToBottomRef.current(true);
+      return true;
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onScrollBottomFn]);
 
   // Scroll to bottom once on mount (e.g. when switching terminal→chat).
   // Keep separate from fn-registration so parent re-renders don't re-trigger.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { scrollToBottom(); }, []);
+  useEffect(() => {
+    if (visibleRef.current && !pendingPinnedLocateIdRef.current) {
+      scrollToBottom();
+    }
+  }, []);
 
   // Track whether the last sent user bubble is above/below/inside the
   // viewport. Only "above" flips the pin on — that's when new assistant
@@ -4388,6 +4430,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     prevScrollScopeRef.current = scrollScopeKey;
     autoScrollRef.current = true;
     pendingEngageFollowRef.current = !preview;
+    pendingVisibleScrollToBottomRef.current = false;
     hasInitialScrolledRef.current = false;
     hasInitialPinCompletedRef.current = false;
     prevVisibleTsRef.current = 0;
@@ -4406,7 +4449,28 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   useLayoutEffect(() => {
     const becameVisible = !prevVisibleRef.current && visible;
     prevVisibleRef.current = visible;
-    if (preview || !visible) return;
+    if (!visible) return;
+    const hasPendingVisibleScroll = pendingVisibleScrollToBottomRef.current && !pendingPinnedLocateIdRef.current;
+    if (pendingVisibleScrollToBottomRef.current) {
+      pendingVisibleScrollToBottomRef.current = false;
+    }
+    if (hasPendingVisibleScroll) {
+      autoScrollRef.current = true;
+      pendingEngageFollowRef.current = true;
+      hasInitialScrolledRef.current = false;
+      hasInitialPinCompletedRef.current = false;
+      userScrollUpUntilRef.current = 0;
+      newSinceUnfollowRef.current = 0;
+      setNewSinceUnfollow(0);
+      countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
+      setShowScrollBtn(false);
+      suppressLoadOlder();
+      if (scrollRef.current) {
+        pinScrollToBottomNow(scrollRef.current);
+      }
+      scrollToBottom(true);
+    }
+    if (preview) return;
     if (becameVisible && !pendingPinnedLocateIdRef.current) {
       autoScrollRef.current = true;
       pendingEngageFollowRef.current = true;

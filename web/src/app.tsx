@@ -3600,26 +3600,46 @@ function InternalMainApp() {
 
   const scheduleMainChatScrollToBottom = useCallback((name: string) => {
     pendingChatScrollSessionRef.current = name;
-    requestAnimationFrame(() => {
-      if (pendingChatScrollSessionRef.current !== name) return;
-      const fn = chatScrollFnsRef.current.get(name);
-      if (fn) {
-        pendingChatScrollSessionRef.current = null;
-        fn();
-      }
-    });
+    const tryScroll = (remainingRetries: number) => {
+      requestAnimationFrame(() => {
+        if (pendingChatScrollSessionRef.current !== name) return;
+        const fn = chatScrollFnsRef.current.get(name) as (() => boolean | void) | undefined;
+        if (fn) {
+          const handled = fn();
+          if (handled !== false) {
+            pendingChatScrollSessionRef.current = null;
+            return;
+          }
+          chatScrollFnsRef.current.delete(name);
+        }
+        if (remainingRetries > 0) {
+          tryScroll(remainingRetries - 1);
+        }
+      });
+    };
+    tryScroll(3);
   }, []);
 
   const scheduleSubChatScrollToBottom = useCallback((id: string) => {
     pendingSubScrollIdsRef.current.add(id);
-    requestAnimationFrame(() => {
-      if (!pendingSubScrollIdsRef.current.has(id)) return;
-      const fn = subChatScrollFnsRef.current.get(id);
-      if (fn) {
-        pendingSubScrollIdsRef.current.delete(id);
-        fn();
-      }
-    });
+    const tryScroll = (remainingRetries: number) => {
+      requestAnimationFrame(() => {
+        if (!pendingSubScrollIdsRef.current.has(id)) return;
+        const fn = subChatScrollFnsRef.current.get(id) as (() => boolean | void) | undefined;
+        if (fn) {
+          const handled = fn();
+          if (handled !== false) {
+            pendingSubScrollIdsRef.current.delete(id);
+            return;
+          }
+          subChatScrollFnsRef.current.delete(id);
+        }
+        if (remainingRetries > 0) {
+          tryScroll(remainingRetries - 1);
+        }
+      });
+    };
+    tryScroll(3);
   }, []);
 
   const maximizeOpenSubSession = useCallback((id: string) => {
