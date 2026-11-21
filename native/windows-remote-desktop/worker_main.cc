@@ -887,17 +887,13 @@ class WorkerRuntime {
                                        kHeadlessDisplayReason));
         return true;
       }
-      int pending_controllers =
-          signal.authority.mode == kControlMode ? 1 : 0;
-      for (const auto& [id, existing] : sessions_) {
-        if (!existing->closed() && existing->controlling())
-          ++pending_controllers;
-      }
+      const ActiveSessionCounts active = CountActiveSessionsOnSignaling();
+      const std::uint32_t pending_viewers = active.viewers + 1;
+      const std::uint32_t pending_controllers =
+          active.controllers + (signal.authority.mode == kControlMode ? 1 : 0);
       // Show the native disclosure synchronously before AcquireSource starts
       // DXGI.  A failed initialization immediately restores the actual count.
-      if (!presentation_adapter_.Show(
-              static_cast<std::uint32_t>(sessions_.size()) + 1,
-              static_cast<std::uint32_t>(pending_controllers))) {
+      if (!presentation_adapter_.Show(pending_viewers, pending_controllers)) {
         writer_->Emit(TerminalEnvelope(signal.authority,
                                        "protected_desktop"));
         return true;
@@ -1248,17 +1244,27 @@ class WorkerRuntime {
     RemoveClosedOnSignaling();
   }
 
-  void UpdateIndicatorOnSignaling() {
-    int controllers = 0;
+  struct ActiveSessionCounts {
+    std::uint32_t viewers = 0;
+    std::uint32_t controllers = 0;
+  };
+
+  ActiveSessionCounts CountActiveSessionsOnSignaling() const {
+    ActiveSessionCounts counts;
     for (const auto& [id, session] : sessions_) {
-      if (!session->closed() && session->controlling()) ++controllers;
+      if (session->closed()) continue;
+      ++counts.viewers;
+      if (session->controlling()) ++counts.controllers;
     }
-    if (sessions_.empty()) {
+    return counts;
+  }
+
+  void UpdateIndicatorOnSignaling() {
+    const ActiveSessionCounts active = CountActiveSessionsOnSignaling();
+    if (active.viewers == 0) {
       presentation_adapter_.Hide();
     } else {
-      presentation_adapter_.Show(
-          static_cast<std::uint32_t>(sessions_.size()),
-          static_cast<std::uint32_t>(controllers));
+      presentation_adapter_.Show(active.viewers, active.controllers);
     }
   }
 
