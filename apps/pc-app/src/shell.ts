@@ -92,6 +92,7 @@ export interface PcAppShellDeps {
       | 'locale'
       | 'timeZone'
       | 'onSpeechModelStatusChanged'
+      | 'onInputDevicesChanged'
     >
   >;
   createMainWindow: (options: {
@@ -374,6 +375,15 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       onSelectSpeechModel: (model) => {
         void voice.setSpeechModel(model).then(() => rebuildMenu());
       },
+      inputDevices: voice?.getInputDevicesSync(),
+      selectedInputDevice: voice?.getSelectedInputDevice(),
+      onSelectInputDevice: (uid) => {
+        voice.setSelectedInputDevice(uid);
+        rebuildMenu();
+      },
+      onRefreshInputDevices: () => {
+        void voice.getInputDevices().then(() => rebuildMenu());
+      },
       onSelectServer: (origin) => void handleSelectServer(origin),
       onAddServer: () => void handleAddServer(),
       onSwitchServer: () => void showServerPicker(),
@@ -417,13 +427,17 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       }
     },
     onSpeechModelStatusChanged: () => rebuildMenu(),
+    onInputDevicesChanged: () => rebuildMenu(),
     ...(deps.voiceDeps ?? {}),
   });
   if (deps.ipcMain) {
     voice.registerIpc(deps.ipcMain);
   }
-  if (deps.platform === 'darwin' && voice.getSpeechModel() !== 'system') {
-    void voice.warmSelectedSpeechModel();
+  if (deps.platform === 'darwin') {
+    if (voice.getSpeechModel() !== 'system') {
+      void voice.warmSelectedSpeechModel();
+    }
+    void voice.getInputDevices();
   }
 
   const ensureWindow = async (): Promise<ShellWindowLike> => {

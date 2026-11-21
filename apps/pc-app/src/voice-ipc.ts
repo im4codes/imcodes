@@ -1,5 +1,5 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isSameActiveOrigin } from './security.js';
@@ -23,8 +23,19 @@ export const PC_APP_VOICE_CHANNELS = Object.freeze({
   getSpeechModel: 'imcodes:pc-voice:get-speech-model',
   setSpeechModel: 'imcodes:pc-voice:set-speech-model',
   getSpeechModelStatus: 'imcodes:pc-voice:get-speech-model-status',
+  getInputDevices: 'imcodes:pc-voice:get-input-devices',
+  getInputDevice: 'imcodes:pc-voice:get-input-device',
+  setInputDevice: 'imcodes:pc-voice:set-input-device',
   event: 'imcodes:pc-voice:event',
 } as const);
+
+export interface PcAppInputDevice {
+  uid: string;
+  name: string;
+  transport: string;
+  isDefault: boolean;
+  isPhysical: boolean;
+}
 
 export type PcAppMediaAccessStatus = 'not-determined' | 'granted' | 'denied' | 'restricted' | 'unknown';
 export type PcAppPrivacyTarget = 'microphone' | 'speech';
@@ -85,6 +96,7 @@ export interface PcAppVoiceControllerDeps {
   locale?: string;
   timeZone?: string;
   onSpeechModelStatusChanged?: (status: PcAppSpeechModelStatus) => void;
+  onInputDevicesChanged?: (devices: PcAppInputDevice[], selectedUid: string) => void;
 }
 
 const MAC_PRIVACY_URLS: Record<PcAppPrivacyTarget, string> = {
@@ -163,6 +175,34 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
   const modelStore = new PcAppSpeechModelStore(deps.userDataDir);
   let selectedModel: PcAppSpeechModelChoice = modelStore.load();
+  const inputDeviceStorePath = join(deps.userDataDir, 'speech-input-device.json');
+  const loadSelectedInputDevice = (): string => {
+    try {
+      const raw = readFileSync(inputDeviceStorePath, 'utf8');
+      const parsed = JSON.parse(raw) as { version?: unknown; uid?: unknown } | null;
+      if (!parsed || typeof parsed !== 'object' || parsed.version !== 1) return 'auto';
+      const uid = typeof parsed.uid === 'string' ? parsed.uid.trim() : '';
+      return uid || 'auto';
+    } catch {
+      return 'auto';
+    }
+  };
+  const saveSelectedInputDevice = (uid: string): void => {
+    const tmpPath = `${inputDeviceStorePath}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      mkdirSync(deps.userDataDir, { recursive: true, mode: 0o700 });
+      writeFileSync(tmpPath, JSON.stringify({ version: 1, uid }, null, 2), { encoding: 'utf8', mode: 0o600 });
+      renameSync(tmpPath, inputDeviceStorePath);
+    } catch {
+      try {
+        rmSync(tmpPath, { force: true });
+      } catch {
+        // Fail soft when userDataDir is unwritable.
+      }
+    }
+  };
+  let selectedInputDevice: string = loadSelectedInputDevice();
+  let cachedInputDevices: PcAppInputDevice[] = [];
   let modelDownloadState: PcAppSpeechModelStatus['state'] = 'idle';
   let modelDownloadProgress = 0;
   let modelDownloadedBytes = 0;
@@ -507,6 +547,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         if (typeof options?.locale === 'string' && options.locale.trim()) {
           args.push('--locale', options.locale.trim());
         }
+        if (selectedInputDevice !== 'auto') {
+          args.push('--device', selectedInputDevice);
+        }
       } else {
         if (!verified) {
           void triggerDownloadIfSelected();
@@ -532,6 +575,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       args = ['listen'];
       if (typeof options?.locale === 'string' && options.locale.trim()) {
         args.push('--locale', options.locale.trim());
+      }
+      if (selectedInputDevice !== 'auto') {
+        args.push('--device', selectedInputDevice);
       }
     }
 
@@ -639,6 +685,55 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     return computeStatusSync();
   };
 
+  const getInputDevices = async (): Promise<PcAppInputDevice[]> => {
+    if (deps.platform !== 'darwin') {
+      return [];
+    }
+    const bin = resolveSpeechHelperPath();
+    if (!bin) return [...cachedInputDevices];
+    try {
+      const raw = deps.runHelperSync
+        ? deps.runHelperSync(bin, ['devices'])
+        : await (deps.runHelperAsync ?? defaultRunHelperAsync)(bin, ['devices']);
+      const parsed = JSON.parse(raw.trim()) as unknown;
+      if (!Array.isArray(parsed)) return [...cachedInputDevices];
+      const next: PcAppInputDevice[] = [];
+      for (const item of parsed) {
+        if (!item || typeof item !== 'object') continue;
+        const rec = item as Record<string, unknown>;
+        const uid = typeof rec.uid === 'string' ? rec.uid.trim() : '';
+        if (!uid) continue;
+        const name = typeof rec.name === 'string' && rec.name.trim() ? rec.name.trim() : uid;
+        const transport = typeof rec.transport === 'string' && rec.transport.trim() ? rec.transport.trim() : 'other';
+        next.push({
+          uid,
+          name,
+          transport,
+          isDefault: rec.isDefault === true,
+          isPhysical: rec.isPhysical === true,
+        });
+      }
+      cachedInputDevices = next;
+      deps.onInputDevicesChanged?.([...cachedInputDevices], selectedInputDevice);
+    } catch {
+      // Keep cached devices on helper failure.
+    }
+    return [...cachedInputDevices];
+  };
+
+  const getSelectedInputDevice = (): string => selectedInputDevice;
+
+  const setSelectedInputDevice = (rawUid: unknown): string => {
+    if (typeof rawUid !== 'string') {
+      throw new Error(`Invalid input device UID: ${String(rawUid)}`);
+    }
+    const next = rawUid.trim() || 'auto';
+    selectedInputDevice = next;
+    saveSelectedInputDevice(next);
+    deps.onInputDevicesChanged?.([...cachedInputDevices], selectedInputDevice);
+    return selectedInputDevice;
+  };
+
   const registerIpc = (ipcMain: PcAppIpcMainLike) => {
     ipcMain.handle(PC_APP_VOICE_CHANNELS.getPermissions, async (event) => {
       assertTrustedSender(event);
@@ -676,6 +771,18 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       assertTrustedSender(event);
       return getSpeechModelStatus();
     });
+    ipcMain.handle(PC_APP_VOICE_CHANNELS.getInputDevices, async (event) => {
+      assertTrustedSender(event);
+      return getInputDevices();
+    });
+    ipcMain.handle(PC_APP_VOICE_CHANNELS.getInputDevice, async (event) => {
+      assertTrustedSender(event);
+      return getSelectedInputDevice();
+    });
+    ipcMain.handle(PC_APP_VOICE_CHANNELS.setInputDevice, async (event, uid) => {
+      assertTrustedSender(event);
+      return setSelectedInputDevice(uid);
+    });
   };
 
   const unregisterIpc = (ipcMain: PcAppIpcMainLike) => {
@@ -688,6 +795,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       PC_APP_VOICE_CHANNELS.getSpeechModel,
       PC_APP_VOICE_CHANNELS.setSpeechModel,
       PC_APP_VOICE_CHANNELS.getSpeechModelStatus,
+      PC_APP_VOICE_CHANNELS.getInputDevices,
+      PC_APP_VOICE_CHANNELS.getInputDevice,
+      PC_APP_VOICE_CHANNELS.setInputDevice,
     ]) {
       ipcMain.removeHandler?.(channel);
     }
@@ -705,6 +815,10 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     setSpeechModel,
     getSpeechModelStatus,
     getSpeechModelStatusSync: computeStatusSync,
+    getInputDevices,
+    getInputDevicesSync: (): PcAppInputDevice[] => [...cachedInputDevices],
+    getSelectedInputDevice,
+    setSelectedInputDevice,
     warmSelectedSpeechModel: triggerDownloadIfSelected,
     registerIpc,
     unregisterIpc,

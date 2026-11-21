@@ -9,6 +9,9 @@ const VOICE_CHANNELS = {
   getSpeechModel: 'imcodes:pc-voice:get-speech-model',
   setSpeechModel: 'imcodes:pc-voice:set-speech-model',
   getSpeechModelStatus: 'imcodes:pc-voice:get-speech-model-status',
+  getInputDevices: 'imcodes:pc-voice:get-input-devices',
+  getInputDevice: 'imcodes:pc-voice:get-input-device',
+  setInputDevice: 'imcodes:pc-voice:set-input-device',
   event: 'imcodes:pc-voice:event',
 } as const;
 
@@ -30,6 +33,10 @@ if (isHttpContext) {
     setSpeechModel: (model: 'system' | 'qwen3-0.6b' | 'qwen3-1.7b') =>
       ipcRenderer.invoke(VOICE_CHANNELS.setSpeechModel, model),
     getSpeechModelStatus: () => ipcRenderer.invoke(VOICE_CHANNELS.getSpeechModelStatus),
+    getInputDevices: () => ipcRenderer.invoke(VOICE_CHANNELS.getInputDevices),
+    getInputDevice: () => ipcRenderer.invoke(VOICE_CHANNELS.getInputDevice),
+    setInputDevice: (uid: string) =>
+      ipcRenderer.invoke(VOICE_CHANNELS.setInputDevice, uid),
     subscribe: (listener: (event: unknown) => void) => {
       if (typeof listener !== 'function') return () => {};
       const handler = (_ipcEvent: unknown, payload: unknown) => {

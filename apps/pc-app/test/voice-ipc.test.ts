@@ -157,6 +157,9 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       PC_APP_VOICE_CHANNELS.getSpeechModel,
       PC_APP_VOICE_CHANNELS.setSpeechModel,
       PC_APP_VOICE_CHANNELS.getSpeechModelStatus,
+      PC_APP_VOICE_CHANNELS.getInputDevices,
+      PC_APP_VOICE_CHANNELS.getInputDevice,
+      PC_APP_VOICE_CHANNELS.setInputDevice,
     ]) {
       const fn = ctx.handlers.get(ch)!;
       await expect(fn(untrustedFrameEvent, 'microphone')).rejects.toThrow(/Untrusted origin/);
@@ -537,5 +540,127 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       ['listen', '--model-dir', statusReady.modelDir, '--variant', '0.6b', '--locale', 'zh-CN'],
     );
     await withMetallib.voice.dispose();
+  });
+
+  it('enumerates, persists, and binds selected microphone input device across system and mlx helpers', async () => {
+    const weights = Buffer.from('verified-06b-weights');
+    const sha = createHash('sha256').update(weights).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'aufklarer/test-0.6b',
+        revision: 'rev06',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'aufklarer/test-1.7b',
+        revision: 'rev17',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+    };
+
+    const packagedResDir = path.join(tempDir, 'IM.codes-mic.app', 'Contents', 'Resources');
+    mkdirSync(packagedResDir, { recursive: true });
+    const packagedSpeechBin = path.join(packagedResDir, 'imcodes-speech');
+    const packagedMlxBin = path.join(packagedResDir, 'imcodes-speech-mlx');
+    writeFileSync(packagedSpeechBin, '#!/bin/sh\n', { mode: 0o755 });
+    writeFileSync(packagedMlxBin, '#!/bin/sh\n', { mode: 0o755 });
+    writeFileSync(path.join(packagedResDir, 'mlx.metallib'), 'METALLIB');
+
+    let deviceProbeReply: string | Error = JSON.stringify([
+      { uid: 'BuiltInMic', name: 'MacBook Pro Microphone', transport: 'builtin', isDefault: true, isPhysical: true },
+      { uid: 'AirPods-UID', name: 'AirPods Pro', transport: 'bluetooth', isDefault: false, isPhysical: false },
+    ]);
+
+    const createMicController = () => {
+      const spawned = createFakeChildProcess();
+      const spawnHelper = vi.fn(() => spawned as unknown as ChildProcess);
+      const onInputDevicesChanged = vi.fn();
+      const runHelperAsync = vi.fn(async (bin: string, args: string[]) => {
+        if (bin === packagedSpeechBin && args[0] === 'devices') {
+          if (deviceProbeReply instanceof Error) throw deviceProbeReply;
+          return deviceProbeReply;
+        }
+        if (bin === packagedMlxBin && args[0] === 'probe') {
+          return JSON.stringify({ arch: 'arm64', metalSupported: true, metallibAvailable: true, mlxSupported: true });
+        }
+        return JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true });
+      });
+      const handlers = new Map<string, (event: PcAppIpcInvokeEventLike, ...args: unknown[]) => unknown>();
+      const mainWc = { id: 'main' };
+      const ipcMain: PcAppIpcMainLike = {
+        handle: (channel, listener) => { handlers.set(channel, listener); },
+        removeHandler: (channel) => { handlers.delete(channel); },
+      };
+      const voice = createPcAppVoiceController({
+        platform: 'darwin',
+        arch: 'arm64',
+        userDataDir: tempDir,
+        resourcesPath: packagedResDir,
+        isMainWebContents: (s) => s === mainWc,
+        getCurrentTrustedOrigin: () => 'https://app.im.codes',
+        getActiveOrigin: () => 'https://app.im.codes',
+        getTrustedOrigins: () => new Set(['https://app.im.codes']),
+        getSenderUrl: () => 'https://app.im.codes/session/1',
+        sendToRenderer: () => {},
+        getMediaAccessStatus: () => 'granted',
+        runHelperAsync,
+        spawnHelper,
+        manifests,
+        mirrorOrigins: ['https://hf-mirror.com'],
+        fetchModel: async () => new Response(new Uint8Array(weights), { status: 200 }),
+        onInputDevicesChanged,
+      });
+      voice.registerIpc(ipcMain);
+      return { voice, spawnHelper, runHelperAsync, onInputDevicesChanged, handlers, mainWc };
+    };
+
+    const first = createMicController();
+    const ev: PcAppIpcInvokeEventLike = { sender: first.mainWc, senderFrame: { url: 'https://app.im.codes/session/1' } };
+    expect(await first.handlers.get(PC_APP_VOICE_CHANNELS.getInputDevice)!(ev)).toBe('auto');
+
+    const devices = await first.handlers.get(PC_APP_VOICE_CHANNELS.getInputDevices)!(ev);
+    expect(devices).toEqual([
+      { uid: 'BuiltInMic', name: 'MacBook Pro Microphone', transport: 'builtin', isDefault: true, isPhysical: true },
+      { uid: 'AirPods-UID', name: 'AirPods Pro', transport: 'bluetooth', isDefault: false, isPhysical: false },
+    ]);
+    expect(first.voice.getInputDevicesSync()).toEqual(devices);
+
+    // Helper error preserves cached devices cleanly
+    deviceProbeReply = new Error('helper crashed');
+    expect(await first.voice.getInputDevices()).toEqual(devices);
+
+    // Selecting a device persists it and appends --device <uid> to imcodes-speech
+    expect(await first.handlers.get(PC_APP_VOICE_CHANNELS.setInputDevice)!(ev, 'AirPods-UID')).toBe('AirPods-UID');
+    expect(await first.voice.startListening({ locale: 'en-US' })).toEqual({ ok: true });
+    expect(first.spawnHelper).toHaveBeenLastCalledWith(
+      packagedSpeechBin,
+      ['listen', '--locale', 'en-US', '--device', 'AirPods-UID'],
+    );
+    await first.voice.dispose();
+
+    // Reloading in a fresh controller preserves the selected device and binds --device <uid> on mlx helper too
+    const second = createMicController();
+    expect(second.voice.getSelectedInputDevice()).toBe('AirPods-UID');
+    await second.voice.setSpeechModel('qwen3-0.6b');
+    await new Promise((res) => setTimeout(res, 25));
+    const statusReady = await second.voice.getSpeechModelStatus();
+    expect(await second.voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    expect(second.spawnHelper).toHaveBeenLastCalledWith(
+      packagedMlxBin,
+      ['listen', '--model-dir', statusReady.modelDir, '--variant', '0.6b', '--locale', 'zh-CN', '--device', 'AirPods-UID'],
+    );
+
+    // Setting blank / 'auto' clears --device flag
+    expect(second.voice.setSelectedInputDevice('   ')).toBe('auto');
+    expect(await second.voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    expect(second.spawnHelper).toHaveBeenLastCalledWith(
+      packagedMlxBin,
+      ['listen', '--model-dir', statusReady.modelDir, '--variant', '0.6b', '--locale', 'zh-CN'],
+    );
+    await second.voice.dispose();
   });
 });

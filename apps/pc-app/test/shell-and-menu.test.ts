@@ -762,4 +762,90 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     expect(restore).toHaveBeenCalledTimes(2);
     expect(minimized).toBe(false);
   });
+
+  it('renders Microphone submenu in voice:menu, wires selection & refresh in shell, and keeps voice menu null off darwin', async () => {
+    const win32Template = buildAppMenuTemplate({
+      platform: 'win32',
+      appName: 'IM.codes',
+      locale: 'en',
+      servers: [],
+      activeOrigin: null,
+      onSelectServer: () => {},
+      onAddServer: () => {},
+      onRemoveServer: () => {},
+      onReload: () => {},
+      onForceReload: () => {},
+      onToggleDevTools: () => {},
+      onClearSession: () => {},
+      onBindFallback: () => {},
+      onOpenDocs: () => {},
+    });
+    expect(findMenuItem(win32Template, 'voice:menu')).toBeUndefined();
+
+    const menus: MenuItemOptionsLike[][] = [];
+    let deviceListCalls = 0;
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      welcomeLocale: 'en',
+      voiceDeps: {
+        speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+        runHelperAsync: async (_bin, args) => {
+          if (args[0] === 'devices') {
+            deviceListCalls += 1;
+            return JSON.stringify(
+              deviceListCalls === 1
+                ? [
+                    { uid: 'mic-1', name: 'MacBook Pro Mic', transport: 'builtin', isDefault: true, isPhysical: true },
+                    { uid: 'bt-1', name: 'AirPods', transport: 'bluetooth', isDefault: false, isPhysical: false },
+                  ]
+                : [
+                    { uid: 'mic-1', name: 'MacBook Pro Mic', transport: 'builtin', isDefault: false, isPhysical: true },
+                    { uid: 'usb-1', name: 'Shure MV7', transport: 'usb', isDefault: true, isPhysical: true },
+                  ],
+            );
+          }
+          return JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true });
+        },
+      },
+      createMainWindow: (opts) => createFakeShellWindow({ webPreferences: opts.webPreferences }),
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: (template) => {
+        menus.push(template);
+      },
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 0 }),
+    });
+
+    await shell.ensureWindow();
+    await vi.waitFor(() => {
+      const latest = menus.at(-1)!;
+      expect(findMenuItem(latest, 'voice:mic:mic-1')).toBeDefined();
+    });
+
+    const initialMenu = menus.at(-1)!;
+    expect(findMenuItem(initialMenu, 'voice:mic-menu')?.label).toBe('Microphone');
+    expect(findMenuItem(initialMenu, 'voice:mic-auto')?.checked).toBe(true);
+    expect(findMenuItem(initialMenu, 'voice:mic:mic-1')?.label).toBe('MacBook Pro Mic (Default)');
+    expect(findMenuItem(initialMenu, 'voice:mic:bt-1')?.label).toBe('AirPods (Bluetooth)');
+
+    findMenuItem(initialMenu, 'voice:mic:bt-1')?.click?.();
+    await vi.waitFor(() => {
+      const latest = menus.at(-1)!;
+      expect(shell.voice.getSelectedInputDevice()).toBe('bt-1');
+      expect(findMenuItem(latest, 'voice:mic:bt-1')?.checked).toBe(true);
+      expect(findMenuItem(latest, 'voice:mic-auto')?.checked).toBe(false);
+    });
+
+    findMenuItem(menus.at(-1)!, 'voice:mic-refresh')?.click?.();
+    await vi.waitFor(() => {
+      const latest = menus.at(-1)!;
+      expect(findMenuItem(latest, 'voice:mic:usb-1')?.label).toBe('Shure MV7 (Default)');
+      expect(findMenuItem(latest, 'voice:mic:bt-1')).toBeUndefined();
+    });
+  });
 });

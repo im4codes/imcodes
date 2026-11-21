@@ -170,21 +170,53 @@ private func isPhysicalInputDevice(_ deviceID: AudioDeviceID) -> Int? {
   return physicalTransportPriority(transport)
 }
 
-func selectPreferredPhysicalInputDeviceID() -> AudioDeviceID? {
-  let systemObject = AudioObjectID(kAudioObjectSystemObject)
-
-  var defaultAddr = AudioObjectPropertyAddress(
-    mSelector: kAudioHardwarePropertyDefaultInputDevice,
+private func audioDeviceStringProperty(_ deviceID: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
+  var addr = AudioObjectPropertyAddress(
+    mSelector: selector,
     mScope: kAudioObjectPropertyScopeGlobal,
     mElement: kAudioObjectPropertyElementMain
   )
-  var defaultID: AudioDeviceID = kAudioObjectUnknown
-  var defaultSize = UInt32(MemoryLayout<AudioDeviceID>.size)
-  if AudioObjectGetPropertyData(systemObject, &defaultAddr, 0, nil, &defaultSize, &defaultID) == noErr,
-     isPhysicalInputDevice(defaultID) != nil {
-    return defaultID
+  var value: Unmanaged<CFString>?
+  var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+  let status = AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &value)
+  guard status == noErr, let cfStr = value?.takeRetainedValue() else {
+    return nil
   }
+  return cfStr as String
+}
 
+private func transportTypeName(_ transport: UInt32?) -> String {
+  guard let transport else { return "other" }
+  switch transport {
+  case kAudioDeviceTransportTypeBuiltIn:
+    return "builtin"
+  case kAudioDeviceTransportTypeUSB:
+    return "usb"
+  case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE:
+    return "bluetooth"
+  case kAudioDeviceTransportTypeThunderbolt:
+    return "thunderbolt"
+  case kAudioDeviceTransportTypeDisplayPort:
+    return "displayport"
+  case kAudioDeviceTransportTypeHDMI:
+    return "hdmi"
+  case kAudioDeviceTransportTypePCI:
+    return "pci"
+  case kAudioDeviceTransportTypeFireWire:
+    return "firewire"
+  case kAudioDeviceTransportTypeAVB:
+    return "avb"
+  case kAudioDeviceTransportTypeAggregate:
+    return "aggregate"
+  case kAudioDeviceTransportTypeVirtual:
+    return "virtual"
+  default:
+    return "other"
+  }
+}
+
+private func allAudioDeviceIDs() -> [AudioDeviceID] {
+  let systemObject = AudioObjectID(kAudioObjectSystemObject)
   var devicesAddr = AudioObjectPropertyAddress(
     mSelector: kAudioHardwarePropertyDevices,
     mScope: kAudioObjectPropertyScopeGlobal,
@@ -193,17 +225,85 @@ func selectPreferredPhysicalInputDeviceID() -> AudioDeviceID? {
   var dataSize: UInt32 = 0
   guard AudioObjectGetPropertyDataSize(systemObject, &devicesAddr, 0, nil, &dataSize) == noErr,
         dataSize > 0 else {
-    return nil
+    return []
   }
   let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.stride
   var deviceIDs = [AudioDeviceID](repeating: kAudioObjectUnknown, count: count)
   var mutableSize = dataSize
   guard AudioObjectGetPropertyData(systemObject, &devicesAddr, 0, nil, &mutableSize, &deviceIDs) == noErr else {
-    return nil
+    return []
+  }
+  return deviceIDs
+}
+
+private func defaultInputDeviceID() -> AudioDeviceID {
+  let systemObject = AudioObjectID(kAudioObjectSystemObject)
+  var defaultAddr = AudioObjectPropertyAddress(
+    mSelector: kAudioHardwarePropertyDefaultInputDevice,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var defaultID: AudioDeviceID = kAudioObjectUnknown
+  var defaultSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+  if AudioObjectGetPropertyData(systemObject, &defaultAddr, 0, nil, &defaultSize, &defaultID) == noErr {
+    return defaultID
+  }
+  return kAudioObjectUnknown
+}
+
+func listAliveInputDevices() -> [[String: Any]] {
+  let defaultID = defaultInputDeviceID()
+  var result: [[String: Any]] = []
+  for deviceID in allAudioDeviceIDs() {
+    guard deviceID != kAudioObjectUnknown,
+          isAudioDeviceAlive(deviceID),
+          audioDeviceInputChannelCount(deviceID) > 0,
+          let uid = audioDeviceStringProperty(deviceID, selector: kAudioDevicePropertyDeviceUID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          !uid.isEmpty else {
+      continue
+    }
+    let name = audioDeviceStringProperty(deviceID, selector: kAudioObjectPropertyName)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let transport = audioDeviceTransportType(deviceID)
+    let isPhysical = transport.flatMap(physicalTransportPriority) != nil
+    result.append([
+      "uid": uid,
+      "name": (name?.isEmpty == false ? name! : uid),
+      "transport": transportTypeName(transport),
+      "isDefault": deviceID == defaultID,
+      "isPhysical": isPhysical,
+    ])
+  }
+  return result
+}
+
+func resolveInputDeviceID(deviceUID: String?) -> AudioDeviceID? {
+  if let raw = deviceUID?.trimmingCharacters(in: .whitespacesAndNewlines),
+     !raw.isEmpty,
+     raw.lowercased() != "auto" {
+    for deviceID in allAudioDeviceIDs() {
+      guard deviceID != kAudioObjectUnknown,
+            isAudioDeviceAlive(deviceID),
+            audioDeviceInputChannelCount(deviceID) > 0,
+            let uid = audioDeviceStringProperty(deviceID, selector: kAudioDevicePropertyDeviceUID),
+            uid == raw else {
+        continue
+      }
+      return deviceID
+    }
+  }
+  return selectPreferredPhysicalInputDeviceID()
+}
+
+func selectPreferredPhysicalInputDeviceID() -> AudioDeviceID? {
+  let defaultID = defaultInputDeviceID()
+  if isPhysicalInputDevice(defaultID) != nil {
+    return defaultID
   }
 
   var best: (id: AudioDeviceID, priority: Int)?
-  for deviceID in deviceIDs {
+  for deviceID in allAudioDeviceIDs() {
     guard let priority = isPhysicalInputDevice(deviceID) else { continue }
     if best == nil || priority < best!.priority {
       best = (deviceID, priority)
@@ -223,7 +323,7 @@ final class SpeechSession {
   private var latestText = ""
   private let doneSemaphore = DispatchSemaphore(value: 0)
 
-  func run(localeTag: String?) -> Int32 {
+  func run(localeTag: String?, deviceUID: String?) -> Int32 {
     let micStatus = requestMicIfNeeded()
     if micStatus != .authorized {
       emitJson([
@@ -257,8 +357,8 @@ final class SpeechSession {
     }
 
     let inputNode = audioEngine.inputNode
-    if let preferredInputID = selectPreferredPhysicalInputDeviceID() {
-      try? inputNode.auAudioUnit.setDeviceID(preferredInputID)
+    if let targetInputID = resolveInputDeviceID(deviceUID: deviceUID) {
+      try? inputNode.auAudioUnit.setDeviceID(targetInputID)
     }
     let format = inputNode.outputFormat(forBus: 0)
     guard format.channelCount > 0, format.sampleRate > 0 else {
@@ -433,12 +533,26 @@ case "request":
   _ = requestSpeechIfNeeded()
   emitJson(currentStatusPayload())
   exit(0)
+case "devices":
+  if let data = try? JSONSerialization.data(withJSONObject: listAliveInputDevices(), options: []),
+     let str = String(data: data, encoding: .utf8) {
+    print(str)
+    fflush(stdout)
+  } else {
+    print("[]")
+    fflush(stdout)
+  }
+  exit(0)
 case "listen":
   var localeTag: String?
+  var deviceUID: String?
   var idx = 1
   while idx < args.count {
     if args[idx] == "--locale", idx + 1 < args.count {
       localeTag = args[idx + 1]
+      idx += 2
+    } else if args[idx] == "--device", idx + 1 < args.count {
+      deviceUID = args[idx + 1]
       idx += 2
     } else {
       idx += 1
@@ -453,7 +567,7 @@ case "listen":
   let intSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
   intSrc.setEventHandler { session.stop(abort: true) }
   intSrc.resume()
-  let code = session.run(localeTag: localeTag)
+  let code = session.run(localeTag: localeTag, deviceUID: deviceUID)
   exit(code)
 default:
   emitJson(["type": "error", "code": "unknown_command", "command": cmd])

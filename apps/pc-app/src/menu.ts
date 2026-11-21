@@ -7,6 +7,7 @@ import {
 } from './i18n.js';
 import type { SavedServer } from './servers.js';
 import type { PcAppSpeechModelChoice, PcAppSpeechModelStatus } from './speech-models.js';
+import type { PcAppInputDevice } from './voice-ipc.js';
 
 export interface MenuItemOptionsLike {
   id?: string;
@@ -29,6 +30,10 @@ export interface AppMenuOptions {
   boundServer?: BoundServerSummary | null;
   speechModelStatus?: PcAppSpeechModelStatus;
   onSelectSpeechModel?: (model: PcAppSpeechModelChoice) => void;
+  inputDevices?: PcAppInputDevice[];
+  selectedInputDevice?: string;
+  onSelectInputDevice?: (uid: string) => void;
+  onRefreshInputDevices?: () => void;
   onSelectServer: (origin: string) => void;
   onAddServer: () => void;
   onSwitchServer?: () => void;
@@ -45,6 +50,16 @@ export interface AppMenuOptions {
 
 function formatServerLabel(server: SavedServer): string {
   return server.label ? `${server.label} (${server.origin})` : server.origin;
+}
+
+function formatInputDeviceLabel(
+  device: PcAppInputDevice,
+  t: (key: PcAppMessageKey, vars?: Record<string, string | number>) => string,
+): string {
+  const tags: string[] = [];
+  if (device.isDefault) tags.push(t('menu.voice.micTagDefault'));
+  if (device.transport === 'bluetooth') tags.push(t('menu.voice.micTagBluetooth'));
+  return tags.length > 0 ? `${device.name} (${tags.join(', ')})` : device.name;
 }
 
 /**
@@ -221,6 +236,38 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
             id: 'voice:status',
             label: speechStatusLabel,
             enabled: false,
+          },
+          { type: 'separator' },
+          {
+            id: 'voice:mic-menu',
+            label: t('menu.voice.micLabel'),
+            submenu: [
+              {
+                id: 'voice:mic-auto',
+                label: t('menu.voice.micAuto'),
+                type: 'radio',
+                checked: (options.selectedInputDevice ?? 'auto') === 'auto',
+                click: () => options.onSelectInputDevice?.('auto'),
+              },
+              ...((options.inputDevices ?? []).length > 0
+                ? [
+                    { type: 'separator' } satisfies MenuItemOptionsLike,
+                    ...(options.inputDevices ?? []).map((dev) => ({
+                      id: `voice:mic:${dev.uid}`,
+                      label: formatInputDeviceLabel(dev, t),
+                      type: 'radio' as const,
+                      checked: options.selectedInputDevice === dev.uid,
+                      click: () => options.onSelectInputDevice?.(dev.uid),
+                    })),
+                  ]
+                : []),
+              { type: 'separator' },
+              {
+                id: 'voice:mic-refresh',
+                label: t('menu.voice.micRefresh'),
+                click: () => options.onRefreshInputDevices?.(),
+              },
+            ],
           },
         ],
       }
