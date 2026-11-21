@@ -1482,16 +1482,11 @@ function InternalMainApp() {
         watchProjectionStore.setApiKey(getApiKey() ?? watchKey);
       });
     }
-    watchProjectionStore.setServers(servers.map((server) => ({
-      id: server.id,
-      name: server.name,
-      baseUrl: auth.baseUrl,
-    })));
     watchProjectionStore.setCurrentServerId(selectedServerId);
     return () => {
       cancelled = true;
     };
-  }, [auth, servers, selectedServerId]);
+  }, [auth, selectedServerId]);
 
   useEffect(() => {
     if (!selectedServerId) return;
@@ -2955,6 +2950,15 @@ function InternalMainApp() {
     () => new Set(normalizePinnedServers(unifiedServers, serverPinned)),
     [unifiedServers, serverPinned],
   );
+  useEffect(() => {
+    if (!auth) return;
+    watchProjectionStore.setServers(orderedServers.map((server) => ({
+      id: server.id,
+      name: server.name,
+      baseUrl: auth.baseUrl,
+      isPinned: pinnedServerIds.has(server.id),
+    })));
+  }, [auth, orderedServers, pinnedServerIds]);
   const restrictedSharedEntries = useMemo(
     () => filterRestrictedSharedEntries(sharedEntries),
     [sharedEntries],

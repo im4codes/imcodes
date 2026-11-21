@@ -408,27 +408,32 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showTaskServerFilter) {
-                List {
-                    Section("Devices") {
-                        ForEach(sessionManager.displayServers) { server in
-                            let checked = sessionManager.isTaskServerVisible(server.id)
-                            Button {
-                                sessionManager.toggleTaskServerVisibility(server.id)
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: checked ? "checkmark.square.fill" : "square")
-                                        .font(.caption2)
-                                        .foregroundStyle(checked ? .cyan : .secondary)
-                                    if server.isPinned ?? false {
-                                        Image(systemName: "pin.fill")
-                                            .font(.system(size: 8))
-                                            .foregroundStyle(.orange)
+                NavigationStack {
+                    List {
+                        Section("Devices") {
+                            ForEach(sessionManager.displayServers) { server in
+                                Toggle(isOn: Binding(
+                                    get: { sessionManager.isTaskServerVisible(server.id) },
+                                    set: { _ in sessionManager.toggleTaskServerVisibility(server.id) }
+                                )) {
+                                    HStack(spacing: 4) {
+                                        if server.isPinned ?? false {
+                                            Image(systemName: "pin.fill")
+                                                .font(.system(size: 8))
+                                                .foregroundStyle(.orange)
+                                        }
+                                        Text(server.name)
+                                            .font(.caption)
+                                            .lineLimit(1)
                                     }
-                                    Text(server.name)
-                                        .font(.caption)
-                                        .lineLimit(1)
-                                    Spacer()
                                 }
+                            }
+                        }
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") {
+                                showTaskServerFilter = false
                             }
                         }
                     }

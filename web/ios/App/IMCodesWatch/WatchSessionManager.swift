@@ -52,7 +52,25 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     var displayServers: [WatchServerRow] {
-        let raw = !servers.isEmpty ? servers : applicationContext.servers
+        let contextPinnedById = Dictionary(
+            applicationContext.servers.compactMap { row -> (String, Bool)? in
+                guard let isPinned = row.isPinned else { return nil }
+                return (row.id, isPinned)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let raw: [WatchServerRow]
+        if !servers.isEmpty {
+            raw = servers.map { row in
+                var copy = row
+                if copy.isPinned == nil {
+                    copy.isPinned = contextPinnedById[row.id]
+                }
+                return copy
+            }
+        } else {
+            raw = applicationContext.servers
+        }
         return Self.sortServers(raw)
     }
 
@@ -296,7 +314,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
             return
         }
         async let tasksStep: Void = loadGlobalTasks(force: true)
-        if servers.isEmpty {
+        if servers.isEmpty || servers.contains(where: { $0.isPinned == nil }) {
             await loadServers(force: false)
         }
         if let selectedServerId {

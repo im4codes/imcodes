@@ -42,6 +42,7 @@ export interface WatchServerRow {
   id: string;
   name: string;
   baseUrl: string;
+  isPinned?: boolean;
 }
 
 export interface WatchQueueEntry {
@@ -802,7 +803,9 @@ export class WatchProjectionStore {
 
   private upsertServer(server: WatchServerRow): void {
     const next = new Map(this.servers.map((row) => [row.id, row] as const));
-    next.set(server.id, { ...server });
+    const existing = next.get(server.id);
+    const isPinned = server.isPinned !== undefined ? server.isPinned : existing?.isPinned;
+    next.set(server.id, isPinned !== undefined ? { ...server, isPinned } : { ...server });
     this.servers = [...next.values()];
   }
 

@@ -43,8 +43,8 @@ describe('watch projection store', () => {
     const { store } = makeSnapshotStore(1_000);
     store.setApiKey('watch-key');
     store.setServers([
-      { id: 'srv-2', name: 'Other', baseUrl: 'https://other.test' },
-      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      { id: 'srv-2', name: 'Other', baseUrl: 'https://other.test', isPinned: false },
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test', isPinned: true },
     ]);
 
     store.updateFromSessionList(
@@ -65,8 +65,8 @@ describe('watch projection store', () => {
       currentServerId: 'srv-1',
       apiKey: 'watch-key',
       servers: [
-        { id: 'srv-2', name: 'Other', baseUrl: 'https://other.test' },
-        { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+        { id: 'srv-2', name: 'Other', baseUrl: 'https://other.test', isPinned: false },
+        { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test', isPinned: true },
       ],
     });
     expect(snapshot.sessions.map((row) => row.sessionName)).toEqual([
