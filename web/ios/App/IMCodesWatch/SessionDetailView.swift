@@ -3,12 +3,15 @@ import WatchKit
 
 struct SessionDetailView: View {
     @EnvironmentObject private var sessionManager: WatchSessionManager
+    @StateObject private var voiceManager = WatchVoiceInputManager.shared
     let route: WatchRoute
 
     @StateObject private var ttsPlayer = WatchTtsPlayer()
     @State private var draft = ""
     @State private var isSending = false
     @State private var statusMessage: String?
+    @State private var voiceBaseDraft = ""
+    @State private var voiceSessionActive = false
     @State private var initialScrollDone = false
     @State private var prevItemCount = 0
     @State private var isAtBottom = true
@@ -129,7 +132,21 @@ struct SessionDetailView: View {
         }
         .onDisappear {
             ttsPlayer.stop()
+            if voiceManager.isRecording || voiceManager.state == .transcribing {
+                voiceSessionActive = false
+            }
+            voiceManager.cancelIfRecording()
             sessionManager.clearActiveRoute()
+        }
+        .onChange(of: voiceManager.transcriptUpdate) { update in
+            guard voiceSessionActive, let update else { return }
+            let trimmed = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                draft = mergeVoiceDraft(base: voiceBaseDraft, dictated: trimmed)
+            }
+            if update.isFinal {
+                voiceSessionActive = false
+            }
         }
     }
 
@@ -273,10 +290,37 @@ struct SessionDetailView: View {
 
             HStack(spacing: 8) {
                 Button(isSending ? "…" : "Send") {
+                    if voiceManager.isRecording || voiceManager.state == .transcribing {
+                        voiceSessionActive = false
+                        voiceManager.cancelIfRecording()
+                    }
                     Task { await sendReply(text: draft) }
                 }
                 .font(.caption2)
                 .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSending)
+
+                Button {
+                    if voiceManager.isRecording {
+                        voiceManager.stopRecording()
+                    } else if voiceManager.state == .idle {
+                        voiceBaseDraft = draft
+                        voiceSessionActive = true
+                        voiceManager.startRecording()
+                    }
+                } label: {
+                    if voiceManager.state == .starting || voiceManager.state == .transcribing {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .scaleEffect(0.6)
+                            .frame(width: 16, height: 16)
+                    } else {
+                        Image(systemName: voiceManager.isRecording ? "stop.circle.fill" : "mic.fill")
+                            .font(.caption2)
+                            .foregroundStyle(voiceManager.isRecording ? .red : .accentColor)
+                    }
+                }
+                .disabled(isSending || voiceManager.state == .starting || voiceManager.state == .transcribing)
+                .accessibilityLabel(voiceManager.isRecording ? "Stop dictation" : "Voice input")
 
                 Spacer()
 
@@ -287,7 +331,28 @@ struct SessionDetailView: View {
                         .font(.caption2)
                 }
             }
+
+            if let voiceStatus = voiceManager.statusMessage, !voiceStatus.isEmpty {
+                Text(voiceStatus)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            if let voiceError = voiceManager.errorMessage, !voiceError.isEmpty {
+                Text(voiceError)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.red)
+            }
         }
+    }
+
+    private func mergeVoiceDraft(base: String, dictated: String) -> String {
+        guard !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return dictated
+        }
+        if base.hasSuffix(" ") || base.hasSuffix("\n") {
+            return base + dictated
+        }
+        return base + " " + dictated
     }
 
     private var canSend: Bool {

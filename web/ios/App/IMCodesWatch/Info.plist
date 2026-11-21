@@ -26,5 +26,7 @@
     <string>com.im.codes</string>
     <key>WKRunsIndependentlyOfCompanionApp</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Used to record your voice and stream it to your paired iPhone for speech transcription.</string>
   </dict>
 </plist>

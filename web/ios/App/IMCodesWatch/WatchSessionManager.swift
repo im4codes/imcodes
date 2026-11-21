@@ -585,9 +585,50 @@ extension WatchSessionManager: WCSessionDelegate {
         }
     }
 
+    nonisolated func session(_ session: WCSession, didReceiveMessage message: [String : Any]) {
+        Task { @MainActor in
+            self.handleWatchAsrMessage(message)
+        }
+    }
+
+    nonisolated func session(_ session: WCSession, didReceiveMessage message: [String : Any], replyHandler: @escaping ([String : Any]) -> Void) {
+        replyHandler(["ok": true])
+        Task { @MainActor in
+            self.handleWatchAsrMessage(message)
+        }
+    }
+
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String : Any]) {
         Task { @MainActor in
-            self.handleDurableEvent(userInfo)
+            if (userInfo["action"] as? String) == "watchAsrResult" {
+                self.handleWatchAsrMessage(userInfo)
+            } else {
+                self.handleDurableEvent(userInfo)
+            }
+        }
+    }
+
+    nonisolated func session(_ session: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
+        let metadata = fileTransfer.file.metadata
+        let fileURL = fileTransfer.file.fileURL
+        Task { @MainActor in
+            WatchVoiceInputManager.shared.handleFileTransferCompleted(
+                metadata: metadata,
+                fileURL: fileURL,
+                error: error
+            )
+        }
+    }
+
+    private func handleWatchAsrMessage(_ message: [String: Any]) {
+        guard let action = message["action"] as? String else { return }
+        switch action {
+        case "watchAsrResult":
+            WatchVoiceInputManager.shared.handleWatchAsrResult(message)
+        case "watchAsrStatus":
+            WatchVoiceInputManager.shared.handleWatchAsrStatus(message)
+        default:
+            break
         }
     }
 
