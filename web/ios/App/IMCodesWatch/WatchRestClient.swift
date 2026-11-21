@@ -52,6 +52,24 @@ actor WatchRestClient {
         let text: String
     }
 
+    struct WatchTtsConfig: Codable, Equatable {
+        let mode: String
+        let model: String?
+        let voice: String?
+        let responseFormat: String?
+        let serverDefaultConfigured: Bool?
+    }
+
+    struct TtsSpeechRequestBody: Codable, Equatable {
+        let input: String
+        let lang: String?
+    }
+
+    struct WatchTtsAudioResponse: Equatable {
+        let data: Data
+        let contentType: String
+    }
+
     static func makeServersRequest(baseUrl: URL, apiKey: String) throws -> URLRequest {
         guard !apiKey.isEmpty else { throw WatchRestError.missingParameters }
         let url = baseUrl
@@ -157,6 +175,80 @@ actor WatchRestClient {
             beforeTs: beforeTs
         )
         return try await performJSON(request: request)
+    }
+
+    static func makeTtsConfigRequest(baseUrl: URL, apiKey: String) throws -> URLRequest {
+        guard !apiKey.isEmpty else { throw WatchRestError.missingParameters }
+        let url = baseUrl
+            .appendingPathComponent("api")
+            .appendingPathComponent("tts")
+            .appendingPathComponent("config")
+        return try makeAuthorizedRequest(url: url, apiKey: apiKey)
+    }
+
+    static func makeTtsSpeechRequest(
+        baseUrl: URL,
+        apiKey: String,
+        input: String,
+        lang: String? = nil
+    ) throws -> URLRequest {
+        let trimmedInput = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty, !trimmedInput.isEmpty else {
+            throw WatchRestError.missingParameters
+        }
+        let url = baseUrl
+            .appendingPathComponent("api")
+            .appendingPathComponent("tts")
+            .appendingPathComponent("speech")
+        var request = try makeAuthorizedRequest(url: url, apiKey: apiKey)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("audio/*, application/octet-stream", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONEncoder().encode(
+            TtsSpeechRequestBody(input: trimmedInput, lang: lang)
+        )
+        return request
+    }
+
+    func fetchTtsConfig(baseUrl: URL, apiKey: String) async throws -> WatchTtsConfig {
+        let request = try Self.makeTtsConfigRequest(baseUrl: baseUrl, apiKey: apiKey)
+        return try await performJSON(request: request)
+    }
+
+    func fetchTtsSpeech(
+        baseUrl: URL,
+        apiKey: String,
+        input: String,
+        lang: String? = nil
+    ) async throws -> WatchTtsAudioResponse {
+        let request = try Self.makeTtsSpeechRequest(
+            baseUrl: baseUrl,
+            apiKey: apiKey,
+            input: input,
+            lang: lang
+        )
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw WatchRestError.invalidResponse
+            }
+            switch httpResponse.statusCode {
+            case 200..<300:
+                guard !data.isEmpty else { throw WatchRestError.invalidResponse }
+                let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type") ?? "audio/mpeg"
+                return WatchTtsAudioResponse(data: data, contentType: contentType)
+            case 401, 403:
+                throw WatchRestError.authExpired
+            case 502, 503:
+                throw WatchRestError.agentUnavailable
+            default:
+                throw WatchRestError.serverError(statusCode: httpResponse.statusCode)
+            }
+        } catch let error as WatchRestError {
+            throw error
+        } catch {
+            throw WatchRestError.networkError(error.localizedDescription)
+        }
     }
 
     func sendReply(

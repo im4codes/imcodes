@@ -22,6 +22,7 @@
 		68D8C921DA370A96FFEC3632 /* WatchRestClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D7A228E5C81E9D9E918E935 /* WatchRestClient.swift */; };
 		7DC29F465F6BBC3186483313 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F58337379F5C806BEACE51BC /* ContentView.swift */; };
 		8E63C56B839412039A7DAA64 /* WatchSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0637170AC378C910837B3C39 /* WatchSessionManager.swift */; };
+		9A1B2C3D4E5F60718293A4B5 /* WatchTtsPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A1B2C3D4E5F60718293A4B6 /* WatchTtsPlayer.swift */; };
 		AA0000011FED79650016851F /* AuthSessionPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000001FED79650016851F /* AuthSessionPlugin.swift */; };
 		B19BE7082FFB8D46D7FA845C /* IMCodesWatch.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = CF22FE3CE7EC962E92D3D2D5 /* IMCodesWatch.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		BB0000011FED79650016851F /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = BB0000001FED79650016851F /* PrivacyInfo.xcprivacy */; };
@@ -63,6 +64,7 @@
 /* Begin PBXFileReference section */
 		0637170AC378C910837B3C39 /* WatchSessionManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WatchSessionManager.swift; sourceTree = "<group>"; };
 		1D7A228E5C81E9D9E918E935 /* WatchRestClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WatchRestClient.swift; sourceTree = "<group>"; };
+		9A1B2C3D4E5F60718293A4B6 /* WatchTtsPlayer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WatchTtsPlayer.swift; sourceTree = "<group>"; };
 		20A16CBA698A53EF405066A1 /* Models.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		2BBCF5C44E927F58C34F853F /* IMCodesWatch.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = IMCodesWatch.entitlements; sourceTree = "<group>"; };
 		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
@@ -138,6 +140,7 @@
 				3FEF5BEBBAF97AA37366EDFA /* SessionDetailView.swift */,
 				0637170AC378C910837B3C39 /* WatchSessionManager.swift */,
 				1D7A228E5C81E9D9E918E935 /* WatchRestClient.swift */,
+				9A1B2C3D4E5F60718293A4B6 /* WatchTtsPlayer.swift */,
 				20A16CBA698A53EF405066A1 /* Models.swift */,
 				C653EF149F3AED223982F83D /* Info.plist */,
 				2BBCF5C44E927F58C34F853F /* IMCodesWatch.entitlements */,
@@ -336,6 +339,7 @@
 				0D5515DDFDD801E85B857720 /* SessionDetailView.swift in Sources */,
 				8E63C56B839412039A7DAA64 /* WatchSessionManager.swift in Sources */,
 				68D8C921DA370A96FFEC3632 /* WatchRestClient.swift in Sources */,
+				9A1B2C3D4E5F60718293A4B5 /* WatchTtsPlayer.swift in Sources */,
 				5422A42B3726D16B817BF0F6 /* Models.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -5,6 +5,7 @@ struct SessionDetailView: View {
     @EnvironmentObject private var sessionManager: WatchSessionManager
     let route: WatchRoute
 
+    @StateObject private var ttsPlayer = WatchTtsPlayer()
     @State private var draft = ""
     @State private var isSending = false
     @State private var statusMessage: String?
@@ -123,7 +124,11 @@ struct SessionDetailView: View {
                 await sessionManager.loadHistoryIfNeeded(for: route)
             }
         }
+        .onChange(of: route) { _ in
+            ttsPlayer.stop()
+        }
         .onDisappear {
+            ttsPlayer.stop()
             sessionManager.clearActiveRoute()
         }
     }
@@ -190,6 +195,37 @@ struct SessionDetailView: View {
                                         .font(.system(size: 8))
                                         .foregroundStyle(.red)
                                 }
+                            } else if !item.isUser && !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                let isPlayingItem = ttsPlayer.playingMessageId == item.id
+                                Button {
+                                    if isPlayingItem {
+                                        ttsPlayer.stop()
+                                    } else {
+                                        ttsPlayer.play(
+                                            messageId: item.id,
+                                            text: item.text,
+                                            baseUrl: sessionManager.currentBaseUrl(for: route.serverId),
+                                            apiKey: sessionManager.currentApiKey()
+                                        )
+                                    }
+                                } label: {
+                                    HStack(spacing: 3) {
+                                        if isPlayingItem && ttsPlayer.isLoading {
+                                            ProgressView()
+                                                .progressViewStyle(.circular)
+                                                .scaleEffect(0.45)
+                                                .frame(width: 10, height: 10)
+                                        } else {
+                                            Image(systemName: isPlayingItem ? "stop.fill" : "speaker.wave.2")
+                                                .font(.system(size: 9))
+                                        }
+                                        Text(isPlayingItem ? "Stop" : "Listen")
+                                            .font(.system(size: 8))
+                                    }
+                                    .foregroundStyle(isPlayingItem ? .cyan : .secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel(isPlayingItem ? "Stop" : "Listen")
                             }
                         }
                         if !item.isUser { Spacer(minLength: 20) }
