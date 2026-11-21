@@ -9,6 +9,7 @@ import {
   ipcMain,
   Menu,
   Notification,
+  screen,
   shell,
   systemPreferences,
   type MenuItemConstructorOptions,
@@ -164,12 +165,26 @@ export async function startPcApp(): Promise<void> {
     getMainWindow: () => pcShell.getMainWindow(),
     getSpeechHelperPath: () => pcShell.voice.getSpeechHelperPath(),
     voice: pcShell.voice,
+    createOverlayWindow: (opts) => new BrowserWindow(opts),
+    getOverlayWorkArea: () => screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea,
     onStateChanged: () => pcShell.rebuildMenu(),
     onAccessibilityDenied: (text) => {
       if (text) {
         clipboard.writeText(text);
       }
       promptAccessibilityPermission(Boolean(text));
+    },
+    onUipiDenied: (text) => {
+      if (text) {
+        clipboard.writeText(text);
+      }
+      if (Notification.isSupported()) {
+        const locale = pcShell.getLocale();
+        new Notification({
+          title: tPcApp(locale, 'globalVoice.uipiDenied.title'),
+          body: tPcApp(locale, 'globalVoice.uipiDenied.bodyCopied'),
+        }).show();
+      }
     },
   });
   pcShell.rebuildMenu();

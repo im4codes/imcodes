@@ -189,8 +189,9 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
   }
 
   const speechStatus = options.speechModelStatus;
+  const localAsrSupported = Boolean(speechStatus && (speechStatus.localAsrSupported ?? speechStatus.mlxSupported));
   const activeSelectedModel: PcAppSpeechModelChoice = (() => {
-    if (!speechStatus || !speechStatus.mlxSupported) return 'system';
+    if (!speechStatus || !localAsrSupported) return 'system';
     const sel = speechStatus.selectedModel;
     if (sel === 'system') return 'system';
     const variantState = speechStatus.models ? speechStatus.models[sel]?.state : speechStatus.state;
@@ -211,7 +212,7 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
       return { label: baseLabel, enabled: true, checked: false };
     }
     const vStatus = speechStatus.models?.[choice];
-    const effectiveState = !speechStatus.mlxSupported
+    const effectiveState = !localAsrSupported
       ? 'unsupported'
       : vStatus
         ? vStatus.state
@@ -257,8 +258,14 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     }
   };
 
-  const qwen06bItem = formatMlxModelItem('qwen3-0.6b', t('menu.voice.qwen06b'));
-  const qwen17bItem = formatMlxModelItem('qwen3-1.7b', t('menu.voice.qwen17b'));
+  const qwen06bItem = formatMlxModelItem(
+    'qwen3-0.6b',
+    platform === 'win32' ? t('menu.voice.win.qwen06b') : t('menu.voice.qwen06b'),
+  );
+  const qwen17bItem = formatMlxModelItem(
+    'qwen3-1.7b',
+    platform === 'win32' ? t('menu.voice.win.qwen17b') : t('menu.voice.qwen17b'),
+  );
 
   const speechStatusLabel = (() => {
     if (!speechStatus) {
@@ -279,9 +286,16 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     }
     switch (speechStatus.state) {
       case 'ready':
-        return activeSelectedModel !== 'system'
-          ? t('menu.voice.statusReady')
-          : t('menu.voice.statusIdle');
+        if (activeSelectedModel === 'system') {
+          return t('menu.voice.statusIdle');
+        }
+        if (speechStatus.executionProvider === 'directml' && speechStatus.gpuName) {
+          return t('menu.voice.statusReadyDirectml', { gpu: speechStatus.gpuName });
+        }
+        if (speechStatus.executionProvider === 'cpu') {
+          return t('menu.voice.statusReadyCpu');
+        }
+        return t('menu.voice.statusReady');
       case 'unsupported':
         return t('menu.voice.statusUnsupported');
       case 'idle':
@@ -290,7 +304,7 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     }
   })();
 
-  const voiceMenu: MenuItemOptionsLike | null = platform === 'darwin'
+  const voiceMenu: MenuItemOptionsLike | null = (platform === 'darwin' || platform === 'win32')
     ? {
         id: 'voice:menu',
         label: t('menu.voice.label'),

@@ -1202,4 +1202,134 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     expect(voiceIpcSrc).toContain("'codesign'");
     expect(voiceIpcSrc).toContain("'-i', 'codes.im.pc'");
   });
+
+  it('supports win32 DXGI probe (< 4 GB VRAM -> cpu, >= 4 GB -> directml), default 0.6B, and serve worker', async () => {
+    const weights = Buffer.from('win-onnx-weights');
+    const sha = createHash('sha256').update(weights).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'csukuangfj2/test-win-0.6b',
+        revision: 'win06',
+        files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'ilmina/test-win-1.7b',
+        revision: 'win17',
+        files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+      },
+    };
+
+    const gt1030Dir = path.join(tempDir, 'gt1030');
+    mkdirSync(gt1030Dir, { recursive: true });
+    const spawnedGt1030: Array<{ bin: string; args: string[]; proc: ReturnType<typeof createFakeChildProcess> }> = [];
+    const voiceGt1030 = createPcAppVoiceController({
+      platform: 'win32',
+      arch: 'x64',
+      userDataDir: gt1030Dir,
+      winSpeechHelperPath: 'C:\\IM.codes\\resources\\imcodes-speech-win.exe',
+      useResidentMlxWorker: true,
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes/session/1',
+      sendToRenderer: () => {},
+      manifests,
+      mirrorOrigins: ['https://hf-mirror.com'],
+      fetchModel: async () => new Response(new Uint8Array(weights), { status: 200 }),
+      runHelperAsync: async (_bin, args) => {
+        if (args[0] === 'probe') {
+          return JSON.stringify({
+            ok: true,
+            gpuName: 'NVIDIA GeForce GT 1030',
+            vramMb: 2048,
+            provider: 'directml', // even if helper reports directml, TS policy enforces < 4096 MB -> cpu
+            localAsrSupported: true,
+          });
+        }
+        if (args[0] === 'devices') {
+          return JSON.stringify([
+            { uid: 'wasapi-1', name: 'USB Condenser Mic', transport: 'usb', isDefault: true, isPhysical: true },
+          ]);
+        }
+        return '{}';
+      },
+      spawnHelper: (bin, args) => {
+        const proc = createFakeChildProcess();
+        spawnedGt1030.push({ bin, args, proc });
+        return proc as unknown as ChildProcess;
+      },
+    });
+
+    await voiceGt1030.warmSelectedSpeechModel();
+    await vi.waitFor(() => {
+      expect(spawnedGt1030).toHaveLength(1);
+    });
+    const gtStatus = await voiceGt1030.getSpeechModelStatus();
+    expect(gtStatus.selectedModel).toBe('qwen3-0.6b');
+    expect(gtStatus.activeBackend).toBe('qwen3-0.6b');
+    expect(gtStatus.localAsrSupported).toBe(true);
+    expect(gtStatus.mlxSupported).toBe(false);
+    expect(gtStatus.executionProvider).toBe('cpu');
+    expect(gtStatus.gpuName).toBe('NVIDIA GeForce GT 1030');
+    expect(gtStatus.vramMb).toBe(2048);
+    expect(spawnedGt1030[0]!.args).toEqual([
+      'serve',
+      '--model-dir',
+      gtStatus.modelDir!,
+      '--variant',
+      '0.6b',
+      '--provider',
+      'cpu',
+    ]);
+
+    const winDevices = await voiceGt1030.getInputDevices();
+    expect(winDevices.map((d) => d.uid)).toEqual(['wasapi-1']);
+    expect((await voiceGt1030.getPermissions()).nativeSpeechAvailable).toBe(true);
+    await voiceGt1030.dispose();
+
+    // RTX 4060 8 GB -> enables DirectML
+    const rtxDir = path.join(tempDir, 'rtx4060');
+    mkdirSync(rtxDir, { recursive: true });
+    const spawnedRtx: Array<{ bin: string; args: string[] }> = [];
+    const voiceRtx = createPcAppVoiceController({
+      platform: 'win32',
+      arch: 'x64',
+      userDataDir: rtxDir,
+      winSpeechHelperPath: 'C:\\IM.codes\\resources\\imcodes-speech-win.exe',
+      useResidentMlxWorker: true,
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes/session/1',
+      sendToRenderer: () => {},
+      manifests,
+      mirrorOrigins: ['https://hf-mirror.com'],
+      fetchModel: async () => new Response(new Uint8Array(weights), { status: 200 }),
+      runHelperAsync: async () =>
+        JSON.stringify({
+          ok: true,
+          gpuName: 'NVIDIA GeForce RTX 4060',
+          vramMb: 8192,
+          provider: 'directml',
+          localAsrSupported: true,
+        }),
+      spawnHelper: (bin, args) => {
+        spawnedRtx.push({ bin, args });
+        return createFakeChildProcess() as unknown as ChildProcess;
+      },
+    });
+    await voiceRtx.warmSelectedSpeechModel();
+    await vi.waitFor(() => {
+      expect(spawnedRtx).toHaveLength(1);
+    });
+    expect(voiceRtx.getSpeechModelStatusSync().executionProvider).toBe('directml');
+    expect(spawnedRtx[0]!.args).toContain('directml');
+    await voiceRtx.dispose();
+  });
 });

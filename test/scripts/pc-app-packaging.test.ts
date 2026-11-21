@@ -41,6 +41,7 @@ import {
   buildMacosSpeechHelper,
   buildMacosSpeechMlxHelper,
   buildPcAppNodeExeEnv,
+  buildWindowsSpeechHelper,
   DEFAULT_SPEECH_MLX_PKG_DIR,
   parseBuildPcAppArgs,
   resealMacosAppSpeechHelper,
@@ -309,13 +310,31 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     ).toThrow(/Bundled tmux binary missing/);
 
     const winExe = join(work, 'imcodes-node.exe');
+    const winSpeechExe = join(work, 'win-bin', 'imcodes-speech-win.exe');
+    const winSpeechDll = join(work, 'win-bin', 'sherpa-onnx-c-api.dll');
+    mkdirSync(join(work, 'win-bin'), { recursive: true });
     writeFileSync(winExe, 'MZ-fake-exe', 'utf8');
+    writeFileSync(winSpeechExe, 'MZ-speech-win', 'utf8');
+    writeFileSync(winSpeechDll, 'MZ-sherpa-dll', 'utf8');
+
+    const builtWinSpeech = buildWindowsSpeechHelper({
+      outDir: join(work, 'out-win-speech'),
+      env: { IMCODES_WIN_SPEECH_BIN_PATH: winSpeechExe },
+    });
+    expect(builtWinSpeech).not.toBeNull();
+    expect(existsSync(builtWinSpeech!.binPath)).toBe(true);
+    expect(builtWinSpeech!.runtimeDlls.some((p) => p.endsWith('sherpa-onnx-c-api.dll'))).toBe(true);
+
     const stagedWin = stagePcAppResources({
       platform: 'win32',
       nodeExePath: winExe,
+      winSpeechBinPath: builtWinSpeech!.binPath,
+      winSpeechRuntimeDlls: builtWinSpeech!.runtimeDlls,
       stageDir: join(work, 'stage-win'),
     });
     expect(existsSync(stagedWin.imcodesPath)).toBe(true);
+    expect(existsSync(join(work, 'stage-win', 'imcodes-speech-win.exe'))).toBe(true);
+    expect(existsSync(join(work, 'stage-win', 'sherpa-onnx-c-api.dll'))).toBe(true);
   });
 
   it('verifyPackagedMacosApp enforces Gate 1-4, nested codesign, optional stapler validate, and clean daemon run', () => {

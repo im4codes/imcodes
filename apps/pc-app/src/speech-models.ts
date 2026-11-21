@@ -50,11 +50,18 @@ export interface PcAppSpeechModelStatus {
   downloadedBytes: number;
   totalBytes: number;
   mlxSupported: boolean;
+  localAsrSupported?: boolean;
+  executionProvider?: 'mlx' | 'directml' | 'cpu' | 'system';
+  gpuName?: string | null;
+  vramMb?: number | null;
+  lowVramWarning?: boolean;
   error?: string;
   modelDir?: string;
   downloadingModel?: Exclude<PcAppSpeechModelChoice, 'system'> | null;
   models?: Record<Exclude<PcAppSpeechModelChoice, 'system'>, PcAppSpeechVariantStatus>;
 }
+
+export const WIN32_GPU_MIN_VRAM_MB = 4096;
 
 export const CHINA_MIRROR_ORIGINS = ['https://hf-mirror.com', 'https://huggingface.co'] as const;
 export const GLOBAL_MIRROR_ORIGINS = ['https://huggingface.co', 'https://hf-mirror.com'] as const;
@@ -141,6 +148,91 @@ export const SPEECH_MODEL_MANIFESTS: Record<PcAppSpeechVariant, PcAppSpeechModel
   },
 };
 
+export const WIN32_SPEECH_MODEL_MANIFESTS: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+  '0.6b': {
+    choice: 'qwen3-0.6b',
+    variant: '0.6b',
+    repoId: 'csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25',
+    revision: '68818b2313fe77bd06f6a7c5068ff3ef59d02b8a',
+    files: [
+      {
+        filename: 'conv_frontend.onnx',
+        expectedSize: 44_148_281,
+        expectedSha256: 'd22dc4423e0940e49884e903d2ea2f7e5567c14fc1aed97e4e26d6b8f208ef9e',
+      },
+      {
+        filename: 'encoder.int8.onnx',
+        expectedSize: 182_491_662,
+        expectedSha256: '60748d3e6744a57c9c91e1b17424a6c2990567e8adceb0783940c03ed98fa9d9',
+      },
+      {
+        filename: 'decoder.int8.onnx',
+        expectedSize: 755_914_231,
+        expectedSha256: '4f6885be5959ae26af3089d38ee7972c5fafbeeb1cf8d5e76eab6d8b61ca5771',
+      },
+      {
+        filename: 'tokenizer/merges.txt',
+        expectedSize: 1_671_853,
+        expectedSha256: '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5',
+      },
+      {
+        filename: 'tokenizer/tokenizer_config.json',
+        expectedSize: 12_487,
+        expectedSha256: '4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c',
+      },
+      {
+        filename: 'tokenizer/vocab.json',
+        expectedSize: 2_776_833,
+        expectedSha256: 'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910',
+      },
+    ],
+  },
+  '1.7b': {
+    choice: 'qwen3-1.7b',
+    variant: '1.7b',
+    repoId: 'ilmina/qwen3-asr-1.7b-sherpa-onnx',
+    revision: '66fb5ea2d4d1682ff8a663bf7e788913604996a0',
+    files: [
+      {
+        filename: 'conv_frontend.onnx',
+        expectedSize: 48_080_441,
+        expectedSha256: 'fa894a4ba53da6a4238f2a6ca0b09362e505d39cecbd646051b033e2e8d7e2fb',
+      },
+      {
+        filename: 'encoder.int8.onnx',
+        expectedSize: 314_222_162,
+        expectedSha256: '436fbd910a0c8914851e5ac1354e807be9f283d08a5da728adaa609731c41469',
+      },
+      {
+        filename: 'decoder.int8.onnx',
+        expectedSize: 2_037_458_645,
+        expectedSha256: 'c43c853fa6e97d08365cb8a5502b360b595cd43c00dc60e4d8ca7cc18cad460b',
+      },
+      {
+        filename: 'tokenizer/merges.txt',
+        expectedSize: 1_671_853,
+        expectedSha256: '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5',
+      },
+      {
+        filename: 'tokenizer/tokenizer_config.json',
+        expectedSize: 12_487,
+        expectedSha256: '4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c',
+      },
+      {
+        filename: 'tokenizer/vocab.json',
+        expectedSize: 2_776_833,
+        expectedSha256: 'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910',
+      },
+    ],
+  },
+};
+
+export function getSpeechModelManifests(
+  platform: NodeJS.Platform = process.platform,
+): Record<PcAppSpeechVariant, PcAppSpeechModelManifest> {
+  return platform === 'win32' ? WIN32_SPEECH_MODEL_MANIFESTS : SPEECH_MODEL_MANIFESTS;
+}
+
 export function choiceToSpeechVariant(choice: PcAppSpeechModelChoice): PcAppSpeechVariant | null {
   if (choice === 'qwen3-0.6b') return '0.6b';
   if (choice === 'qwen3-1.7b') return '1.7b';
@@ -153,6 +245,15 @@ export function isValidSpeechModelChoice(value: unknown): value is PcAppSpeechMo
 
 export function defaultMacosSpeechModelsDir(): string {
   return path.join(os.homedir(), 'Library', 'Application Support', 'imcodes-pc-app', 'speech-models');
+}
+
+export function defaultWindowsSpeechModelsDir(appDataDir?: string): string {
+  const base = appDataDir?.trim() || process.env.APPDATA?.trim() || path.join(os.homedir(), 'AppData', 'Roaming');
+  return path.join(base, 'imcodes-pc-app', 'speech-models');
+}
+
+export function defaultSpeechModelsDir(platform: NodeJS.Platform = process.platform): string {
+  return platform === 'win32' ? defaultWindowsSpeechModelsDir() : defaultMacosSpeechModelsDir();
 }
 
 export function verifiedMarkerFilename(revision: string): string {
@@ -279,16 +380,16 @@ export class PcAppSpeechModelStore {
     this.filePath = path.join(userDataDir, fileName);
   }
 
-  load(): PcAppSpeechModelChoice {
+  load(defaultChoice: PcAppSpeechModelChoice = 'system'): PcAppSpeechModelChoice {
     try {
       const raw = readFileSync(this.filePath, 'utf8');
       const parsed = JSON.parse(raw) as { version?: unknown; model?: unknown } | null;
       if (!parsed || typeof parsed !== 'object' || parsed.version !== 1) {
-        return 'system';
+        return defaultChoice;
       }
-      return isValidSpeechModelChoice(parsed.model) ? parsed.model : 'system';
+      return isValidSpeechModelChoice(parsed.model) ? parsed.model : defaultChoice;
     } catch {
-      return 'system';
+      return defaultChoice;
     }
   }
 
@@ -331,9 +432,12 @@ async function computeFileSha256(filePath: string): Promise<{ size: number; sha2
 function removeStalePartFiles(dir: string): void {
   if (!existsSync(dir)) return;
   try {
-    for (const entry of readdirSync(dir)) {
-      if (entry.includes('.part.') || entry.endsWith('.part')) {
-        rmSync(path.join(dir, entry), { force: true });
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        removeStalePartFiles(fullPath);
+      } else if (entry.name.includes('.part.') || entry.name.endsWith('.part')) {
+        rmSync(fullPath, { force: true });
       }
     }
   } catch {
@@ -343,6 +447,7 @@ function removeStalePartFiles(dir: string): void {
 
 export interface SpeechModelDownloaderDeps {
   modelsBaseDir: string;
+  platform?: NodeJS.Platform;
   manifests?: Record<PcAppSpeechVariant, PcAppSpeechModelManifest>;
   explicitMirrors?: readonly string[] | null;
   customMirrors?: readonly string[] | string | null;
@@ -374,7 +479,7 @@ export class PcAppSpeechModelDownloader {
 
   constructor(deps: SpeechModelDownloaderDeps) {
     this.modelsBaseDir = deps.modelsBaseDir;
-    this.manifests = deps.manifests ?? SPEECH_MODEL_MANIFESTS;
+    this.manifests = deps.manifests ?? getSpeechModelManifests(deps.platform);
     this.fetchFn = deps.fetchFn ?? fetch;
     this.onProgress = deps.onProgress;
     this.mirrorOrder = resolvedMirrorOrigins({
@@ -649,6 +754,7 @@ export class PcAppSpeechModelDownloader {
 
     const hash = createHash('sha256');
     let receivedBytes = 0;
+    mkdirSync(path.dirname(partPath), { recursive: true, mode: 0o755 });
     const out = createWriteStream(partPath, { flags: 'w', mode: 0o644 });
     const reader = res.body.getReader();
 

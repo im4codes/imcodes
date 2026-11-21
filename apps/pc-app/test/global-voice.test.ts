@@ -418,9 +418,9 @@ describe('createPcAppGlobalVoice', () => {
     expect(spawnHelper).toHaveBeenCalledTimes(2); // did not respawn when disabled
     await controllerReloaded.dispose();
 
-    const winController = createPcAppGlobalVoice({
-      platform: 'win32',
-      userDataDir: makeTempDir('imcodes-gv-win-'),
+    const linuxController = createPcAppGlobalVoice({
+      platform: 'linux',
+      userDataDir: makeTempDir('imcodes-gv-linux-'),
       iconPath: null,
       getLocale: () => 'en',
       getMainWindow: () => null,
@@ -431,9 +431,120 @@ describe('createPcAppGlobalVoice', () => {
       },
       spawnHelper,
     });
-    expect(winController.isEnabled()).toBe(false);
-    winController.start();
-    expect(await winController.setEnabled(true)).toBe(false);
-    await winController.dispose();
+    expect(linuxController.isEnabled()).toBe(false);
+    linuxController.start();
+    expect(await linuxController.setEnabled(true)).toBe(false);
+    await linuxController.dispose();
+  });
+
+  it('enables win32 double-tap Shift with non-activating click-through BrowserWindow overlay, robot logo, and UIPI fallback', async () => {
+    const userDataDir = makeTempDir('imcodes-gv-win32-');
+    const iconFile = join(userDataDir, 'robot.png');
+    writeFileSync(iconFile, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+
+    const hotkey = createFakeHelper();
+    const spawnHelper = vi.fn(() => hotkey.proc);
+    const runPasteHelper = vi.fn(async () =>
+      JSON.stringify({ type: 'error', code: 'uipi_elevated_target', message: 'Elevated window focused' }),
+    );
+    const onUipiDenied = vi.fn();
+    const onError = vi.fn();
+
+    let capturedOnEvent: ((event: PcAppVoiceEvent) => void) | undefined;
+    const startListening = vi.fn(async (opts?: { source?: 'in-app' | 'global'; onEvent?: (e: PcAppVoiceEvent) => void }) => {
+      capturedOnEvent = opts?.onEvent;
+      return { ok: true };
+    });
+    const stopListening = vi.fn(async () => {
+      capturedOnEvent?.({ type: 'end' });
+    });
+
+    const loadedUrls: string[] = [];
+    const execScripts: string[] = [];
+    const overlayWindowOptions: unknown[] = [];
+    const showInactiveSpy = vi.fn();
+    const showSpy = vi.fn();
+    const hideSpy = vi.fn();
+    const destroySpy = vi.fn();
+    const setAlwaysOnTopSpy = vi.fn();
+    const setIgnoreMouseEventsSpy = vi.fn();
+
+    const controller = createPcAppGlobalVoice({
+      platform: 'win32',
+      userDataDir,
+      iconPath: iconFile,
+      getLocale: () => 'en',
+      getMainWindow: () => ({ isDestroyed: () => false, isFocused: () => false }),
+      getSpeechHelperPath: () => 'C:\\IM.codes\\resources\\imcodes-speech-win.exe',
+      voice: { startListening, stopListening },
+      getOverlayWorkArea: () => ({ x: 0, y: 0, width: 1920, height: 1040 }),
+      createOverlayWindow: (opts) => {
+        overlayWindowOptions.push(opts);
+        return {
+          loadURL: (url: string) => {
+            loadedUrls.push(url);
+          },
+          showInactive: showInactiveSpy,
+          hide: hideSpy,
+          destroy: destroySpy,
+          setAlwaysOnTop: setAlwaysOnTopSpy,
+          setIgnoreMouseEvents: setIgnoreMouseEventsSpy,
+          webContents: {
+            isDestroyed: () => false,
+            isLoading: () => false,
+            executeJavaScript: async (code: string) => {
+              execScripts.push(code);
+            },
+          },
+          show: showSpy,
+        } as unknown as import('../src/global-voice.js').GlobalVoiceOverlayWindowLike;
+      },
+      spawnHelper,
+      runPasteHelper,
+      onUipiDenied,
+      onError,
+    });
+
+    expect(controller.isEnabled()).toBe(true);
+    controller.start();
+    expect(spawnHelper).toHaveBeenCalledWith('C:\\IM.codes\\resources\\imcodes-speech-win.exe', ['hotkey']);
+
+    hotkey.stdout.write('{"type":"double_tap"}\n');
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(overlayWindowOptions).toHaveLength(1);
+    expect(overlayWindowOptions[0]).toMatchObject({
+      focusable: false,
+      transparent: true,
+      frame: false,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      show: false,
+    });
+    expect(setAlwaysOnTopSpy).toHaveBeenCalledWith(true, 'screen-saver');
+    expect(setIgnoreMouseEventsSpy).toHaveBeenCalledWith(true, { forward: true });
+    expect(showInactiveSpy).toHaveBeenCalled();
+    expect(showSpy).not.toHaveBeenCalled();
+    expect(loadedUrls[0]).toContain('data:text/html');
+    expect(decodeURIComponent(loadedUrls[0]!)).toContain('data:image/png;base64,');
+
+    capturedOnEvent?.({ type: 'start' });
+    capturedOnEvent?.({ type: 'result', text: 'hello windows', isFinal: true });
+    expect(execScripts.some((s) => s.includes('hello windows'))).toBe(true);
+
+    hotkey.stdout.write('{"type":"double_tap"}\n');
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(runPasteHelper).toHaveBeenCalledWith(
+      'C:\\IM.codes\\resources\\imcodes-speech-win.exe',
+      ['paste', '--stdin', '--enter'],
+      'hello windows',
+    );
+    expect(onUipiDenied).toHaveBeenCalledWith('hello windows');
+    expect(onError).toHaveBeenCalledWith('uipi_elevated_target', 'Elevated window focused');
+    expect(hideSpy).toHaveBeenCalled();
+
+    await controller.dispose();
+    expect(destroySpy).toHaveBeenCalled();
   });
 });

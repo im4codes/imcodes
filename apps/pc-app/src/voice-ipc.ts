@@ -5,9 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { isSameActiveOrigin } from './security.js';
 import {
   choiceToSpeechVariant,
+  getSpeechModelManifests,
   isValidSpeechModelChoice,
   PcAppSpeechModelDownloader,
   PcAppSpeechModelStore,
+  WIN32_GPU_MIN_VRAM_MB,
   type PcAppSpeechModelChoice,
   type PcAppSpeechModelManifest,
   type PcAppSpeechModelStatus,
@@ -76,7 +78,9 @@ export interface PcAppVoiceControllerDeps {
   speechModelsDir?: string;
   resourcesPath?: string;
   speechHelperPath?: string;
+  winSpeechHelperPath?: string;
   mlxHelperPath?: string;
+  winProvider?: 'auto' | 'directml' | 'cpu';
   isMainWebContents: (sender: unknown) => boolean;
   getCurrentTrustedOrigin: () => string | null;
   getActiveOrigin: () => string | null;
@@ -198,16 +202,22 @@ function defaultBuildDevHelper(outPath: string, arch = process.arch === 'x64' ? 
 }
 
 export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
+  const isDarwin = deps.platform === 'darwin';
+  const isWin32 = deps.platform === 'win32';
   let activeChild: ChildProcess | null = null;
   let activeChildIsMlx = false;
   let activeStopTimer: ReturnType<typeof setTimeout> | null = null;
   let cachedDevHelperPath: string | null = null;
   let cachedMlxSupport: boolean | null =
-    deps.platform !== 'darwin' || (deps.arch ?? process.arch) !== 'arm64' ? false : null;
+    !isDarwin || (deps.arch ?? process.arch) !== 'arm64' ? false : null;
+  let cachedWinOnnxSupport: boolean | null = isWin32 ? null : false;
+  let cachedWinGpuName: string | null = null;
+  let cachedWinVramMb: number | null = null;
+  let cachedWinProvider: 'directml' | 'cpu' = deps.winProvider === 'directml' ? 'directml' : 'cpu';
   let lastProgressNotifiedBucket = -1;
   let lastProgressNotifiedState: PcAppSpeechModelStatus['state'] | null = null;
   let lastProgressNotifiedDownloading: PcAppSpeechVariant | null = null;
-  let lastProgressNotifiedMlx: boolean | null = cachedMlxSupport;
+  let lastProgressNotifiedMlx: boolean | null = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
   let lastProgressNotifiedAt = 0;
 
   interface ActiveWorkerUtterance {
@@ -239,7 +249,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     !controllerDisposed && !serveUnsupported && (deps.useResidentMlxWorker ?? (deps.spawnHelper === undefined));
 
   const modelStore = new PcAppSpeechModelStore(deps.userDataDir);
-  const loadedModel = modelStore.load();
+  const loadedModel = modelStore.load(isWin32 ? 'qwen3-0.6b' : 'system');
   let selectedModel: PcAppSpeechModelChoice = loadedModel;
   let pendingStartupModel: Exclude<PcAppSpeechModelChoice, 'system'> | null =
     loadedModel !== 'system' ? loadedModel : null;
@@ -307,6 +317,26 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
   };
 
+  const resolveWinSpeechHelperPath = (): string | null => {
+    if (!isWin32) return null;
+    if (deps.winSpeechHelperPath) return deps.winSpeechHelperPath;
+    if (deps.speechHelperPath && deps.speechHelperPath.toLowerCase().endsWith('.exe')) {
+      return deps.speechHelperPath;
+    }
+    if (deps.resourcesPath) {
+      const packaged = join(deps.resourcesPath, 'imcodes-speech-win.exe');
+      if (existsSync(packaged)) return packaged;
+    }
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const candidates = [
+      resolve(moduleDir, '../../native/win/build/Release/imcodes-speech-win.exe'),
+      resolve(moduleDir, '../../native/win/build/imcodes-speech-win.exe'),
+      resolve(moduleDir, '../native/win/build/Release/imcodes-speech-win.exe'),
+      resolve(moduleDir, '../native/win/build/imcodes-speech-win.exe'),
+    ];
+    return candidates.find((p) => existsSync(p)) ?? null;
+  };
+
   const resolveMlxHelperPath = (): string | null => {
     if (deps.platform !== 'darwin') return null;
     if ((deps.arch ?? process.arch) !== 'arm64') return null;
@@ -325,6 +355,12 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     return candidates.find((p) => existsSync(p)) ?? null;
   };
 
+  const resolveLocalBackendHelperPath = (): string | null =>
+    isWin32 ? resolveWinSpeechHelperPath() : resolveMlxHelperPath();
+
+  const isLocalAsrSupportedSync = (): boolean =>
+    isWin32 ? (cachedWinOnnxSupport ?? false) : (cachedMlxSupport ?? false);
+
   const variantManifestTotal = (variant: PcAppSpeechVariant): number =>
     downloader.getManifest(variant).files.reduce((sum, f) => sum + f.expectedSize, 0);
 
@@ -340,7 +376,8 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   const getVariantStatusSync = (variant: PcAppSpeechVariant) => {
     const totalBytes = variantMeta[variant].totalBytes || variantManifestTotal(variant);
     const modelDir = downloader.getModelDirectory(variant);
-    if (cachedMlxSupport === false) {
+    const cachedSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    if (cachedSupport === false) {
       return {
         state: 'unsupported' as const,
         progress: 0,
@@ -388,14 +425,16 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   };
 
   const getEffectiveSelectedModel = (): PcAppSpeechModelChoice => {
-    if (cachedMlxSupport === false) return 'system';
+    const cachedSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    if (cachedSupport === false) return 'system';
     const variant = choiceToSpeechVariant(selectedModel);
     if (!variant) return 'system';
     return downloader.isModelReadySync(variant) ? selectedModel : 'system';
   };
 
   const computeStatusSync = (): PcAppSpeechModelStatus => {
-    const mlxSupported = cachedMlxSupport ?? false;
+    const mlxSupported = isDarwin ? (cachedMlxSupport ?? false) : false;
+    const localAsrSupported = isLocalAsrSupportedSync();
     const status06 = getVariantStatusSync('0.6b');
     const status17 = getVariantStatusSync('1.7b');
     const models = {
@@ -404,7 +443,22 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     };
     const downloadingModel = downloadingVariant ? variantToChoice(downloadingVariant) : null;
     const effectiveSelected = getEffectiveSelectedModel();
-    const activeBackend: PcAppSpeechModelChoice = mlxSupported ? effectiveSelected : 'system';
+    const activeBackend: PcAppSpeechModelChoice = localAsrSupported ? effectiveSelected : 'system';
+    const winMeta = isWin32
+      ? {
+          localAsrSupported,
+          executionProvider: activeBackend === 'system' ? ('system' as const) : cachedWinProvider,
+          gpuName: cachedWinGpuName,
+          vramMb: cachedWinVramMb,
+          lowVramWarning:
+            selectedModel === 'qwen3-1.7b' &&
+            cachedWinVramMb !== null &&
+            cachedWinVramMb < WIN32_GPU_MIN_VRAM_MB,
+        }
+      : {
+          localAsrSupported,
+          executionProvider: activeBackend === 'system' ? ('system' as const) : ('mlx' as const),
+        };
 
     if (downloadingVariant) {
       const dlStatus = downloadingVariant === '0.6b' ? status06 : status17;
@@ -416,13 +470,15 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         downloadedBytes: dlStatus.downloadedBytes,
         totalBytes: dlStatus.totalBytes,
         mlxSupported,
+        ...winMeta,
         modelDir: dlStatus.modelDir,
         downloadingModel,
         models,
       };
     }
 
-    if (cachedMlxSupport === false && (selectedModel !== 'system' || lastStatusVariant !== null)) {
+    const cachedSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    if (cachedSupport === false && (selectedModel !== 'system' || lastStatusVariant !== null)) {
       const refVariant = choiceToSpeechVariant(selectedModel) ?? lastStatusVariant ?? '0.6b';
       const refStatus = refVariant === '0.6b' ? status06 : status17;
       return {
@@ -433,6 +489,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         downloadedBytes: 0,
         totalBytes: refStatus.totalBytes,
         mlxSupported: false,
+        ...winMeta,
         modelDir: refStatus.modelDir,
         downloadingModel: null,
         models,
@@ -450,6 +507,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           downloadedBytes: 0,
           totalBytes: lastStatus.totalBytes,
           mlxSupported,
+          ...winMeta,
           ...(lastStatus.error ? { error: lastStatus.error } : {}),
           modelDir: lastStatus.modelDir,
           downloadingModel: null,
@@ -464,11 +522,12 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       return {
         selectedModel: effectiveSelected,
         activeBackend,
-        state: mlxSupported ? activeStatus.state : 'unsupported',
-        progress: mlxSupported ? activeStatus.progress : 0,
-        downloadedBytes: mlxSupported ? activeStatus.downloadedBytes : 0,
+        state: localAsrSupported ? activeStatus.state : 'unsupported',
+        progress: localAsrSupported ? activeStatus.progress : 0,
+        downloadedBytes: localAsrSupported ? activeStatus.downloadedBytes : 0,
         totalBytes: activeStatus.totalBytes,
         mlxSupported,
+        ...winMeta,
         modelDir: activeStatus.modelDir,
         downloadingModel: null,
         models,
@@ -483,6 +542,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       downloadedBytes: 0,
       totalBytes: 0,
       mlxSupported,
+      ...winMeta,
       downloadingModel: null,
       models,
     };
@@ -493,10 +553,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     const clampedProgress = Number.isFinite(status.progress) ? Math.max(0, Math.min(1, status.progress)) : 0;
     const bucket = status.state === 'downloading' ? Math.floor(clampedProgress * 100000) : -1;
     const now = Date.now();
+    const currentSupport = status.localAsrSupported ?? status.mlxSupported;
     const sameContext =
       status.state === lastProgressNotifiedState
       && downloadingVariant === lastProgressNotifiedDownloading
-      && status.mlxSupported === lastProgressNotifiedMlx;
+      && currentSupport === lastProgressNotifiedMlx;
     if (
       !force
       && sameContext
@@ -508,14 +569,15 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     lastProgressNotifiedState = status.state;
     lastProgressNotifiedBucket = bucket;
     lastProgressNotifiedDownloading = downloadingVariant;
-    lastProgressNotifiedMlx = status.mlxSupported;
+    lastProgressNotifiedMlx = currentSupport;
     lastProgressNotifiedAt = now;
     deps.onSpeechModelStatusChanged?.(status);
   };
 
   const downloader = new PcAppSpeechModelDownloader({
     modelsBaseDir: deps.speechModelsDir ?? join(deps.userDataDir, 'speech-models'),
-    manifests: deps.manifests,
+    platform: deps.platform,
+    manifests: deps.manifests ?? getSpeechModelManifests(deps.platform),
     explicitMirrors: deps.mirrorOrigins,
     customMirrors: deps.customMirrors,
     locale: deps.locale,
@@ -547,6 +609,52 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   }
 
   const checkMlxSupported = async (): Promise<boolean> => {
+    if (isWin32) {
+      if (cachedWinOnnxSupport !== null) return cachedWinOnnxSupport;
+      const winBin = resolveWinSpeechHelperPath();
+      if (!winBin) {
+        cachedWinOnnxSupport = false;
+        cachedWinGpuName = null;
+        cachedWinVramMb = null;
+        cachedWinProvider = 'cpu';
+        return false;
+      }
+      try {
+        const raw = deps.runHelperSync
+          ? deps.runHelperSync(winBin, ['probe'])
+          : await (deps.runHelperAsync ?? defaultRunHelperAsync)(winBin, ['probe']);
+        const parsed = JSON.parse(raw.trim()) as {
+          ok?: unknown;
+          gpuName?: unknown;
+          vramMb?: unknown;
+          provider?: unknown;
+          localAsrSupported?: unknown;
+        };
+        const vram = typeof parsed.vramMb === 'number' && Number.isFinite(parsed.vramMb)
+          ? Math.max(0, Math.round(parsed.vramMb))
+          : 0;
+        cachedWinGpuName = typeof parsed.gpuName === 'string' && parsed.gpuName.trim() ? parsed.gpuName.trim() : null;
+        cachedWinVramMb = vram;
+        // Enforce benchmark policy: DirectML ONLY when dedicated VRAM >= 4096 MB; < 4 GB uses CPU.
+        if (deps.winProvider === 'cpu') {
+          cachedWinProvider = 'cpu';
+        } else if (deps.winProvider === 'directml') {
+          cachedWinProvider = vram >= WIN32_GPU_MIN_VRAM_MB ? 'directml' : 'cpu';
+        } else {
+          cachedWinProvider = vram >= WIN32_GPU_MIN_VRAM_MB && parsed.provider === 'directml'
+            ? 'directml'
+            : 'cpu';
+        }
+        cachedWinOnnxSupport = parsed.localAsrSupported !== false && parsed.ok !== false;
+      } catch {
+        cachedWinGpuName = null;
+        cachedWinVramMb = 0;
+        cachedWinProvider = 'cpu';
+        cachedWinOnnxSupport = true;
+      }
+      return cachedWinOnnxSupport;
+    }
+
     if (deps.platform !== 'darwin' || (deps.arch ?? process.arch) !== 'arm64') {
       cachedMlxSupport = false;
       return false;
@@ -668,7 +776,10 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   };
 
   const resolveSpeechHelperPath = (): string | null => {
-    if (deps.platform !== 'darwin') return null;
+    if (isWin32) {
+      return resolveWinSpeechHelperPath();
+    }
+    if (!isDarwin) return null;
     if (deps.speechHelperPath) return deps.speechHelperPath;
     if (deps.resourcesPath) {
       const packaged = join(deps.resourcesPath, 'imcodes-speech');
@@ -712,6 +823,23 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   };
 
   const getPermissions = async (): Promise<PcAppVoicePermissions> => {
+    if (isWin32) {
+      const winBin = resolveWinSpeechHelperPath();
+      if (!winBin) {
+        return {
+          mic: 'unknown',
+          speech: 'unavailable',
+          platform: deps.platform,
+          nativeSpeechAvailable: false,
+        };
+      }
+      return {
+        mic: 'granted',
+        speech: 'granted',
+        platform: deps.platform,
+        nativeSpeechAvailable: true,
+      };
+    }
     if (deps.platform !== 'darwin') {
       return {
         mic: 'unknown',
@@ -896,7 +1024,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     const spawnPromise = (async (): Promise<ResidentMlxWorker | null> => {
       if (controllerDisposed || !shouldUseResidentMlxWorker()) return null;
       if (!(await checkMlxSupported())) return null;
-      const mlxBin = resolveMlxHelperPath();
+      const mlxBin = resolveLocalBackendHelperPath();
       if (!mlxBin || !downloader.isModelReadySync(variant)) return null;
 
       if (!opts?.skipVerify) {
@@ -917,7 +1045,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       }
 
       const modelDir = downloader.getModelDirectory(variant);
-      const args = ['serve', '--model-dir', modelDir, '--variant', variant];
+      const args = isWin32
+        ? ['serve', '--model-dir', modelDir, '--variant', variant, '--provider', cachedWinProvider]
+        : ['serve', '--model-dir', modelDir, '--variant', variant];
       appendVoiceLog(`mlx serve spawn variant=${variant} bin=${mlxBin} args=${JSON.stringify(args)}`);
       const proc = (deps.spawnHelper ?? ((p, a) => spawn(p, a, { stdio: ['pipe', 'pipe', 'pipe'] })))(mlxBin, args);
       const worker: ResidentMlxWorker = {
@@ -1202,11 +1332,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     onEvent?: (event: PcAppVoiceEvent) => void;
   }): Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }> => {
     const isGlobalSource = options?.source === 'global';
-    if (deps.platform !== 'darwin') {
+    if (!isDarwin && !isWin32) {
       return { ok: false, error: 'unsupported_platform' };
     }
     const perms = await requestPermissions();
     if (perms.mic !== 'granted') {
+      if (isWin32) {
+        return { ok: false, error: 'speech_helper_unavailable' };
+      }
       appendVoiceLog(`startListening denied target=mic selectedModel=${selectedModel} device=${selectedInputDevice}`);
       return { ok: false, error: 'permission_denied', target: 'mic' };
     }
@@ -1217,7 +1350,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     let isMlxHelper = false;
 
     if (variant && (await checkMlxSupported()) && downloader.isModelReadySync(variant)) {
-      const mlxBin = resolveMlxHelperPath();
+      const mlxBin = resolveLocalBackendHelperPath();
       if (mlxBin && shouldUseResidentMlxWorker()) {
         const alreadyReady = Boolean(mlxWorker && mlxWorker.variant === variant && mlxWorker.state === 'ready');
         if (!alreadyReady) {
@@ -1278,7 +1411,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       if (mlxBin && verified) {
         bin = mlxBin;
         isMlxHelper = true;
-        args = ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant];
+        args = isWin32
+          ? ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant, '--provider', cachedWinProvider]
+          : ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant];
         if (typeof options?.locale === 'string' && options.locale.trim()) {
           args.push('--locale', options.locale.trim());
         }
@@ -1300,6 +1435,12 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
 
     if (!bin) {
+      if (isWin32) {
+        if (!isGlobalSource) notifyVoiceEvent({ type: 'end' });
+        const errCode = variant ? 'speech_model_downloading' : 'speech_model_required';
+        appendVoiceLog(`startListening win32 unavailable reason=${errCode} selectedModel=${selectedModel}`);
+        return { ok: false, error: errCode };
+      }
       if (perms.speech !== 'granted') {
         if (!isGlobalSource) notifyVoiceEvent({ type: 'end' });
         appendVoiceLog(`startListening denied target=speech selectedModel=${selectedModel} device=${selectedInputDevice}`);
@@ -1439,9 +1580,12 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   const getSpeechModel = (): PcAppSpeechModelChoice => getEffectiveSelectedModel();
 
   const getSpeechModelStatus = async (): Promise<PcAppSpeechModelStatus> => {
-    const prevMlx = cachedMlxSupport;
+    const prevSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    const prevProvider = cachedWinProvider;
+    const prevVram = cachedWinVramMb;
     await checkMlxSupported();
-    if (prevMlx !== cachedMlxSupport) {
+    const nextSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    if (prevSupport !== nextSupport || prevProvider !== cachedWinProvider || prevVram !== cachedWinVramMb) {
       notifyStatusChanged(true);
     }
     return computeStatusSync();
@@ -1521,7 +1665,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   };
 
   const getInputDevices = async (): Promise<PcAppInputDevice[]> => {
-    if (deps.platform !== 'darwin') {
+    if (!isDarwin && !isWin32) {
       return [];
     }
     const bin = resolveSpeechHelperPath();

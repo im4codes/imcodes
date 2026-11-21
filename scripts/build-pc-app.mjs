@@ -44,6 +44,8 @@ export const DEFAULT_TMUX_DIR = join(DEFAULT_NODE_EXE_DIR, 'bundled-tmux-macos')
 export const DEFAULT_SPEECH_SWIFT_SRC = join(PC_APP_DIR, 'native', 'imcodes-speech.swift');
 export const DEFAULT_SPEECH_MLX_PKG_DIR = join(PC_APP_DIR, 'native', 'qwen3-asr');
 export const DEFAULT_SPEECH_BIN_DIR = join(DEFAULT_NODE_EXE_DIR, 'speech-helper-macos');
+export const DEFAULT_WIN_SPEECH_SRC_DIR = join(PC_APP_DIR, 'native', 'win');
+export const DEFAULT_WIN_SPEECH_BIN_DIR = join(DEFAULT_NODE_EXE_DIR, 'speech-helper-win');
 export const DEFAULT_STAGE_ROOT = join(REPO_ROOT, '.pc-app-stage');
 export const DEFAULT_PC_APP_OUT_DIR = join(PC_APP_DIR, 'release');
 
@@ -356,9 +358,86 @@ export function buildMacosSpeechMlxHelper({
 }
 
 /**
+ * Compile or collect `imcodes-speech-win.exe` (and companion sherpa-onnx / ONNX Runtime DLLs)
+ * on Windows hosts (`cmake` when available; returns `null` when native toolchain/SDK is absent).
+ */
+export function buildWindowsSpeechHelper({
+  srcDir = DEFAULT_WIN_SPEECH_SRC_DIR,
+  outDir = DEFAULT_WIN_SPEECH_BIN_DIR,
+  arch = 'x64',
+  execFn = execFileSync,
+  warnFn = (msg) => process.stderr.write(`${msg}\n`),
+  env = process.env,
+} = {}) {
+  const prebuiltPath = env.IMCODES_WIN_SPEECH_BIN_PATH?.trim();
+  const absOutDir = resolve(outDir);
+  if (prebuiltPath && existsSync(prebuiltPath)) {
+    mkdirSync(absOutDir, { recursive: true });
+    const destBin = join(absOutDir, 'imcodes-speech-win.exe');
+    cpSync(prebuiltPath, destBin);
+    const dllDir = dirname(resolve(prebuiltPath));
+    const runtimeDlls = [];
+    for (const entry of readdirSync(dllDir)) {
+      if (entry.toLowerCase().endsWith('.dll')) {
+        const destDll = join(absOutDir, entry);
+        cpSync(join(dllDir, entry), destDll);
+        runtimeDlls.push(destDll);
+      }
+    }
+    return { binPath: destBin, runtimeDlls };
+  }
+
+  const cmakeLists = join(resolve(srcDir), 'CMakeLists.txt');
+  if (!existsSync(cmakeLists)) {
+    warnFn(`[pc-app build] Windows speech CMake source missing at ${srcDir}; skipping imcodes-speech-win.exe`);
+    return null;
+  }
+
+  const buildDir = join(resolve(srcDir), 'build');
+  const sherpaSdkDir = env.IMCODES_SHERPA_ONNX_WIN_DIR?.trim() || env.SHERPA_ONNX_DIR?.trim() || '';
+  try {
+    const cmakeArgs = ['-S', resolve(srcDir), '-B', buildDir, '-A', arch === 'arm64' ? 'ARM64' : 'x64'];
+    if (sherpaSdkDir) {
+      cmakeArgs.push(`-DSHERPA_ONNX_DIR=${resolve(sherpaSdkDir)}`);
+    }
+    execFn('cmake', cmakeArgs, { stdio: 'inherit', env });
+    execFn('cmake', ['--build', buildDir, '--config', 'Release'], { stdio: 'inherit', env });
+  } catch (err) {
+    warnFn(
+      `[pc-app build] CMake build for imcodes-speech-win.exe failed (${err instanceof Error ? err.message : String(err)}); skipping`,
+    );
+    return null;
+  }
+
+  const builtBin = [
+    join(buildDir, 'Release', 'imcodes-speech-win.exe'),
+    join(buildDir, 'imcodes-speech-win.exe'),
+  ].find((p) => existsSync(p));
+  if (!builtBin) {
+    warnFn(`[pc-app build] imcodes-speech-win.exe not produced under ${buildDir}`);
+    return null;
+  }
+
+  mkdirSync(absOutDir, { recursive: true });
+  const destBin = join(absOutDir, 'imcodes-speech-win.exe');
+  cpSync(builtBin, destBin);
+  const runtimeDlls = [];
+  if (sherpaSdkDir && existsSync(join(sherpaSdkDir, 'lib'))) {
+    for (const entry of readdirSync(join(sherpaSdkDir, 'lib'))) {
+      if (entry.toLowerCase().endsWith('.dll')) {
+        const destDll = join(absOutDir, entry);
+        cpSync(join(sherpaSdkDir, 'lib', entry), destDll);
+        runtimeDlls.push(destDll);
+      }
+    }
+  }
+  return { binPath: destBin, runtimeDlls };
+}
+
+/**
  * Stage `extraResources` for macOS or Windows prior to `electron-builder` packing/signing.
  * - macOS: `imcodes`, `imcodes-speech` (when provided), optional `imcodes-speech-mlx` (+ `mlx.metallib`), `bin/tmux`, `terminfo/`, `licenses/`
- * - Windows: `imcodes.exe`
+ * - Windows: `imcodes.exe`, optional `imcodes-speech-win.exe` (+ companion `.dll`s)
  */
 export function stagePcAppResources({
   platform,
@@ -367,6 +446,8 @@ export function stagePcAppResources({
   speechBinPath,
   mlxSpeechBinPath,
   mlxMetallibPath,
+  winSpeechBinPath,
+  winSpeechRuntimeDlls,
   stageDir,
 }) {
   if (!nodeExePath || !existsSync(nodeExePath)) {
@@ -430,9 +511,23 @@ export function stagePcAppResources({
     if (statSync(destExe).size === 0) {
       throw new Error(`Staged imcodes.exe is empty at ${destExe}`);
     }
+    let destWinSpeech = null;
+    const stagedDlls = [];
+    if (winSpeechBinPath && existsSync(winSpeechBinPath)) {
+      destWinSpeech = join(absStageDir, 'imcodes-speech-win.exe');
+      cpSync(winSpeechBinPath, destWinSpeech);
+      for (const dllPath of winSpeechRuntimeDlls ?? []) {
+        if (dllPath && existsSync(dllPath)) {
+          const destDll = join(absStageDir, dirname(dllPath) === absStageDir ? dllPath : resolve(dllPath).split(/[\\/]/).pop());
+          cpSync(dllPath, destDll);
+          stagedDlls.push(destDll);
+        }
+      }
+    }
     return {
       stageDir: absStageDir,
       imcodesPath: destExe,
+      ...(destWinSpeech ? { winSpeechBinPath: destWinSpeech, winSpeechRuntimeDlls: stagedDlls } : {}),
     };
   }
 
@@ -656,6 +751,7 @@ export async function runBuildPcApp(opts, deps = {}) {
   const ensureTmuxFn = deps.ensureBuiltBundledTmuxFn ?? ensureBuiltBundledTmux;
   const buildSpeechFn = deps.buildMacosSpeechHelperFn ?? buildMacosSpeechHelper;
   const buildSpeechMlxFn = deps.buildMacosSpeechMlxHelperFn ?? buildMacosSpeechMlxHelper;
+  const buildWinSpeechFn = deps.buildWindowsSpeechHelperFn ?? buildWindowsSpeechHelper;
   const stageResourcesFn = deps.stagePcAppResourcesFn ?? stagePcAppResources;
   const verifyMacAppFn = deps.verifyPackagedMacosAppFn ?? verifyPackagedMacosApp;
   const verifyWinDirFn = deps.verifyPackagedWindowsDirFn ?? verifyPackagedWindowsDir;
@@ -694,6 +790,9 @@ export async function runBuildPcApp(opts, deps = {}) {
   const mlxSpeech = opts.platform === 'darwin'
     ? buildSpeechMlxFn({ arch: opts.arch })
     : null;
+  const winSpeech = opts.platform === 'win32'
+    ? buildWinSpeechFn({ arch: opts.arch })
+    : null;
 
   const staged = stageResourcesFn({
     platform: opts.platform,
@@ -702,6 +801,8 @@ export async function runBuildPcApp(opts, deps = {}) {
     speechBinPath,
     mlxSpeechBinPath: mlxSpeech?.binPath,
     mlxMetallibPath: mlxSpeech?.metallibPath ?? undefined,
+    winSpeechBinPath: winSpeech?.binPath,
+    winSpeechRuntimeDlls: winSpeech?.runtimeDlls,
     stageDir: opts.stageDir,
   });
 

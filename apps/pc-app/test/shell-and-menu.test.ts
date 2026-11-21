@@ -767,9 +767,9 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     expect(minimized).toBe(false);
   });
 
-  it('renders Microphone submenu in voice:menu, wires selection & refresh in shell, and keeps voice menu null off darwin', async () => {
-    const win32Template = buildAppMenuTemplate({
-      platform: 'win32',
+  it('renders Microphone submenu and Windows VRAM model hints in voice:menu, and keeps voice menu null on linux', async () => {
+    const linuxTemplate = buildAppMenuTemplate({
+      platform: 'linux',
       appName: 'IM.codes',
       locale: 'en',
       servers: [],
@@ -784,7 +784,46 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
       onBindFallback: () => {},
       onOpenDocs: () => {},
     });
-    expect(findMenuItem(win32Template, 'voice:menu')).toBeUndefined();
+    expect(findMenuItem(linuxTemplate, 'voice:menu')).toBeUndefined();
+
+    const winTemplate = buildAppMenuTemplate({
+      platform: 'win32',
+      appName: 'IM.codes',
+      locale: 'en',
+      servers: [],
+      activeOrigin: null,
+      speechModelStatus: {
+        selectedModel: 'qwen3-0.6b',
+        activeBackend: 'qwen3-0.6b',
+        state: 'ready',
+        progress: 1,
+        downloadedBytes: 100,
+        totalBytes: 100,
+        mlxSupported: false,
+        localAsrSupported: true,
+        executionProvider: 'cpu',
+        gpuName: 'NVIDIA GeForce GT 1030',
+        vramMb: 2048,
+        models: {
+          'qwen3-0.6b': { state: 'ready', progress: 1, downloadedBytes: 100, totalBytes: 100, modelDir: 'C:\\models\\0.6b' },
+          'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 100, modelDir: 'C:\\models\\1.7b' },
+        },
+      },
+      onSelectServer: () => {},
+      onAddServer: () => {},
+      onRemoveServer: () => {},
+      onReload: () => {},
+      onForceReload: () => {},
+      onToggleDevTools: () => {},
+      onClearSession: () => {},
+      onBindFallback: () => {},
+      onOpenDocs: () => {},
+    });
+    expect(findMenuItem(winTemplate, 'voice:menu')).toBeDefined();
+    expect(findMenuItem(winTemplate, 'voice:model-qwen3-0.6b')?.label).toContain(tPcApp('en', 'menu.voice.win.qwen06b'));
+    expect(findMenuItem(winTemplate, 'voice:model-qwen3-1.7b')?.label).toContain(tPcApp('en', 'menu.voice.win.qwen17b'));
+    expect(findMenuItem(winTemplate, 'voice:status')?.label).toBe(tPcApp('en', 'menu.voice.statusReadyCpu'));
+    expect(findMenuItem(winTemplate, 'voice:global-input')?.label).toBe(tPcApp('en', 'menu.voice.globalInput'));
 
     const menus: MenuItemOptionsLike[][] = [];
     let deviceListCalls = 0;
@@ -1254,5 +1293,90 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     expect(findMenuItem(unsupportedMenu, 'voice:model-qwen3-1.7b')?.checked).toBe(false);
     expect(findMenuItem(unsupportedMenu, 'voice:model-qwen3-1.7b')?.enabled).toBe(false);
     expect(findMenuItem(unsupportedMenu, 'voice:model-qwen3-1.7b')?.label).toContain('(Unsupported)');
+  });
+
+  it('prompts low-VRAM warning on win32 when manually selecting qwen3-1.7b with < 4 GB VRAM and defaults to 0.6b when declined', async () => {
+    const menus: MenuItemOptionsLike[][] = [];
+    const promptBoxes: Array<{ title?: string; message: string; buttons?: string[] }> = [];
+    const weights = Buffer.from('win-model');
+    const { createHash } = await import('node:crypto');
+    const sha = createHash('sha256').update(weights).digest('hex');
+
+    let boxResponse = 0; // 0 = Use Recommended 0.6B, 1 = Continue with 1.7B
+    const shell = createPcAppShell({
+      platform: 'win32',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      welcomeLocale: 'en',
+      voiceDeps: {
+        winSpeechHelperPath: 'C:\\IM.codes\\resources\\imcodes-speech-win.exe',
+        mirrorOrigins: ['https://hf-mirror.com'],
+        fetchModel: async () => new Response(new Uint8Array(weights), { status: 200 }),
+        manifests: {
+          '0.6b': {
+            choice: 'qwen3-0.6b',
+            variant: '0.6b',
+            repoId: 'csukuangfj2/test-06b',
+            revision: 'r06',
+            files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+          },
+          '1.7b': {
+            choice: 'qwen3-1.7b',
+            variant: '1.7b',
+            repoId: 'ilmina/test-17b',
+            revision: 'r17',
+            files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+          },
+        },
+        runHelperAsync: async (_bin, args) => {
+          if (args[0] === 'probe') {
+            return JSON.stringify({
+              ok: true,
+              gpuName: 'NVIDIA GeForce GT 1030',
+              vramMb: 2048,
+              provider: 'cpu',
+              localAsrSupported: true,
+            });
+          }
+          return '[]';
+        },
+      },
+      createMainWindow: (opts) => createFakeShellWindow({ webPreferences: opts.webPreferences }),
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: (template) => {
+        menus.push(template);
+      },
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async (_win, options) => {
+        promptBoxes.push(options);
+        return { response: boxResponse };
+      },
+    });
+
+    await shell.ensureWindow();
+    await vi.waitFor(() => {
+      expect(shell.voice.getSpeechModelStatusSync().vramMb).toBe(2048);
+    });
+
+    findMenuItem(menus.at(-1)!, 'voice:model-qwen3-1.7b')?.click?.();
+    await vi.waitFor(() => {
+      expect(promptBoxes).toHaveLength(1);
+    });
+    expect(promptBoxes[0]!.message).toContain('2.0 GB');
+    await vi.waitFor(() => {
+      expect(shell.voice.getSpeechModel()).toBe('qwen3-0.6b');
+    });
+
+    boxResponse = 1;
+    findMenuItem(menus.at(-1)!, 'voice:model-qwen3-1.7b')?.click?.();
+    await vi.waitFor(() => {
+      expect(promptBoxes).toHaveLength(2);
+      expect(shell.voice.getSpeechModel()).toBe('qwen3-1.7b');
+    });
+
+    await shell.voice.dispose();
   });
 });

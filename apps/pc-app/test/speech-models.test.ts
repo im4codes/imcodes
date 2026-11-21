@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   buildSpeechModelAssetUrl,
   CHINA_MIRROR_ORIGINS,
+  getSpeechModelManifests,
   GLOBAL_MIRROR_ORIGINS,
   normalizeMirrorOrigin,
   PcAppSpeechModelDownloader,
@@ -20,6 +21,8 @@ import {
   resolvedDefaultMirrorOrigins,
   resolvedMirrorOrigins,
   SPEECH_MODEL_MANIFESTS,
+  WIN32_GPU_MIN_VRAM_MB,
+  WIN32_SPEECH_MODEL_MANIFESTS,
   verifiedMarkerFilename,
   type PcAppSpeechModelManifest,
   type PcAppSpeechVariant,
@@ -248,5 +251,54 @@ describe('PC App Qwen3-ASR region-aware mirrors, sticky promotion, persistence, 
     expect(downloader.isModelReadySync('0.6b')).toBe(false);
     expect(downloader.isModelReadySync('1.7b')).toBe(true);
     expect(readFileSync(path.join(downloader.getModelDirectory('1.7b'), 'config.json'))).toEqual(file17);
+  });
+
+  it('provides verified win32 ONNX INT8 manifests (0.6B default + 1.7B manual) and downloads nested tokenizer/* files cleanly', async () => {
+    expect(WIN32_GPU_MIN_VRAM_MB).toBe(4096);
+    expect(getSpeechModelManifests('darwin')).toBe(SPEECH_MODEL_MANIFESTS);
+    expect(getSpeechModelManifests('win32')).toBe(WIN32_SPEECH_MODEL_MANIFESTS);
+    expect(WIN32_SPEECH_MODEL_MANIFESTS['0.6b'].repoId).toBe('csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25');
+    expect(WIN32_SPEECH_MODEL_MANIFESTS['1.7b'].repoId).toBe('ilmina/qwen3-asr-1.7b-sherpa-onnx');
+    expect(WIN32_SPEECH_MODEL_MANIFESTS['0.6b'].files.some((f) => f.filename === 'tokenizer/vocab.json')).toBe(true);
+
+    const store = new PcAppSpeechModelStore(tempDir);
+    expect(store.load('qwen3-0.6b')).toBe('qwen3-0.6b');
+    store.save('system');
+    expect(store.load('qwen3-0.6b')).toBe('system');
+
+    const modelPayload = Buffer.from('onnx-bytes');
+    const tokPayload = Buffer.from('{"a":1}');
+    const nestedManifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'csukuangfj2/test-win-06b',
+        revision: 'rev-win-06',
+        files: [
+          { filename: 'decoder.int8.onnx', expectedSize: modelPayload.length, expectedSha256: sha256Hex(modelPayload) },
+          { filename: 'tokenizer/vocab.json', expectedSize: tokPayload.length, expectedSha256: sha256Hex(tokPayload) },
+        ],
+      },
+      '1.7b': WIN32_SPEECH_MODEL_MANIFESTS['1.7b'],
+    };
+
+    const downloader = new PcAppSpeechModelDownloader({
+      modelsBaseDir: tempDir,
+      platform: 'win32',
+      manifests: nestedManifests,
+      explicitMirrors: ['https://hf-mirror.com'],
+      fetchFn: async (input) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        return url.endsWith('/tokenizer/vocab.json') ? makeResponse(tokPayload) : makeResponse(modelPayload);
+      },
+    });
+    const tokDir = path.join(downloader.getModelDirectory('0.6b'), 'tokenizer');
+    mkdirSync(tokDir, { recursive: true });
+    writeFileSync(path.join(tokDir, 'vocab.json.part.stale'), 'stale');
+
+    expect(await downloader.ensureDownloaded('0.6b')).toBe(true);
+    expect(downloader.isModelReadySync('0.6b')).toBe(true);
+    expect(readdirSync(tokDir).some((f) => f.includes('.part.'))).toBe(false);
+    expect(readFileSync(path.join(tokDir, 'vocab.json'))).toEqual(tokPayload);
   });
 });

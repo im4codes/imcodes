@@ -20,7 +20,7 @@ const isHttpContext = currentProtocol === 'https:' || currentProtocol === 'http:
 
 if (isHttpContext) {
   const voiceBridge = Object.freeze({
-    isNativeSpeechSupported: () => process.platform === 'darwin',
+    isNativeSpeechSupported: () => process.platform === 'darwin' || process.platform === 'win32',
     getPermissions: () => ipcRenderer.invoke(VOICE_CHANNELS.getPermissions),
     requestPermissions: () => ipcRenderer.invoke(VOICE_CHANNELS.requestPermissions),
     openPrivacySettings: (target: 'microphone' | 'speech') =>

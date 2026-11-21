@@ -12,6 +12,57 @@ export interface GlobalVoiceWindowLike {
   isFocused?(): boolean;
 }
 
+export interface GlobalVoiceOverlayWorkArea {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface CreateGlobalVoiceOverlayWindowOptions {
+  width: number;
+  height: number;
+  x?: number;
+  y?: number;
+  frame: false;
+  transparent: true;
+  focusable: false;
+  alwaysOnTop: true;
+  skipTaskbar: true;
+  resizable: false;
+  movable: false;
+  minimizable: false;
+  maximizable: false;
+  closable: false;
+  hasShadow: false;
+  show: false;
+  webPreferences: {
+    contextIsolation: true;
+    nodeIntegration: false;
+    sandbox: true;
+  };
+}
+
+export interface GlobalVoiceOverlayWebContentsLike {
+  isDestroyed?(): boolean;
+  isLoading?(): boolean;
+  once?(event: 'did-finish-load', listener: () => void): unknown;
+  executeJavaScript?(code: string, userGesture?: boolean): Promise<unknown>;
+}
+
+export interface GlobalVoiceOverlayWindowLike {
+  isDestroyed?(): boolean;
+  loadURL(url: string): Promise<void> | void;
+  showInactive?(): void;
+  hide?(): void;
+  close?(): void;
+  destroy?(): void;
+  setAlwaysOnTop?(flag: boolean, level?: string): void;
+  setIgnoreMouseEvents?(ignore: boolean, options?: { forward?: boolean }): void;
+  setBounds?(bounds: { x: number; y: number; width: number; height: number }): void;
+  webContents: GlobalVoiceOverlayWebContentsLike;
+}
+
 export interface GlobalVoicePasteResult {
   stdout: string;
 }
@@ -32,11 +83,14 @@ export interface PcAppGlobalVoiceDeps {
     }): Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }>;
     stopListening(options?: { abort?: boolean }): Promise<void>;
   };
+  createOverlayWindow?: (options: CreateGlobalVoiceOverlayWindowOptions) => GlobalVoiceOverlayWindowLike | null;
+  getOverlayWorkArea?: () => GlobalVoiceOverlayWorkArea | null;
   spawnHelper?: (binPath: string, args: string[]) => ChildProcess;
   runPasteHelper?: (binPath: string, args: string[], stdinText: string) => Promise<string>;
   onStateChanged?: (enabled: boolean) => void;
   onError?: (code: string, message?: string) => void;
   onAccessibilityDenied?: (text: string) => void;
+  onUipiDenied?: (text: string) => void;
   now?: () => number;
 }
 
@@ -95,18 +149,123 @@ function isAsarArchivePath(filePath: string): boolean {
 }
 
 export function resolveGlobalVoiceOverlayIconPath(options?: {
+  platform?: NodeJS.Platform;
   resourcesPath?: string;
   moduleDir?: string;
 }): string | null {
   const moduleDir = options?.moduleDir ?? dirname(fileURLToPath(import.meta.url));
   const candidates: string[] = [];
   if (options?.resourcesPath) {
-    candidates.push(join(options.resourcesPath, 'icon.icns'));
+    if (options?.platform !== 'win32') {
+      candidates.push(join(options.resourcesPath, 'icon.icns'));
+    }
     candidates.push(join(options.resourcesPath, 'build', 'icon.png'));
+    candidates.push(join(options.resourcesPath, 'icon.png'));
   }
   candidates.push(resolve(moduleDir, '../../build/icon.png'));
   candidates.push(resolve(moduleDir, '../build/icon.png'));
   return candidates.find((p) => !isAsarArchivePath(p) && existsSync(p)) ?? null;
+}
+
+const WIN_OVERLAY_WIDTH = 344;
+const WIN_OVERLAY_HEIGHT = 68;
+const WIN_OVERLAY_BAR_COUNT = 16;
+
+function buildWinOverlayDataUri(iconPath: string | null): string {
+  let iconSrc = '';
+  if (iconPath && existsSync(iconPath)) {
+    try {
+      const ext = path.extname(iconPath).toLowerCase();
+      const mime = ext === '.png' ? 'image/png' : ext === '.ico' ? 'image/x-icon' : '';
+      if (mime) {
+        iconSrc = `data:${mime};base64,${readFileSync(iconPath).toString('base64')}`;
+      }
+    } catch {
+      iconSrc = '';
+    }
+  }
+  const robotSvgFallback =
+    'data:image/svg+xml;utf8,' +
+    encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#1e293b"/><circle cx="11" cy="15" r="2.5" fill="#22d3ee"/><circle cx="21" cy="15" r="2.5" fill="#22d3ee"/><rect x="10" y="21" width="12" height="2" rx="1" fill="#94a3b8"/></svg>',
+    );
+  const imgUrl = iconSrc || robotSvgFallback;
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent; overflow: hidden;
+    pointer-events: none; user-select: none;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  .pill {
+    box-sizing: border-box;
+    width: 100%; height: 100%;
+    padding: 8px 14px;
+    border-radius: 16px;
+    background: rgba(15, 23, 42, 0.92);
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .logo { width: 26px; height: 26px; border-radius: 7px; flex-shrink: 0; object-fit: cover; }
+  .dot { width: 8px; height: 8px; border-radius: 9999px; flex-shrink: 0; background: #f59e0b; }
+  .dot.listening { background: #22d3ee; }
+  .meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .title { font-size: 12px; font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .text { font-size: 11px; color: #cbd5e1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bars { display: flex; align-items: center; gap: 2px; height: 26px; flex-shrink: 0; }
+  .bar { width: 3px; height: 4px; border-radius: 9999px; background: linear-gradient(180deg, #34d399 0%, #22d3ee 100%); opacity: 0.6; transition: height 60ms ease-out; }
+</style>
+</head>
+<body>
+  <div class="pill">
+    <img class="logo" src="${imgUrl}" alt="" />
+    <span id="dot" class="dot"></span>
+    <div class="meta">
+      <div id="title" class="title"></div>
+      <div id="text" class="text"></div>
+    </div>
+    <div id="bars" class="bars"></div>
+  </div>
+  <script>
+    const BAR_COUNT = ${WIN_OVERLAY_BAR_COUNT};
+    const barsEl = document.getElementById('bars');
+    const history = new Array(BAR_COUNT).fill(0);
+    for (let i = 0; i < BAR_COUNT; i++) {
+      const b = document.createElement('span');
+      b.className = 'bar';
+      barsEl.appendChild(b);
+    }
+    let tick = 0;
+    window.__imcodesWinVoiceOverlayUpdate = function(payload) {
+      if (!payload || typeof payload !== 'object') return;
+      const dot = document.getElementById('dot');
+      const title = document.getElementById('title');
+      const text = document.getElementById('text');
+      dot.className = payload.state === 'listening' ? 'dot listening' : 'dot';
+      title.textContent = typeof payload.title === 'string' ? payload.title : '';
+      text.textContent = typeof payload.text === 'string' ? payload.text : '';
+      const level = payload.state === 'listening' ? Math.max(0, Math.min(1, Number(payload.level) || 0)) : 0;
+      history.shift();
+      history.push(level);
+      tick += 1;
+      const nodes = barsEl.children;
+      for (let i = 0; i < nodes.length; i++) {
+        const sample = history[i] || 0;
+        const env = 1 - Math.abs(i - (BAR_COUNT - 1) / 2) / ((BAR_COUNT - 1) / 2) * 0.25;
+        const jitter = sample > 0.01 ? (0.85 + 0.15 * Math.sin((tick + i) * 0.9)) : 1;
+        const h = Math.round(4 + Math.min(1, sample * env * jitter) * 22);
+        nodes[i].style.height = h + 'px';
+        nodes[i].style.opacity = sample > 0.02 ? '1' : '0.45';
+      }
+    };
+  </script>
+</body>
+</html>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
 function defaultRunPasteHelper(binPath: string, args: string[], stdinText: string): Promise<string> {
@@ -137,14 +296,15 @@ function clampLevel(raw: unknown): number {
 type DictationPhase = 'idle' | 'starting' | 'listening' | 'draining' | 'pasting';
 
 /**
- * Manage macOS system-wide Double-Tap Shift hotkey detection, non-activating
- * floating NSPanel overlay (with IM.codes robot logo), dictation lifecycle,
- * and Accessibility Unicode pasting into foreground applications.
+ * Manage system-wide Double-Tap Shift hotkey detection (macOS NSEvent monitor / Windows WH_KEYBOARD_LL),
+ * non-activating floating overlay (macOS NSPanel / Windows transparent BrowserWindow with IM.codes robot logo),
+ * dictation lifecycle, and direct Unicode pasting into foreground applications.
  */
 export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalVoiceController {
+  const isSupportedPlatform = deps.platform === 'darwin' || deps.platform === 'win32';
   const store = new PcAppGlobalVoiceStore(deps.userDataDir);
   const stored = store.load();
-  let enabled = deps.platform === 'darwin' ? (stored ?? true) : false;
+  let enabled = isSupportedPlatform ? (stored ?? true) : false;
   let disposed = false;
   let started = false;
 
@@ -153,6 +313,8 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
   let hotkeyRestartTimer: ReturnType<typeof setTimeout> | null = null;
 
   let overlayProc: ChildProcess | null = null;
+  let winOverlayWin: GlobalVoiceOverlayWindowLike | null = null;
+  let pendingWinOverlayState: Record<string, unknown> | null = null;
 
   let phase: DictationPhase = 'idle';
   let cancelRequestedDuringStart = false;
@@ -174,10 +336,10 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
     if (deps.iconPath !== undefined) {
       if (deps.iconPath === null) return null;
       return isAsarArchivePath(deps.iconPath)
-        ? resolveGlobalVoiceOverlayIconPath({ resourcesPath: deps.resourcesPath })
+        ? resolveGlobalVoiceOverlayIconPath({ platform: deps.platform, resourcesPath: deps.resourcesPath })
         : deps.iconPath;
     }
-    return resolveGlobalVoiceOverlayIconPath({ resourcesPath: deps.resourcesPath });
+    return resolveGlobalVoiceOverlayIconPath({ platform: deps.platform, resourcesPath: deps.resourcesPath });
   };
 
   const clearHotkeyRestartTimer = (): void => {
@@ -198,6 +360,81 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
       proc.kill('SIGTERM');
     } catch {
       // Already exited.
+    }
+  };
+
+  const computeWinOverlayBounds = () => {
+    const workArea = deps.getOverlayWorkArea?.();
+    if (!workArea) {
+      return { width: WIN_OVERLAY_WIDTH, height: WIN_OVERLAY_HEIGHT };
+    }
+    const x = Math.round(workArea.x + (workArea.width - WIN_OVERLAY_WIDTH) / 2);
+    const y = Math.round(workArea.y + workArea.height - WIN_OVERLAY_HEIGHT - 28);
+    return { x, y, width: WIN_OVERLAY_WIDTH, height: WIN_OVERLAY_HEIGHT };
+  };
+
+  const pushWinOverlayPayload = (win: GlobalVoiceOverlayWindowLike, payload: Record<string, unknown>): void => {
+    pendingWinOverlayState = payload;
+    if (win.isDestroyed?.()) return;
+    if (win.webContents.isLoading?.()) return;
+    const script = `window.__imcodesWinVoiceOverlayUpdate && window.__imcodesWinVoiceOverlayUpdate(${JSON.stringify(payload)});`;
+    void win.webContents.executeJavaScript?.(script, true)?.catch(() => {});
+  };
+
+  const ensureWinOverlayWindow = (): GlobalVoiceOverlayWindowLike | null => {
+    if (disposed || !enabled || deps.platform !== 'win32') return null;
+    if (!deps.createOverlayWindow) return null;
+    if (winOverlayWin && !winOverlayWin.isDestroyed?.()) return winOverlayWin;
+
+    const bounds = computeWinOverlayBounds();
+    const win = deps.createOverlayWindow({
+      ...bounds,
+      frame: false,
+      transparent: true,
+      focusable: false,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      closable: false,
+      hasShadow: false,
+      show: false,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+    if (!win) return null;
+    winOverlayWin = win;
+    win.setAlwaysOnTop?.(true, 'screen-saver');
+    win.setIgnoreMouseEvents?.(true, { forward: true });
+    win.webContents.once?.('did-finish-load', () => {
+      if (pendingWinOverlayState && winOverlayWin === win && !win.isDestroyed?.()) {
+        pushWinOverlayPayload(win, pendingWinOverlayState);
+      }
+    });
+    const iconPath = resolveIconPath();
+    void Promise.resolve(win.loadURL(buildWinOverlayDataUri(iconPath))).catch(() => {});
+    return win;
+  };
+
+  const destroyWinOverlayWindow = (): void => {
+    const win = winOverlayWin;
+    winOverlayWin = null;
+    pendingWinOverlayState = null;
+    if (!win || win.isDestroyed?.()) return;
+    try {
+      win.hide?.();
+      if (win.destroy) {
+        win.destroy();
+      } else {
+        win.close?.();
+      }
+    } catch {
+      // Ignore already-destroyed overlay window.
     }
   };
 
@@ -231,6 +468,27 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
   };
 
   const sendOverlayCommand = (payload: Record<string, unknown>): void => {
+    if (deps.platform === 'win32') {
+      if (payload.cmd === 'hide') {
+        pendingWinOverlayState = null;
+        if (winOverlayWin && !winOverlayWin.isDestroyed?.()) {
+          winOverlayWin.hide?.();
+        }
+        return;
+      }
+      const win = ensureWinOverlayWindow();
+      if (!win) return;
+      const bounds = computeWinOverlayBounds();
+      if (bounds.x !== undefined && bounds.y !== undefined) {
+        win.setBounds?.({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height });
+      }
+      win.setAlwaysOnTop?.(true, 'screen-saver');
+      win.setIgnoreMouseEvents?.(true, { forward: true });
+      win.showInactive?.();
+      pushWinOverlayPayload(win, payload);
+      return;
+    }
+
     if (payload.cmd === 'hide' && !overlayProc) return;
     const proc = payload.cmd === 'hide' ? overlayProc : ensureOverlayProcess();
     if (!proc) return;
@@ -291,6 +549,12 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
           if (parsed.type === 'error' && parsed.code) {
             if (parsed.code === 'accessibility_denied') {
               deps.onAccessibilityDenied?.(trimmed);
+            } else if (parsed.code === 'uipi_elevated_target') {
+              if (deps.onUipiDenied) {
+                deps.onUipiDenied(trimmed);
+              } else {
+                deps.onAccessibilityDenied?.(trimmed);
+              }
             }
             deps.onError?.(parsed.code, parsed.message);
           }
@@ -334,7 +598,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
   };
 
   const startGlobalDictation = async (): Promise<void> => {
-    if (disposed || !enabled || deps.platform !== 'darwin') return;
+    if (disposed || !enabled || !isSupportedPlatform) return;
     if (phase !== 'idle') return;
 
     const sessionId = ++activeSessionId;
@@ -426,7 +690,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
   };
 
   const toggleDictation = async (): Promise<void> => {
-    if (disposed || !enabled || deps.platform !== 'darwin') return;
+    if (disposed || !enabled || !isSupportedPlatform) return;
     if (phase === 'idle') {
       pendingEnterOnPaste = false;
       await startGlobalDictation();
@@ -444,7 +708,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
   };
 
   const handleHotkeyEvent = async (eventType: string): Promise<void> => {
-    if (disposed || !enabled || deps.platform !== 'darwin') return;
+    if (disposed || !enabled || !isSupportedPlatform) return;
     if (isMainWindowFocused()) return;
 
     if (eventType === 'double_tap') {
@@ -486,7 +750,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
   };
 
   const spawnHotkeyMonitor = (): void => {
-    if (disposed || !enabled || !started || deps.platform !== 'darwin') return;
+    if (disposed || !enabled || !started || !isSupportedPlatform) return;
     if (hotkeyProc) return;
     const bin = deps.getSpeechHelperPath();
     if (!bin) return;
@@ -564,10 +828,11 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
     const ov = overlayProc;
     overlayProc = null;
     terminateChild(ov);
+    destroyWinOverlayWindow();
   };
 
   const start = (): void => {
-    if (disposed || deps.platform !== 'darwin') return;
+    if (disposed || !isSupportedPlatform) return;
     started = true;
     if (enabled) {
       spawnHotkeyMonitor();
@@ -576,7 +841,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
 
   const setEnabled = async (nextEnabled: boolean): Promise<boolean> => {
     if (disposed) return enabled;
-    if (deps.platform !== 'darwin') {
+    if (!isSupportedPlatform) {
       enabled = false;
       return false;
     }

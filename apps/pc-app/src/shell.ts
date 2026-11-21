@@ -33,6 +33,7 @@ import {
   type WelcomeDataUrlOptions,
 } from './server-prompt.js';
 import { normalizeServerOrigin, ServerStore } from './servers.js';
+import { WIN32_GPU_MIN_VRAM_MB } from './speech-models.js';
 import { TrustedOriginController, type TrustedWindowLike } from './trust.js';
 import {
   createPcAppVoiceController,
@@ -382,7 +383,32 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       boundServer: bind.getBoundSummary(),
       speechModelStatus: voice?.getSpeechModelStatusSync(),
       onSelectSpeechModel: (model) => {
-        void voice.setSpeechModel(model).then(() => rebuildMenu());
+        void (async () => {
+          let nextModel = model;
+          if (deps.platform === 'win32' && model === 'qwen3-1.7b') {
+            const st = voice.getSpeechModelStatusSync();
+            const vramMb = st.vramMb;
+            if (typeof vramMb === 'number' && vramMb < WIN32_GPU_MIN_VRAM_MB && mainWindow && !mainWindow.isDestroyed()) {
+              const vramLabel = vramMb > 0 ? `${(vramMb / 1024).toFixed(1)} GB (${st.gpuName ?? 'GPU'})` : '0 GB (CPU)';
+              const { response } = await deps.showMessageBox(mainWindow, {
+                type: 'warning',
+                title: tPcApp(activeLocale, 'menu.voice.lowVramDialog.title'),
+                message: tPcApp(activeLocale, 'menu.voice.lowVramDialog.message', { vram: vramLabel }),
+                buttons: [
+                  tPcApp(activeLocale, 'menu.voice.lowVramDialog.cancel'),
+                  tPcApp(activeLocale, 'menu.voice.lowVramDialog.confirm'),
+                ],
+                defaultId: 0,
+                cancelId: 0,
+              });
+              if (response !== 1) {
+                nextModel = 'qwen3-0.6b';
+              }
+            }
+          }
+          await voice.setSpeechModel(nextModel);
+          rebuildMenu();
+        })();
       },
       inputDevices: voice?.getInputDevicesSync(),
       selectedInputDevice: voice?.getSelectedInputDevice(),
@@ -453,7 +479,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
   if (deps.ipcMain) {
     voice.registerIpc(deps.ipcMain);
   }
-  if (deps.platform === 'darwin') {
+  if (deps.platform === 'darwin' || deps.platform === 'win32') {
     void voice.getSpeechModelStatus().then(() => rebuildMenu());
     void voice.warmSelectedSpeechModel();
     void voice.getInputDevices();
