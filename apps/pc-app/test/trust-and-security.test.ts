@@ -9,6 +9,7 @@ import {
   isAllowedPermissionRequest,
   isSameActiveOrigin,
   MAIN_WINDOW_WEB_PREFERENCES,
+  type WindowOpenHandlerResult,
 } from '../src/security.js';
 import { ServerStore } from '../src/servers.js';
 import { createPcAppShell, type ShellWindowLike } from '../src/shell.js';
@@ -17,7 +18,7 @@ import { currentTrustedOrigin, TrustedOriginController, UntrustedOriginError } f
 class MockWebContents extends EventEmitter {
   url = '';
   destroyed = false;
-  windowOpenHandler: ((details: { url: string }) => { action: 'deny' }) | null = null;
+  windowOpenHandler: ((details: { url: string }) => WindowOpenHandlerResult) | null = null;
   session: MockSession;
 
   constructor(session: MockSession) {
@@ -29,7 +30,7 @@ class MockWebContents extends EventEmitter {
     return this.url;
   }
 
-  setWindowOpenHandler(handler: (details: { url: string }) => { action: 'deny' }): void {
+  setWindowOpenHandler(handler: (details: { url: string }) => WindowOpenHandlerResult): void {
     this.windowOpenHandler = handler;
   }
 }
@@ -562,5 +563,177 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
     expect(connectEv.preventDefault).toHaveBeenCalled();
     await vi.waitFor(() => expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes'));
     expect(openExternal).not.toHaveBeenCalled();
+  });
+
+  it('allows same-origin popout windows with enforced webPreferences and wires did-create-window security guards onto child windows', async () => {
+    const session = new MockSession();
+    const wc = new MockWebContents(session);
+    const openExternal = vi.fn();
+    const preloadPath = '/tmp/mock-preload.cjs';
+    const win: ShellWindowLike = {
+      isDestroyed: () => false,
+      loadURL: async (nextUrl: string) => {
+        wc.url = nextUrl;
+      },
+      on: vi.fn(),
+      webContents: Object.assign(wc, {
+        reload: vi.fn(),
+        reloadIgnoringCache: vi.fn(),
+        toggleDevTools: vi.fn(),
+      }),
+    };
+
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      preloadPath,
+      bindDeps: { imcodesHome: tempDir },
+      createMainWindow: () => win,
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: () => {},
+      openExternal,
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 1 }),
+    });
+
+    await shell.addAndSelectServer('https://app.im.codes');
+    await shell.addAndSelectServer('https://second.im.codes');
+    await shell.selectServer('https://app.im.codes');
+    expect(wc.windowOpenHandler).toBeTruthy();
+
+    // Same active origin (e.g. Remote Desktop "Open in new window") returns allow with strict webPreferences
+    const sameOriginResult = wc.windowOpenHandler!({
+      url: 'https://app.im.codes/#/remote-desktop/srv_1',
+    });
+    expect(sameOriginResult).toEqual({
+      action: 'allow',
+      overrideBrowserWindowOptions: {
+        width: 1280,
+        height: 800,
+        minWidth: 800,
+        minHeight: 560,
+        autoHideMenuBar: true,
+        webPreferences: {
+          ...MAIN_WINDOW_WEB_PREFERENCES,
+          preload: preloadPath,
+        },
+      },
+    });
+    expect(openExternal).not.toHaveBeenCalled();
+
+    // Another saved origin or external URL still returns deny and routes external http/https to openExternal
+    expect(wc.windowOpenHandler!({ url: 'https://second.im.codes/home' })).toEqual({ action: 'deny' });
+    expect(openExternal).toHaveBeenCalledWith('https://second.im.codes/home');
+    openExternal.mockClear();
+    expect(wc.windowOpenHandler!({ url: 'https://docs.im.codes/guide' })).toEqual({ action: 'deny' });
+    expect(openExternal).toHaveBeenCalledWith('https://docs.im.codes/guide');
+
+    // Emit did-create-window and verify child BrowserWindow enforces navigation, webview, and window-open guards
+    openExternal.mockClear();
+    const childWc = new MockWebContents(session);
+    childWc.url = 'https://app.im.codes/#/remote-desktop/srv_1';
+    wc.emit('did-create-window', { webContents: childWc });
+    expect(childWc.windowOpenHandler).toBeTruthy();
+
+    // Child window allows same-active-origin navigation/redirect, blocks untrusted origins, other saved servers, file:, and imcodes-welcome.local
+    for (const eventName of ['will-navigate', 'will-redirect'] as const) {
+      const sameEv = { preventDefault: vi.fn() };
+      childWc.emit(eventName, sameEv, 'https://app.im.codes/#/remote-desktop/srv_2');
+      expect(sameEv.preventDefault).not.toHaveBeenCalled();
+
+      for (const blockedTarget of [
+        'https://evil.example/phish',
+        'https://second.im.codes/home',
+        'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example',
+        'file:///etc/passwd',
+      ]) {
+        const blockedEv = { preventDefault: vi.fn() };
+        childWc.emit(eventName, blockedEv, blockedTarget);
+        expect(blockedEv.preventDefault).toHaveBeenCalledTimes(1);
+      }
+    }
+
+    // Child window blocks webview attachment
+    const childWebviewEv = { preventDefault: vi.fn() };
+    childWc.emit('will-attach-webview', childWebviewEv);
+    expect(childWebviewEv.preventDefault).toHaveBeenCalledTimes(1);
+
+    // Child window preserves same-origin popout + external handoff rules
+    expect(childWc.windowOpenHandler!({ url: 'https://app.im.codes/sub' })).toEqual({
+      action: 'allow',
+      overrideBrowserWindowOptions: {
+        width: 1280,
+        height: 800,
+        minWidth: 800,
+        minHeight: 560,
+        autoHideMenuBar: true,
+        webPreferences: {
+          ...MAIN_WINDOW_WEB_PREFERENCES,
+          preload: preloadPath,
+        },
+      },
+    });
+    expect(openExternal).not.toHaveBeenCalled();
+
+    expect(childWc.windowOpenHandler!({ url: 'https://example.com/external' })).toEqual({ action: 'deny' });
+    expect(openExternal).toHaveBeenCalledWith('https://example.com/external');
+
+    openExternal.mockClear();
+    expect(childWc.windowOpenHandler!({ url: 'https://imcodes-welcome.local/connect' })).toEqual({ action: 'deny' });
+    expect(openExternal).not.toHaveBeenCalled();
+
+    // Child window created via did-create-window is allowed trusted Remote Desktop permissions while on active origin,
+    // and loses them once destroyed or drifted
+    expect(session.permissionCheckHandler!(childWc, 'fullscreen', 'https://app.im.codes')).toBe(true);
+    expect(session.permissionCheckHandler!(childWc, 'keyboardLock', 'https://app.im.codes')).toBe(true);
+    expect(session.permissionCheckHandler!(childWc, 'geolocation', 'https://app.im.codes')).toBe(false);
+    childWc.url = 'https://evil.example/spoof';
+    expect(session.permissionCheckHandler!(childWc, 'fullscreen', 'https://app.im.codes')).toBe(false);
+    childWc.url = 'https://app.im.codes/#/remote-desktop/srv_1';
+    childWc.emit('destroyed');
+    expect(session.permissionCheckHandler!(childWc, 'fullscreen', 'https://app.im.codes')).toBe(false);
+  });
+
+  it('omits preload in same-origin overrideBrowserWindowOptions when shell has no preloadPath', async () => {
+    const session = new MockSession();
+    const wc = new MockWebContents(session);
+    const win: ShellWindowLike = {
+      isDestroyed: () => false,
+      loadURL: async (nextUrl: string) => {
+        wc.url = nextUrl;
+      },
+      on: vi.fn(),
+      webContents: Object.assign(wc, {
+        reload: vi.fn(),
+        reloadIgnoringCache: vi.fn(),
+        toggleDevTools: vi.fn(),
+      }),
+    };
+
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      bindDeps: { imcodesHome: tempDir },
+      createMainWindow: () => win,
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: () => {},
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 1 }),
+    });
+
+    await shell.addAndSelectServer('https://app.im.codes');
+    const result = wc.windowOpenHandler!({ url: 'https://app.im.codes/#/remote-desktop/srv_1' });
+    expect(result.action).toBe('allow');
+    if (result.action === 'allow') {
+      expect(result.overrideBrowserWindowOptions?.webPreferences).toEqual(MAIN_WINDOW_WEB_PREFERENCES);
+      expect('preload' in (result.overrideBrowserWindowOptions?.webPreferences ?? {})).toBe(false);
+    }
   });
 });

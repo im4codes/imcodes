@@ -436,6 +436,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
         return deps.showSaveDialogSync(mainWindow, suggestedFilename) ?? null;
       },
       onTrustedMediaPermissionRequest: () => voice.ensureMediaAccessOnWebPermissionRequest(),
+      preloadPath: deps.preloadPath,
       externalDocsHosts: deps.externalDocsHosts,
     });
 

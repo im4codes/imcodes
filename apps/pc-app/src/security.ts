@@ -7,6 +7,41 @@ export const MAIN_WINDOW_WEB_PREFERENCES = Object.freeze({
   webviewTag: false,
 } as const);
 
+export type WindowOpenWebPreferences = typeof MAIN_WINDOW_WEB_PREFERENCES & { preload?: string };
+
+export interface ChildBrowserWindowOptions {
+  width: number;
+  height: number;
+  minWidth: number;
+  minHeight: number;
+  autoHideMenuBar: boolean;
+  webPreferences: WindowOpenWebPreferences;
+}
+
+export type WindowOpenHandlerResult =
+  | { action: 'deny' }
+  | {
+      action: 'allow';
+      overrideBrowserWindowOptions?: ChildBrowserWindowOptions;
+    };
+
+export function buildChildWindowWebPreferences(preloadPath?: string): WindowOpenWebPreferences {
+  return preloadPath
+    ? { ...MAIN_WINDOW_WEB_PREFERENCES, preload: preloadPath }
+    : { ...MAIN_WINDOW_WEB_PREFERENCES };
+}
+
+export function buildChildWindowOptions(preloadPath?: string): ChildBrowserWindowOptions {
+  return {
+    width: 1280,
+    height: 800,
+    minWidth: 800,
+    minHeight: 560,
+    autoHideMenuBar: true,
+    webPreferences: buildChildWindowWebPreferences(preloadPath),
+  };
+}
+
 export const DEFAULT_EXTERNAL_DOCS_HOSTS = [
   'docs.im.codes',
   'github.com',
@@ -120,12 +155,18 @@ export interface PermissionRequestDetailsLike {
   requestingUrl?: string;
 }
 
+export interface ChildWindowLike {
+  webContents: SecurityWebContentsLike;
+}
+
 export interface SecurityWebContentsLike {
   getURL(): string;
   on(event: 'will-navigate', listener: (event: PreventableEventLike, url: string) => void): unknown;
   on(event: 'will-redirect', listener: (event: PreventableEventLike, url: string) => void): unknown;
   on(event: 'will-attach-webview', listener: (event: PreventableEventLike) => void): unknown;
-  setWindowOpenHandler(handler: (details: { url: string }) => { action: 'deny' }): void;
+  on(event: 'did-create-window', listener: (window: ChildWindowLike, details?: unknown) => void): unknown;
+  once?(event: 'destroyed', listener: () => void): unknown;
+  setWindowOpenHandler(handler: (details: { url: string }) => WindowOpenHandlerResult): void;
 }
 
 export interface SecuritySessionLike {
@@ -147,6 +188,16 @@ export interface SecuritySessionLike {
   on(event: 'will-download', listener: (event: PreventableEventLike, item: DownloadItemLike, webContents: unknown) => void): unknown;
 }
 
+export interface ChildWindowSecurityGuardOptions {
+  webContents: SecurityWebContentsLike;
+  getActiveOrigin: () => string | null;
+  getTrustedOrigins: () => ReadonlySet<string>;
+  openExternal: (url: string) => Promise<void> | void;
+  preloadPath?: string;
+  externalDocsHosts?: readonly string[];
+  onChildWindowCreated?: (childWindow: ChildWindowLike) => void;
+}
+
 export interface WindowSecurityGuardOptions {
   webContents: SecurityWebContentsLike;
   session: SecuritySessionLike;
@@ -160,28 +211,23 @@ export interface WindowSecurityGuardOptions {
    */
   promptSavePathSync: (suggestedFilename: string) => string | undefined | null;
   onTrustedMediaPermissionRequest?: (details?: PermissionRequestDetailsLike) => Promise<boolean> | boolean;
+  preloadPath?: string;
   externalDocsHosts?: readonly string[];
 }
 
 /**
- * Enforce §4.7 Electron security guards on the main BrowserWindow and session:
- * - Same-active-origin navigation & redirect allowlist
- * - Window-open denial + strict allowlisted external URL handoff
- * - Webview attachment prevention (defense-in-depth alongside webviewTag=false)
- * - Active-trusted-origin scoped permission gate (clipboard, media, fullscreen, keyboardLock & notifications only)
- * - User-confirmed download destination (never silent disk writes)
+ * Attach §4.7 navigation, redirect, webview, and window-open guards onto a window's webContents
+ * (and recursively onto any same-origin child BrowserWindows created via `did-create-window`).
  */
-export function attachWindowSecurityGuards(options: WindowSecurityGuardOptions): void {
+export function attachChildWindowSecurityGuards(options: ChildWindowSecurityGuardOptions): void {
   const {
     webContents,
-    session,
     getActiveOrigin,
     getTrustedOrigins,
-    getCurrentTrustedOrigin,
     openExternal,
-    promptSavePathSync,
-    onTrustedMediaPermissionRequest,
+    preloadPath,
     externalDocsHosts,
+    onChildWindowCreated,
   } = options;
 
   const enforceNavigation = (event: PreventableEventLike, targetUrl: string) => {
@@ -197,24 +243,96 @@ export function attachWindowSecurityGuards(options: WindowSecurityGuardOptions):
   });
 
   webContents.setWindowOpenHandler(({ url }) => {
+    if (isSameActiveOrigin(url, getActiveOrigin(), getTrustedOrigins())) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: buildChildWindowOptions(preloadPath),
+      };
+    }
     if (isAllowedExternalUrl(url, externalDocsHosts)) {
       void Promise.resolve(openExternal(url)).catch(() => {});
     }
     return { action: 'deny' };
   });
 
+  webContents.on?.('did-create-window', (childWindow) => {
+    onChildWindowCreated?.(childWindow);
+    attachChildWindowSecurityGuards({
+      webContents: childWindow.webContents,
+      getActiveOrigin,
+      getTrustedOrigins,
+      openExternal,
+      preloadPath,
+      externalDocsHosts,
+      onChildWindowCreated,
+    });
+  });
+}
+
+function isSecurityWebContents(value: unknown): value is SecurityWebContentsLike {
+  return Boolean(value && typeof value === 'object' && typeof (value as SecurityWebContentsLike).getURL === 'function');
+}
+
+/**
+ * Enforce §4.7 Electron security guards on the main BrowserWindow and session:
+ * - Same-active-origin navigation & redirect allowlist
+ * - Same-origin popout BrowserWindow allowlist with enforced webPreferences + external URL handoff
+ * - Child BrowserWindow security inheritance via `did-create-window`
+ * - Webview attachment prevention (defense-in-depth alongside webviewTag=false)
+ * - Active-trusted-origin scoped permission gate (clipboard, media, fullscreen, keyboardLock & notifications only)
+ * - User-confirmed download destination (never silent disk writes)
+ */
+export function attachWindowSecurityGuards(options: WindowSecurityGuardOptions): void {
+  const {
+    webContents,
+    session,
+    getActiveOrigin,
+    getTrustedOrigins,
+    getCurrentTrustedOrigin,
+    openExternal,
+    promptSavePathSync,
+    onTrustedMediaPermissionRequest,
+    preloadPath,
+    externalDocsHosts,
+  } = options;
+
+  const allowedWebContents = new Set<unknown>([webContents]);
+
+  attachChildWindowSecurityGuards({
+    webContents,
+    getActiveOrigin,
+    getTrustedOrigins,
+    openExternal,
+    preloadPath,
+    externalDocsHosts,
+    onChildWindowCreated: (childWindow) => {
+      allowedWebContents.add(childWindow.webContents);
+      childWindow.webContents.once?.('destroyed', () => {
+        allowedWebContents.delete(childWindow.webContents);
+      });
+    },
+  });
+
+  const resolveWindowPageOrigin = (wc: unknown): string | null => {
+    const mainTrusted = getCurrentTrustedOrigin();
+    if (!mainTrusted) return null;
+    if (wc === webContents) return mainTrusted;
+    if (!isSecurityWebContents(wc)) return null;
+    return isSameActiveOrigin(wc.getURL(), getActiveOrigin(), getTrustedOrigins()) ? getActiveOrigin() : null;
+  };
+
   session.setPermissionRequestHandler((wc, permission, callback, details) => {
-    if (wc !== webContents) {
+    if (!allowedWebContents.has(wc)) {
       callback(false);
       return;
     }
-    const requestingUrl = details?.requestingUrl || webContents.getURL();
+    const requestingUrl = details?.requestingUrl || (isSecurityWebContents(wc) ? wc.getURL() : webContents.getURL());
     const granted = isAllowedPermissionRequest({
       requestingUrl,
       permission,
       activeOrigin: getActiveOrigin(),
       trustedOrigins: getTrustedOrigins(),
-      currentPageOrigin: getCurrentTrustedOrigin(),
+      currentPageOrigin: resolveWindowPageOrigin(wc),
     });
     if (!granted) {
       callback(false);
@@ -231,18 +349,18 @@ export function attachWindowSecurityGuards(options: WindowSecurityGuardOptions):
   });
 
   session.setPermissionCheckHandler?.((wc, permission, requestingOrigin) => {
-    if (wc !== webContents) return false;
+    if (!allowedWebContents.has(wc)) return false;
     return isAllowedPermissionRequest({
-      requestingUrl: requestingOrigin || webContents.getURL(),
+      requestingUrl: requestingOrigin || (isSecurityWebContents(wc) ? wc.getURL() : webContents.getURL()),
       permission,
       activeOrigin: getActiveOrigin(),
       trustedOrigins: getTrustedOrigins(),
-      currentPageOrigin: getCurrentTrustedOrigin(),
+      currentPageOrigin: resolveWindowPageOrigin(wc),
     });
   });
 
   session.on('will-download', (event, item, wc) => {
-    if (wc && wc !== webContents) {
+    if (wc && !allowedWebContents.has(wc)) {
       event.preventDefault();
       item.cancel();
       return;
