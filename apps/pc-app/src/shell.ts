@@ -94,6 +94,7 @@ export interface PcAppShellDeps {
       | 'timeZone'
       | 'onSpeechModelStatusChanged'
       | 'onInputDevicesChanged'
+      | 'onVoiceEvent'
     >
   >;
   createMainWindow: (options: {
@@ -122,6 +123,7 @@ export interface PcAppShellDeps {
   promptAddServer?: () => Promise<ServerPromptInput | null>;
   detectLocalBoundOrigin?: () => string | { origin: string; label?: string } | null;
   welcomeLocale?: string;
+  onLocaleChanged?: (locale: PcAppLocale) => void;
   onOpenSettings?: () => void;
   onBindFallback?: (trustedOrigin: string | null) => Promise<void> | void;
   bindDeps?: Partial<
@@ -236,6 +238,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     if (nextLocale === activeLocale) return;
     activeLocale = nextLocale;
     bind.setLocale(activeLocale);
+    deps.onLocaleChanged?.(activeLocale);
     rebuildMenu();
     if (
       mainWindow &&

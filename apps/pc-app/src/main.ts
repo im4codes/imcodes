@@ -8,11 +8,13 @@ import {
   ipcMain,
   Menu,
   Notification,
+  screen,
   shell,
   systemPreferences,
   type MenuItemConstructorOptions,
 } from 'electron';
-import { createPcAppShell } from './shell.js';
+import { createPcAppShell, type PcAppShellInstance } from './shell.js';
+import { createPcAppVoiceHud, type VoiceHudWindowLike } from './voice-hud.js';
 
 function resolveRuntimeIconPath(): string | undefined {
   const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -37,6 +39,22 @@ export async function startPcApp(): Promise<void> {
     app.dock?.setIcon(runtimeIconPath);
   }
 
+  let shellInstance: PcAppShellInstance | null = null;
+  const voiceHud = createPcAppVoiceHud({
+    platform: process.platform,
+    getLocale: () => shellInstance?.getLocale() ?? app.getLocale(),
+    getDisplayWorkArea: () => {
+      const cursor = screen.getCursorScreenPoint();
+      const display = screen.getDisplayNearestPoint(cursor) ?? screen.getPrimaryDisplay();
+      return display.workArea;
+    },
+    createWindow: (opts) =>
+      new BrowserWindow({
+        ...opts,
+        ...(process.platform === 'darwin' ? { type: 'panel' as const } : {}),
+      }) as unknown as VoiceHudWindowLike,
+  });
+
   const pcShell = createPcAppShell({
     platform: process.platform,
     appName: 'IM.codes',
@@ -44,6 +62,7 @@ export async function startPcApp(): Promise<void> {
     welcomeLocale: app.getLocale(),
     preloadPath: resolveRuntimePreloadPath(),
     ipcMain,
+    onLocaleChanged: (locale) => voiceHud.setLocale(locale),
     voiceDeps: {
       resourcesPath: process.resourcesPath,
       speechModelsDir: join(app.getPath('appData'), 'imcodes-pc-app', 'speech-models'),
@@ -55,6 +74,7 @@ export async function startPcApp(): Promise<void> {
         ? (mediaType) => systemPreferences.askForMediaAccess(mediaType)
         : undefined,
       openSystemUrl: (url) => shell.openExternal(url),
+      onVoiceEvent: (ev) => voiceHud.handleEvent(ev),
     },
     createMainWindow: (opts) =>
       new BrowserWindow({
@@ -99,8 +119,15 @@ export async function startPcApp(): Promise<void> {
     },
   });
 
+  shellInstance = pcShell;
+  voiceHud.setLocale(pcShell.getLocale());
+
   await pcShell.ensureWindow();
   await pcShell.checkLaunchAgent();
+
+  app.on('before-quit', () => {
+    voiceHud.dispose();
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

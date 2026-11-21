@@ -98,6 +98,7 @@ export interface PcAppVoiceControllerDeps {
   timeZone?: string;
   onSpeechModelStatusChanged?: (status: PcAppSpeechModelStatus) => void;
   onInputDevicesChanged?: (devices: PcAppInputDevice[], selectedUid: string) => void;
+  onVoiceEvent?: (event: PcAppVoiceEvent) => void;
 }
 
 const MAC_PRIVACY_URLS: Record<PcAppPrivacyTarget, string> = {
@@ -711,6 +712,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
   };
 
+  const notifyVoiceEvent = (payload: PcAppVoiceEvent): void => {
+    try {
+      deps.onVoiceEvent?.(payload);
+    } catch {
+      // Never allow HUD or external voice-event listeners to break voice IPC.
+    }
+  };
+
   const stopListening = async (options?: { abort?: boolean }): Promise<void> => {
     if (activeStopTimer !== null) {
       clearTimeout(activeStopTimer);
@@ -725,6 +734,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       try {
         child.kill('SIGTERM');
       } catch { /* already exited */ }
+      notifyVoiceEvent({ type: 'end' });
       return;
     }
     try {
@@ -777,7 +787,10 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
     if (variant && (await checkMlxSupported()) && downloader.isModelReadySync(variant)) {
       const mlxBin = resolveMlxHelperPath();
-      const verified = await downloader.verifyModelFilesOnDisk(variant);
+      if (mlxBin) {
+        notifyVoiceEvent({ type: 'loading', variant });
+      }
+      const verified = mlxBin ? await downloader.verifyModelFilesOnDisk(variant) : false;
       if (mlxBin && verified) {
         bin = mlxBin;
         isMlxHelper = true;
@@ -804,11 +817,13 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
     if (!bin) {
       if (perms.speech !== 'granted') {
+        notifyVoiceEvent({ type: 'end' });
         appendVoiceLog(`startListening denied target=speech selectedModel=${selectedModel} device=${selectedInputDevice}`);
         return { ok: false, error: 'permission_denied', target: 'speech' };
       }
       bin = resolveSpeechHelperPath();
       if (!bin) {
+        notifyVoiceEvent({ type: 'end' });
         appendVoiceLog(`startListening speech_helper_unavailable selectedModel=${selectedModel} device=${selectedInputDevice}`);
         return { ok: false, error: 'speech_helper_unavailable' };
       }
@@ -822,6 +837,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
 
     await stopListening({ abort: true });
+    if (isMlxHelper && variant) {
+      notifyVoiceEvent({ type: 'loading', variant });
+    }
 
     appendVoiceLog(`startListening model=${selectedModel} device=${selectedInputDevice} bin=${bin} args=${JSON.stringify(args)}`);
     const child = (deps.spawnHelper ?? ((p, a) => spawn(p, a, { stdio: ['pipe', 'pipe', 'pipe'] })))(bin, args);
@@ -852,6 +870,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       } else if (payload.type === 'error') {
         appendVoiceLog(`helper error code=${payload.code} target=${payload.target ?? '-'} message=${payload.message ?? '-'}`);
       }
+      notifyVoiceEvent(payload);
       if (options?.onEvent) {
         options.onEvent(payload);
         return;
