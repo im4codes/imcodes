@@ -252,6 +252,7 @@ vi.mock('../../src/agent/notify-setup.js', () => ({ setupCodexNotify: vi.fn(asyn
 vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }));
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
 import { openCodeSdkRuntimeHooks } from '../../src/agent/providers/opencode-sdk.js';
@@ -3872,6 +3873,141 @@ describe('sdk transport session restore', () => {
       expect(mocks.store.get(name)?.agentType).toBe('codex-sdk');
       expect(mocks.store.get(name)?.ccPreset).toBeUndefined();
     } finally {
+      codexPresetSpy.mockRestore();
+    }
+  });
+
+  it('restores codex-sdk ccPreset session with codexModelProvider, switched requestedModel, env, systemPrompt, and availableModels', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const switchedModel = 'sc117-qwen3.8-flash-next-iq3_xxs-uncensored';
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig').mockResolvedValue({
+      env: {
+        OPENAI_BASE_URL: 'https://preset-qwen.example/v1',
+        CODEX_BASE_URL: 'https://preset-qwen.example/v1',
+        OPENAI_API_KEY: 'sk-preset',
+        CODEX_API_KEY: 'sk-preset',
+        CODEX_MODEL: switchedModel,
+        IMCODES_CC_PRESET: 'qwen3.8-27b',
+      },
+      model: switchedModel,
+      availableModels: ['qwen3.8-27b', switchedModel],
+      systemPrompt: 'Authoritative runtime fact: qwen3.8-27b preset.',
+      contextWindow: 262_144,
+      codexModelProvider: {
+        providerId: 'qwen3_8-27b',
+        baseUrl: 'https://preset-qwen.example/v1',
+        apiKey: 'sk-preset',
+        wireApi: 'responses',
+      },
+    });
+    const initSpy = vi.spyOn(TransportSessionRuntime.prototype, 'initialize');
+    try {
+      const name = 'deck_restore_codex_preset_brain';
+      mocks.store.set(name, {
+        name,
+        projectName: 'restorecodexpreset',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/restore-codex-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-codex-preset-restore',
+        codexSessionId: 'codex-thread-preset-restore',
+        ccPreset: 'qwen3.8-27b',
+        requestedModel: switchedModel,
+        activeModel: switchedModel,
+        modelDisplay: switchedModel,
+      });
+
+      await connectProvider('codex-sdk', {});
+      await restoreTransportSessions('codex-sdk');
+
+      expect(codexPresetSpy).toHaveBeenCalledWith('qwen3.8-27b', switchedModel);
+      expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({
+        sessionName: name,
+        providerId: 'codex-sdk',
+        agentId: switchedModel,
+        systemPrompt: 'Authoritative runtime fact: qwen3.8-27b preset.',
+        settings: {
+          codexModelProvider: {
+            providerId: 'qwen3_8-27b',
+            baseUrl: 'https://preset-qwen.example/v1',
+            apiKey: 'sk-preset',
+            wireApi: 'responses',
+          },
+        },
+        env: expect.objectContaining({
+          CODEX_MODEL: switchedModel,
+          OPENAI_BASE_URL: 'https://preset-qwen.example/v1',
+          IMCODES_CC_PRESET: 'qwen3.8-27b',
+        }),
+      }));
+
+      const persisted = mocks.store.get(name);
+      expect(persisted?.requestedModel).toBe(switchedModel);
+      expect(persisted?.activeModel).toBe(switchedModel);
+      expect(persisted?.modelDisplay).toBe(switchedModel);
+      expect(persisted?.codexAvailableModels).toEqual(['qwen3.8-27b', switchedModel]);
+      expect(persisted?.presetContextWindow).toBe(262_144);
+
+      mocks.codexRuns.length = 0;
+      const runtime = getTransportRuntime(name);
+      runtime!.send('continue with switched preset model');
+      await settleCodexRun(name, 'resume', 'continue with switched preset model');
+      const resumed = codexRunForSession(name, 'resume');
+      expect(resumed?.id).toBe('codex-thread-preset-restore');
+      expect(resumed?.options.model).toBe(switchedModel);
+      expect(resumed?.options.modelProvider).toBe('qwen3_8-27b');
+    } finally {
+      initSpy.mockRestore();
+      codexPresetSpy.mockRestore();
+    }
+  });
+
+  it('handles missing or deleted ccPreset safely when restoring a codex-sdk session', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig').mockResolvedValue({ env: {} });
+    const initSpy = vi.spyOn(TransportSessionRuntime.prototype, 'initialize');
+    try {
+      const name = 'deck_restore_codex_missing_preset_brain';
+      mocks.store.set(name, {
+        name,
+        projectName: 'restorecodexmissingpreset',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/restore-codex-missing-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-codex-missing-preset',
+        codexSessionId: 'codex-thread-missing-preset',
+        ccPreset: 'deleted-preset',
+        requestedModel: 'sc117-qwen3.8-flash-next-iq3_xxs-uncensored',
+      });
+
+      await connectProvider('codex-sdk', {});
+      await restoreTransportSessions('codex-sdk');
+
+      expect(codexPresetSpy).toHaveBeenCalledWith('deleted-preset', 'sc117-qwen3.8-flash-next-iq3_xxs-uncensored');
+      expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({
+        sessionName: name,
+        providerId: 'codex-sdk',
+        agentId: 'sc117-qwen3.8-flash-next-iq3_xxs-uncensored',
+      }));
+      const initCall = initSpy.mock.calls.find(([cfg]) => cfg.sessionName === name)?.[0];
+      expect(initCall?.settings).toBeUndefined();
+      expect(mocks.store.get(name)?.requestedModel).toBe('sc117-qwen3.8-flash-next-iq3_xxs-uncensored');
+    } finally {
+      initSpy.mockRestore();
       codexPresetSpy.mockRestore();
     }
   });

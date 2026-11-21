@@ -247,6 +247,38 @@ function sanitizeCodexSdkStartupModel(value: string | null | undefined): string 
   return isClaudeModel ? DEFAULT_CODEX_SESSION_MODEL : trimmed;
 }
 
+async function applyCodexPresetConfig(input: {
+  ccPreset: string;
+  requestedModel?: string;
+  env?: Record<string, string>;
+  contextWindow?: number;
+  systemPrompt?: string;
+  settings?: string | Record<string, unknown>;
+}): Promise<{
+  env?: Record<string, string>;
+  model?: string;
+  contextWindow?: number;
+  systemPrompt?: string;
+  availableModels?: string[];
+  settings?: string | Record<string, unknown>;
+}> {
+  const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
+  const presetConfig = await getCodexPresetTransportConfig(input.ccPreset, input.requestedModel);
+  return {
+    env: { ...(input.env ?? {}), ...presetConfig.env },
+    model: presetConfig.model ?? input.requestedModel,
+    contextWindow: presetConfig.contextWindow ?? input.contextWindow,
+    systemPrompt: presetConfig.systemPrompt ?? input.systemPrompt,
+    availableModels: presetConfig.availableModels?.length ? presetConfig.availableModels : undefined,
+    settings: presetConfig.codexModelProvider
+      ? {
+          ...(typeof input.settings === 'object' && input.settings ? input.settings : {}),
+          codexModelProvider: presetConfig.codexModelProvider,
+        }
+      : input.settings,
+  };
+}
+
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
   if (ccSessionId) {
@@ -3408,6 +3440,7 @@ export async function restoreTransportSessions(
       let effectiveRequestedModel = requestedTransportModel;
       let restoredPresetContextWindow = s.presetContextWindow;
       let qwenPresetUsesApiKey = false;
+      let availableCodexModels: string[] | undefined;
       let dshLlmConfig: DshLlmConfig | undefined;
       let piLlmConfig: PiLlmConfig | undefined;
       const boundServerId = await loadBoundServerIdForManagedMcp();
@@ -3465,6 +3498,21 @@ export async function restoreTransportSessions(
         if (presetPreferredModel) effectiveRequestedModel = presetPreferredModel;
         restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === 'codex-sdk' && s.ccPreset) {
+        const applied = await applyCodexPresetConfig({
+          ccPreset: s.ccPreset,
+          requestedModel: effectiveRequestedModel,
+          env: extraEnv,
+          contextWindow: restoredPresetContextWindow,
+          systemPrompt,
+          settings: transportSettings,
+        });
+        extraEnv = applied.env;
+        effectiveRequestedModel = applied.model;
+        restoredPresetContextWindow = applied.contextWindow;
+        systemPrompt = applied.systemPrompt;
+        availableCodexModels = applied.availableModels;
+        transportSettings = applied.settings;
       } else if (s.providerId === 'pi' && s.ccPreset) {
         const { getPiPresetTransportConfig } = await import('../daemon/cc-presets.js');
         const presetConfig = await getPiPresetTransportConfig(s.ccPreset, effectiveRequestedModel);
@@ -3610,6 +3658,7 @@ export async function restoreTransportSessions(
           ? undefined
           : (qwenRuntime?.authLimit ?? currentForFinalize.qwenAuthLimit),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
+        ...(availableCodexModels?.length ? { codexAvailableModels: availableCodexModels } : {}),
         ...(restoredPresetContextWindow ? { presetContextWindow: restoredPresetContextWindow } : {}),
         ...getQwenDisplayMetadata({
           model: effectiveRequestedModel,
@@ -4053,21 +4102,20 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     }
     let availableCodexModels: string[] | undefined;
     if (effectiveCcPreset) {
-      const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
-      const presetConfig = await getCodexPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
-      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
-      if (presetConfig.model) requestedTransportModel = presetConfig.model;
-      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
-      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
-      if (presetConfig.availableModels?.length) {
-        availableCodexModels = presetConfig.availableModels;
-      }
-      if (presetConfig.codexModelProvider) {
-        transportSettings = {
-          ...(typeof transportSettings === 'object' && transportSettings ? transportSettings : {}),
-          codexModelProvider: presetConfig.codexModelProvider,
-        };
-      }
+      const applied = await applyCodexPresetConfig({
+        ccPreset: effectiveCcPreset,
+        requestedModel: requestedTransportModel,
+        env: transportEnv,
+        contextWindow: presetContextWindow,
+        systemPrompt: transportSystemPrompt,
+        settings: transportSettings,
+      });
+      transportEnv = applied.env;
+      requestedTransportModel = applied.model;
+      presetContextWindow = applied.contextWindow;
+      transportSystemPrompt = applied.systemPrompt;
+      availableCodexModels = applied.availableModels;
+      transportSettings = applied.settings;
     }
     const rawSdkDisplay = mergeCodexDisplayMetadata(
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
