@@ -488,6 +488,9 @@ final class SpeechSession {
 
     let req = SFSpeechAudioBufferRecognitionRequest()
     req.shouldReportPartialResults = true
+    if #available(macOS 13.0, *) {
+      req.addsPunctuation = true
+    }
     request = req
 
     inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
