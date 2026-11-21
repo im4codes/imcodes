@@ -444,9 +444,8 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     voice.registerIpc(deps.ipcMain);
   }
   if (deps.platform === 'darwin') {
-    if (voice.getSpeechModel() !== 'system') {
-      void voice.warmSelectedSpeechModel();
-    }
+    void voice.getSpeechModelStatus().then(() => rebuildMenu());
+    void voice.warmSelectedSpeechModel();
     void voice.getInputDevices();
   }
 

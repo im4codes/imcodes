@@ -33,6 +33,15 @@ export interface PcAppSpeechModelManifest {
   files: readonly PcAppSpeechModelAssetSpec[];
 }
 
+export interface PcAppSpeechVariantStatus {
+  state: PcAppSpeechModelState;
+  progress: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  error?: string;
+  modelDir: string;
+}
+
 export interface PcAppSpeechModelStatus {
   selectedModel: PcAppSpeechModelChoice;
   activeBackend: PcAppSpeechModelChoice;
@@ -43,6 +52,8 @@ export interface PcAppSpeechModelStatus {
   mlxSupported: boolean;
   error?: string;
   modelDir?: string;
+  downloadingModel?: Exclude<PcAppSpeechModelChoice, 'system'> | null;
+  models?: Record<Exclude<PcAppSpeechModelChoice, 'system'>, PcAppSpeechVariantStatus>;
 }
 
 export const CHINA_MIRROR_ORIGINS = ['https://hf-mirror.com', 'https://huggingface.co'] as const;

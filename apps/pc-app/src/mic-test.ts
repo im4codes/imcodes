@@ -34,6 +34,9 @@ export function buildMicTestOverlayScript(localeRaw: string): string {
     transcriptLabel: tPcApp(locale, 'micTest.transcriptLabel'),
     transcriptPlaceholder: tPcApp(locale, 'micTest.transcriptPlaceholder'),
     levelLabel: tPcApp(locale, 'micTest.levelLabel'),
+    modelLabel: tPcApp(locale, 'micTest.modelLabel'),
+    modelSystem: tPcApp(locale, 'micTest.modelSystem'),
+    modelDownloading: tPcApp(locale, 'micTest.modelDownloading'),
   };
 
   return `(function () {
@@ -145,6 +148,37 @@ export function buildMicTestOverlayScript(localeRaw: string): string {
   devRow.appendChild(selectEl);
   devRow.appendChild(refreshBtn);
   root.appendChild(devRow);
+
+  var modelRow = document.createElement('div');
+  modelRow.id = 'imcodes-mic-test-model-row';
+  Object.assign(modelRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '8px',
+    padding: '5px 8px',
+    borderRadius: '6px',
+    border: '1px solid rgba(51, 65, 85, 0.7)',
+    background: 'rgba(2, 6, 23, 0.65)',
+    fontSize: '11px',
+    color: '#94a3b8',
+  });
+  var modelLabelEl = document.createElement('span');
+  modelLabelEl.textContent = STRINGS.modelLabel;
+  var modelBadgeEl = document.createElement('span');
+  modelBadgeEl.id = 'imcodes-mic-test-model-badge';
+  modelBadgeEl.textContent = STRINGS.modelSystem;
+  Object.assign(modelBadgeEl.style, {
+    color: '#cbd5e1',
+    fontWeight: '500',
+    textAlign: 'right',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  });
+  modelRow.appendChild(modelLabelEl);
+  modelRow.appendChild(modelBadgeEl);
+  root.appendChild(modelRow);
 
   var card = document.createElement('div');
   Object.assign(card.style, {
@@ -356,6 +390,39 @@ export function buildMicTestOverlayScript(localeRaw: string): string {
     }
   }
 
+  function formatModelChoice(choice) {
+    if (choice === 'qwen3-0.6b') return 'Qwen3-ASR 0.6B';
+    if (choice === 'qwen3-1.7b') return 'Qwen3-ASR 1.7B';
+    return STRINGS.modelSystem;
+  }
+
+  function renderModelStatus(st) {
+    if (!st || typeof st !== 'object') return;
+    var activeName = formatModelChoice(st.activeBackend || st.selectedModel || 'system');
+    var dlChoice = st.downloadingModel || (st.state === 'downloading' ? st.selectedModel : null);
+    if (dlChoice && dlChoice !== 'system' && (st.state === 'downloading' || (st.models && st.models[dlChoice] && st.models[dlChoice].state === 'downloading'))) {
+      var dlProgress = st.models && st.models[dlChoice] ? st.models[dlChoice].progress : st.progress;
+      var pct = Math.max(0, Math.min(100, Math.round((Number(dlProgress) || 0) * 100)));
+      var dlText = STRINGS.modelDownloading
+        .replace('{{model}}', formatModelChoice(dlChoice))
+        .replace('{{progress}}', String(pct));
+      modelBadgeEl.textContent = activeName + ' · ' + dlText;
+      modelBadgeEl.style.color = '#38bdf8';
+      return;
+    }
+    modelBadgeEl.textContent = activeName;
+    modelBadgeEl.style.color = activeName !== STRINGS.modelSystem ? '#34d399' : '#cbd5e1';
+  }
+
+  function refreshModelStatus() {
+    if (!voice || typeof voice.getSpeechModelStatus !== 'function') return;
+    Promise.resolve(voice.getSpeechModelStatus())
+      .then(function (st) {
+        if (!disposed) renderModelStatus(st);
+      })
+      .catch(function () {});
+  }
+
   function refreshDevices() {
     Promise.all([voice.getInputDevices(), voice.getInputDevice()])
       .then(function (pair) {
@@ -465,9 +532,15 @@ export function buildMicTestOverlayScript(localeRaw: string): string {
     window.addEventListener('mouseup', onMouseUp);
   });
 
+  var modelPollTimer = null;
+
   function cleanup() {
     if (disposed) return;
     disposed = true;
+    if (modelPollTimer !== null) {
+      clearInterval(modelPollTimer);
+      modelPollTimer = null;
+    }
     window.removeEventListener('beforeunload', cleanup);
     window.removeEventListener('mousemove', onMouseMove);
     window.removeEventListener('mouseup', onMouseUp);
@@ -493,6 +566,10 @@ export function buildMicTestOverlayScript(localeRaw: string): string {
 
   (document.body || document.documentElement).appendChild(root);
   refreshDevices();
+  refreshModelStatus();
+  if (typeof voice.getSpeechModelStatus === 'function') {
+    modelPollTimer = setInterval(refreshModelStatus, 1000);
+  }
   return { mounted: true };
 })();`;
 }

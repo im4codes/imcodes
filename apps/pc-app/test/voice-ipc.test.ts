@@ -395,14 +395,20 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     expect(await ctx.handlers.get(PC_APP_VOICE_CHANNELS.getSpeechModel)!(ev)).toBe('system');
     await expect(ctx.handlers.get(PC_APP_VOICE_CHANNELS.setSpeechModel)!(ev, 'invalid-model')).rejects.toThrow(/Invalid speech model/);
 
-    // Switch to qwen3-0.6b while download is gated -> starts downloading, activeBackend stays 'system'
+    // Switch to qwen3-0.6b while download is gated -> starts downloading, selectedModel & activeBackend stay 'system'
     const initialStatus = await ctx.handlers.get(PC_APP_VOICE_CHANNELS.setSpeechModel)!(ev, 'qwen3-0.6b') as {
       selectedModel: string;
       activeBackend: string;
       state: string;
+      downloadingModel: string | null;
+      models: Record<string, { state: string; progress: number }>;
     };
-    expect(initialStatus.selectedModel).toBe('qwen3-0.6b');
+    expect(initialStatus.selectedModel).toBe('system');
     expect(initialStatus.activeBackend).toBe('system');
+    expect(initialStatus.state).toBe('downloading');
+    expect(initialStatus.downloadingModel).toBe('qwen3-0.6b');
+    expect(initialStatus.models['qwen3-0.6b'].state).toBe('downloading');
+    expect(await ctx.handlers.get(PC_APP_VOICE_CHANNELS.getSpeechModel)!(ev)).toBe('system');
 
     // Starting voice before weights finish falls back cleanly to system SFSpeechRecognizer
     expect(await ctx.handlers.get(PC_APP_VOICE_CHANNELS.startListening)!(ev, { locale: 'zh-CN' })).toEqual({ ok: true });
@@ -411,16 +417,22 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       ['listen', '--locale', 'zh-CN'],
     );
 
-    // Finish background download -> next startListening uses imcodes-speech-mlx with --variant 0.6b
+    // Finish background download -> automatically promotes selectedModel & activeBackend to 'qwen3-0.6b'
     release06();
     await new Promise((res) => setTimeout(res, 25));
     const ready06 = await ctx.handlers.get(PC_APP_VOICE_CHANNELS.getSpeechModelStatus)!(ev) as {
+      selectedModel: string;
       activeBackend: string;
       state: string;
+      downloadingModel: string | null;
       modelDir: string;
+      models: Record<string, { state: string; progress: number }>;
     };
     expect(ready06.state).toBe('ready');
+    expect(ready06.selectedModel).toBe('qwen3-0.6b');
     expect(ready06.activeBackend).toBe('qwen3-0.6b');
+    expect(ready06.downloadingModel).toBeNull();
+    expect(ready06.models['qwen3-0.6b'].state).toBe('ready');
 
     expect(await ctx.handlers.get(PC_APP_VOICE_CHANNELS.startListening)!(ev, { locale: 'zh-CN' })).toEqual({ ok: true });
     expect(ctx.spawnHelper).toHaveBeenLastCalledWith(
@@ -428,9 +440,22 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       ['listen', '--model-dir', ready06.modelDir, '--variant', '0.6b', '--locale', 'zh-CN'],
     );
 
-    // Switch to 1.7b, verify persistence across new controller instance, and check x64 unsupported fallback
+    // Switch to 1.7b, verify persistence across new arm64 controller instance, and check x64 unsupported keeps 'system' active
     await ctx.handlers.get(PC_APP_VOICE_CHANNELS.setSpeechModel)!(ev, 'qwen3-1.7b');
     await new Promise((res) => setTimeout(res, 25));
+    expect(await ctx.handlers.get(PC_APP_VOICE_CHANNELS.getSpeechModel)!(ev)).toBe('qwen3-1.7b');
+
+    const ctxArm2 = setupController({
+      platform: 'darwin',
+      arch: 'arm64',
+      micStatus: 'granted',
+      helperRequestJson: JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+      mlxHelperPath: mlxBin,
+      manifests,
+    });
+    expect(await ctxArm2.voice.getSpeechModel()).toBe('qwen3-1.7b');
+    await ctxArm2.voice.dispose();
+
     const ctx2 = setupController({
       platform: 'darwin',
       arch: 'x64',
@@ -439,10 +464,13 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       mlxHelperPath: mlxBin,
       manifests,
     });
-    expect(await ctx2.voice.getSpeechModel()).toBe('qwen3-1.7b');
+    expect(await ctx2.voice.getSpeechModel()).toBe('system');
     const x64Status = await ctx2.voice.getSpeechModelStatus();
     expect(x64Status.state).toBe('unsupported');
+    expect(x64Status.selectedModel).toBe('system');
     expect(x64Status.activeBackend).toBe('system');
+    expect(x64Status.models?.['qwen3-0.6b'].state).toBe('unsupported');
+    expect(x64Status.models?.['qwen3-1.7b'].state).toBe('unsupported');
     expect(await ctx2.voice.startListening({ locale: 'en-US' })).toEqual({ ok: true });
     expect(ctx2.spawnHelper).toHaveBeenLastCalledWith(
       '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
@@ -451,6 +479,65 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
 
     await ctx.voice.dispose();
     await ctx2.voice.dispose();
+  });
+
+  it('cancels active model download cleanly when switching back to system', async () => {
+    const weights = Buffer.from('cancel-test-weights');
+    const sha = createHash('sha256').update(weights).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'aufklarer/test-0.6b',
+        revision: 'rev06-cancel',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'aufklarer/test-1.7b',
+        revision: 'rev17-cancel',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+    };
+    let releaseDownload!: () => void;
+    const downloadGate = new Promise<void>((res) => { releaseDownload = res; });
+    const ctx = setupController({
+      platform: 'darwin',
+      arch: 'arm64',
+      micStatus: 'granted',
+      helperRequestJson: JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+      mlxHelperPath: '/tmp/fake-mlx-bin',
+      isMlxSupported: true,
+      manifests,
+      fetchModel: async (_url, init) => {
+        await new Promise<void>((resolveWait, rejectWait) => {
+          if (init?.signal?.aborted) {
+            rejectWait(new Error('aborted'));
+            return;
+          }
+          init?.signal?.addEventListener('abort', () => rejectWait(new Error('aborted')), { once: true });
+          void downloadGate.then(resolveWait);
+        });
+        return new Response(new Uint8Array(weights), { status: 200 });
+      },
+    });
+
+    const downloadingStatus = await ctx.voice.setSpeechModel('qwen3-0.6b');
+    expect(downloadingStatus.selectedModel).toBe('system');
+    expect(downloadingStatus.state).toBe('downloading');
+    expect(downloadingStatus.downloadingModel).toBe('qwen3-0.6b');
+
+    const cancelledStatus = await ctx.voice.setSpeechModel('system');
+    expect(cancelledStatus.selectedModel).toBe('system');
+    expect(cancelledStatus.state).toBe('idle');
+    expect(cancelledStatus.downloadingModel).toBeNull();
+    expect(cancelledStatus.models?.['qwen3-0.6b'].state).toBe('idle');
+
+    releaseDownload();
+    await new Promise((res) => setTimeout(res, 20));
+    expect(ctx.voice.getSpeechModel()).toBe('system');
+    await ctx.voice.dispose();
   });
 
   it('uses packaged resourcesPath imcodes-speech-mlx when mlx.metallib probe passes, and falls back activeBackend to system when metallib is missing', async () => {

@@ -1021,6 +1021,20 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
           ]),
           getInputDevice: vi.fn(async () => 'auto'),
           setInputDevice: setInputDeviceMock,
+          getSpeechModelStatus: vi.fn(async () => ({
+            selectedModel: 'system',
+            activeBackend: 'system',
+            state: 'downloading',
+            progress: 0.42,
+            downloadedBytes: 42,
+            totalBytes: 100,
+            mlxSupported: true,
+            downloadingModel: 'qwen3-0.6b',
+            models: {
+              'qwen3-0.6b': { state: 'downloading', progress: 0.42, downloadedBytes: 42, totalBytes: 100, modelDir: '/m/06' },
+              'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 100, modelDir: '/m/17' },
+            },
+          })),
           startListening: startListeningMock,
           stopListening: stopListeningMock,
           subscribe: vi.fn((fn: (ev: unknown) => void) => {
@@ -1042,6 +1056,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
 
     await vi.waitFor(() => {
       expect(selectEl.children).toHaveLength(3);
+      expect(elements.get('imcodes-mic-test-model-badge')!.textContent).toContain('Qwen3-ASR 0.6B (42%)');
     });
     const initialRebuilds = selectEl._innerHTMLChanges;
 
@@ -1074,5 +1089,96 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     expect(elements.get(MIC_TEST_OVERLAY_ID)).toBeUndefined();
     expect(voiceSubscribers.size).toBe(0);
     expect(stopListeningMock).toHaveBeenLastCalledWith({ abort: true });
+  });
+
+  it('shows per-model readiness, download progress, and unsupported gating in the Voice menu', () => {
+    const baseOpts = {
+      platform: 'darwin' as const,
+      appName: 'IM.codes',
+      locale: 'en',
+      servers: [],
+      activeOrigin: null,
+      onSelectServer: () => {},
+      onAddServer: () => {},
+      onRemoveServer: () => {},
+      onReload: () => {},
+      onForceReload: () => {},
+      onToggleDevTools: () => {},
+      onClearSession: () => {},
+      onBindFallback: () => {},
+      onOpenDocs: () => {},
+    };
+
+    const downloadingMenu = buildAppMenuTemplate({
+      ...baseOpts,
+      speechModelStatus: {
+        selectedModel: 'system',
+        activeBackend: 'system',
+        state: 'downloading',
+        progress: 0.42,
+        downloadedBytes: 42,
+        totalBytes: 100,
+        mlxSupported: true,
+        downloadingModel: 'qwen3-0.6b',
+        models: {
+          'qwen3-0.6b': { state: 'downloading', progress: 0.42, downloadedBytes: 42, totalBytes: 100, modelDir: '/m/06' },
+          'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 100, modelDir: '/m/17' },
+        },
+      },
+    });
+    expect(findMenuItem(downloadingMenu, 'voice:model-system')?.checked).toBe(true);
+    expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-0.6b')?.checked).toBe(false);
+    expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-0.6b')?.enabled).toBe(false);
+    expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-0.6b')?.label).toContain('Downloading 42%');
+    expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-1.7b')?.checked).toBe(false);
+    expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-1.7b')?.enabled).toBe(true);
+    expect(findMenuItem(downloadingMenu, 'voice:model-qwen3-1.7b')?.label).toContain('Not Downloaded');
+
+    const readyMenu = buildAppMenuTemplate({
+      ...baseOpts,
+      speechModelStatus: {
+        selectedModel: 'qwen3-0.6b',
+        activeBackend: 'qwen3-0.6b',
+        state: 'ready',
+        progress: 1,
+        downloadedBytes: 100,
+        totalBytes: 100,
+        mlxSupported: true,
+        downloadingModel: null,
+        models: {
+          'qwen3-0.6b': { state: 'ready', progress: 1, downloadedBytes: 100, totalBytes: 100, modelDir: '/m/06' },
+          'qwen3-1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 100, modelDir: '/m/17' },
+        },
+      },
+    });
+    expect(findMenuItem(readyMenu, 'voice:model-system')?.checked).toBe(false);
+    expect(findMenuItem(readyMenu, 'voice:model-qwen3-0.6b')?.checked).toBe(true);
+    expect(findMenuItem(readyMenu, 'voice:model-qwen3-0.6b')?.enabled).toBe(true);
+    expect(findMenuItem(readyMenu, 'voice:model-qwen3-0.6b')?.label).toContain('(Ready)');
+
+    const unsupportedMenu = buildAppMenuTemplate({
+      ...baseOpts,
+      speechModelStatus: {
+        selectedModel: 'system',
+        activeBackend: 'system',
+        state: 'unsupported',
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: 100,
+        mlxSupported: false,
+        downloadingModel: null,
+        models: {
+          'qwen3-0.6b': { state: 'unsupported', progress: 0, downloadedBytes: 0, totalBytes: 100, modelDir: '/m/06' },
+          'qwen3-1.7b': { state: 'unsupported', progress: 0, downloadedBytes: 0, totalBytes: 100, modelDir: '/m/17' },
+        },
+      },
+    });
+    expect(findMenuItem(unsupportedMenu, 'voice:model-system')?.checked).toBe(true);
+    expect(findMenuItem(unsupportedMenu, 'voice:model-qwen3-0.6b')?.checked).toBe(false);
+    expect(findMenuItem(unsupportedMenu, 'voice:model-qwen3-0.6b')?.enabled).toBe(false);
+    expect(findMenuItem(unsupportedMenu, 'voice:model-qwen3-0.6b')?.label).toContain('(Unsupported)');
+    expect(findMenuItem(unsupportedMenu, 'voice:model-qwen3-1.7b')?.checked).toBe(false);
+    expect(findMenuItem(unsupportedMenu, 'voice:model-qwen3-1.7b')?.enabled).toBe(false);
+    expect(findMenuItem(unsupportedMenu, 'voice:model-qwen3-1.7b')?.label).toContain('(Unsupported)');
   });
 });

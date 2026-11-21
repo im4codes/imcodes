@@ -169,12 +169,18 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let activeChild: ChildProcess | null = null;
   let activeStopTimer: ReturnType<typeof setTimeout> | null = null;
   let cachedDevHelperPath: string | null = null;
-  let cachedMlxSupport: boolean | null = null;
+  let cachedMlxSupport: boolean | null =
+    deps.platform !== 'darwin' || (deps.arch ?? process.arch) !== 'arm64' ? false : null;
   let lastProgressNotifiedBucket = -1;
   let lastProgressNotifiedState: PcAppSpeechModelStatus['state'] | null = null;
+  let lastProgressNotifiedDownloading: PcAppSpeechVariant | null = null;
+  let lastProgressNotifiedMlx: boolean | null = cachedMlxSupport;
 
   const modelStore = new PcAppSpeechModelStore(deps.userDataDir);
-  let selectedModel: PcAppSpeechModelChoice = modelStore.load();
+  const loadedModel = modelStore.load();
+  let selectedModel: PcAppSpeechModelChoice = loadedModel;
+  let pendingStartupModel: Exclude<PcAppSpeechModelChoice, 'system'> | null =
+    loadedModel !== 'system' ? loadedModel : null;
   const inputDeviceStorePath = join(deps.userDataDir, 'speech-input-device.json');
   const loadSelectedInputDevice = (): string => {
     try {
@@ -203,11 +209,16 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   };
   let selectedInputDevice: string = loadSelectedInputDevice();
   let cachedInputDevices: PcAppInputDevice[] = [];
-  let modelDownloadState: PcAppSpeechModelStatus['state'] = 'idle';
-  let modelDownloadProgress = 0;
-  let modelDownloadedBytes = 0;
-  let modelTotalBytes = 0;
-  let modelDownloadError: string | undefined;
+  type VariantDownloadMeta = {
+    state: 'idle' | 'downloading' | 'ready' | 'failed';
+    progress: number;
+    downloadedBytes: number;
+    totalBytes: number;
+    error?: string;
+  };
+  let downloadingVariant: PcAppSpeechVariant | null = null;
+  let targetModelAfterDownload: Exclude<PcAppSpeechModelChoice, 'system'> | null = null;
+  let lastStatusVariant: PcAppSpeechVariant | null = null;
 
   const voiceLogPath = join(deps.userDataDir, 'voice.log');
   const VOICE_LOG_MAX_BYTES = 64 * 1024;
@@ -252,61 +263,185 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     return candidates.find((p) => existsSync(p)) ?? null;
   };
 
-  const computeStatusSync = (): PcAppSpeechModelStatus => {
-    const variant = choiceToSpeechVariant(selectedModel);
-    const mlxSupported = cachedMlxSupport ?? false;
-    if (!variant) {
+  const variantManifestTotal = (variant: PcAppSpeechVariant): number =>
+    downloader.getManifest(variant).files.reduce((sum, f) => sum + f.expectedSize, 0);
+
+  const buildInitialVariantMeta = (): Record<PcAppSpeechVariant, VariantDownloadMeta> => ({
+    '0.6b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 0 },
+    '1.7b': { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 0 },
+  });
+  const variantMeta: Record<PcAppSpeechVariant, VariantDownloadMeta> = buildInitialVariantMeta();
+
+  const variantToChoice = (variant: PcAppSpeechVariant): Exclude<PcAppSpeechModelChoice, 'system'> =>
+    variant === '0.6b' ? 'qwen3-0.6b' : 'qwen3-1.7b';
+
+  const getVariantStatusSync = (variant: PcAppSpeechVariant) => {
+    const totalBytes = variantMeta[variant].totalBytes || variantManifestTotal(variant);
+    const modelDir = downloader.getModelDirectory(variant);
+    if (cachedMlxSupport === false) {
       return {
-        selectedModel: 'system',
-        activeBackend: 'system',
-        state: 'idle',
+        state: 'unsupported' as const,
         progress: 0,
         downloadedBytes: 0,
-        totalBytes: 0,
-        mlxSupported,
-      };
-    }
-    const manifest = downloader.getManifest(variant);
-    const totalBytes = manifest.files.reduce((sum, f) => sum + f.expectedSize, 0);
-    const modelDir = downloader.getModelDirectory(variant);
-    const ready = downloader.isModelReadySync(variant);
-    if (ready) {
-      return {
-        selectedModel,
-        activeBackend: mlxSupported ? selectedModel : 'system',
-        state: mlxSupported ? 'ready' : 'unsupported',
-        progress: 1,
-        downloadedBytes: totalBytes,
         totalBytes,
-        mlxSupported,
         modelDir,
       };
     }
-    const effectiveState: PcAppSpeechModelStatus['state'] =
-      cachedMlxSupport === false
-        ? 'unsupported'
-        : modelDownloadState;
+    const meta = variantMeta[variant];
+    if (downloadingVariant === variant || meta.state === 'downloading') {
+      return {
+        state: 'downloading' as const,
+        progress: meta.progress,
+        downloadedBytes: meta.downloadedBytes,
+        totalBytes,
+        modelDir,
+      };
+    }
+    if (downloader.isModelReadySync(variant)) {
+      return {
+        state: 'ready' as const,
+        progress: 1,
+        downloadedBytes: totalBytes,
+        totalBytes,
+        modelDir,
+      };
+    }
+    if (meta.state === 'failed') {
+      return {
+        state: 'failed' as const,
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes,
+        ...(meta.error ? { error: meta.error } : {}),
+        modelDir,
+      };
+    }
     return {
-      selectedModel,
-      activeBackend: 'system',
-      state: effectiveState,
-      progress: modelDownloadProgress,
-      downloadedBytes: modelDownloadedBytes,
-      totalBytes: modelTotalBytes || totalBytes,
-      mlxSupported,
-      ...(modelDownloadError ? { error: modelDownloadError } : {}),
+      state: 'idle' as const,
+      progress: 0,
+      downloadedBytes: 0,
+      totalBytes,
       modelDir,
+    };
+  };
+
+  const getEffectiveSelectedModel = (): PcAppSpeechModelChoice => {
+    if (cachedMlxSupport === false) return 'system';
+    const variant = choiceToSpeechVariant(selectedModel);
+    if (!variant) return 'system';
+    return downloader.isModelReadySync(variant) ? selectedModel : 'system';
+  };
+
+  const computeStatusSync = (): PcAppSpeechModelStatus => {
+    const mlxSupported = cachedMlxSupport ?? false;
+    const status06 = getVariantStatusSync('0.6b');
+    const status17 = getVariantStatusSync('1.7b');
+    const models = {
+      'qwen3-0.6b': status06,
+      'qwen3-1.7b': status17,
+    };
+    const downloadingModel = downloadingVariant ? variantToChoice(downloadingVariant) : null;
+    const effectiveSelected = getEffectiveSelectedModel();
+    const activeBackend: PcAppSpeechModelChoice = mlxSupported ? effectiveSelected : 'system';
+
+    if (downloadingVariant) {
+      const dlStatus = downloadingVariant === '0.6b' ? status06 : status17;
+      return {
+        selectedModel: effectiveSelected,
+        activeBackend,
+        state: 'downloading',
+        progress: dlStatus.progress,
+        downloadedBytes: dlStatus.downloadedBytes,
+        totalBytes: dlStatus.totalBytes,
+        mlxSupported,
+        modelDir: dlStatus.modelDir,
+        downloadingModel,
+        models,
+      };
+    }
+
+    if (cachedMlxSupport === false && (selectedModel !== 'system' || lastStatusVariant !== null)) {
+      const refVariant = choiceToSpeechVariant(selectedModel) ?? lastStatusVariant ?? '0.6b';
+      const refStatus = refVariant === '0.6b' ? status06 : status17;
+      return {
+        selectedModel: 'system',
+        activeBackend: 'system',
+        state: 'unsupported',
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: refStatus.totalBytes,
+        mlxSupported: false,
+        modelDir: refStatus.modelDir,
+        downloadingModel: null,
+        models,
+      };
+    }
+
+    if (lastStatusVariant) {
+      const lastStatus = lastStatusVariant === '0.6b' ? status06 : status17;
+      if (lastStatus.state === 'failed') {
+        return {
+          selectedModel: effectiveSelected,
+          activeBackend,
+          state: 'failed',
+          progress: 0,
+          downloadedBytes: 0,
+          totalBytes: lastStatus.totalBytes,
+          mlxSupported,
+          ...(lastStatus.error ? { error: lastStatus.error } : {}),
+          modelDir: lastStatus.modelDir,
+          downloadingModel: null,
+          models,
+        };
+      }
+    }
+
+    const activeVariant = choiceToSpeechVariant(effectiveSelected);
+    if (activeVariant) {
+      const activeStatus = activeVariant === '0.6b' ? status06 : status17;
+      return {
+        selectedModel: effectiveSelected,
+        activeBackend,
+        state: mlxSupported ? activeStatus.state : 'unsupported',
+        progress: mlxSupported ? activeStatus.progress : 0,
+        downloadedBytes: mlxSupported ? activeStatus.downloadedBytes : 0,
+        totalBytes: activeStatus.totalBytes,
+        mlxSupported,
+        modelDir: activeStatus.modelDir,
+        downloadingModel: null,
+        models,
+      };
+    }
+
+    return {
+      selectedModel: 'system',
+      activeBackend: 'system',
+      state: 'idle',
+      progress: 0,
+      downloadedBytes: 0,
+      totalBytes: 0,
+      mlxSupported,
+      downloadingModel: null,
+      models,
     };
   };
 
   const notifyStatusChanged = (force = false) => {
     const status = computeStatusSync();
     const bucket = status.state === 'downloading' ? Math.floor(status.progress * 10) : -1;
-    if (!force && status.state === lastProgressNotifiedState && bucket === lastProgressNotifiedBucket) {
+    if (
+      !force
+      && status.state === lastProgressNotifiedState
+      && bucket === lastProgressNotifiedBucket
+      && downloadingVariant === lastProgressNotifiedDownloading
+      && status.mlxSupported === lastProgressNotifiedMlx
+    ) {
       return;
     }
     lastProgressNotifiedState = status.state;
     lastProgressNotifiedBucket = bucket;
+    lastProgressNotifiedDownloading = downloadingVariant;
+    lastProgressNotifiedMlx = status.mlxSupported;
     deps.onSpeechModelStatusChanged?.(status);
   };
 
@@ -319,15 +454,29 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     timeZone: deps.timeZone,
     fetchFn: deps.fetchModel,
     onProgress: (ev) => {
-      if (choiceToSpeechVariant(selectedModel) !== ev.variant) return;
-      modelDownloadState = ev.state;
-      modelDownloadProgress = ev.progress;
-      modelDownloadedBytes = ev.downloadedBytes;
-      modelTotalBytes = ev.totalBytes;
-      modelDownloadError = ev.error;
+      const manifestTotal = variantManifestTotal(ev.variant);
+      if (ev.state === 'downloading') {
+        downloadingVariant = ev.variant;
+      } else if (downloadingVariant === ev.variant) {
+        downloadingVariant = null;
+      }
+      variantMeta[ev.variant] = {
+        state: ev.state,
+        progress: ev.progress,
+        downloadedBytes: ev.downloadedBytes,
+        totalBytes: ev.totalBytes || manifestTotal,
+        ...(ev.error ? { error: ev.error } : {}),
+      };
       notifyStatusChanged(ev.state !== 'downloading');
     },
   });
+
+  if (selectedModel !== 'system') {
+    const initVariant = choiceToSpeechVariant(selectedModel);
+    if (initVariant && !downloader.isModelReadySync(initVariant)) {
+      selectedModel = 'system';
+    }
+  }
 
   const checkMlxSupported = async (): Promise<boolean> => {
     if (deps.platform !== 'darwin' || (deps.arch ?? process.arch) !== 'arm64') {
@@ -364,28 +513,75 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     return cachedMlxSupport;
   };
 
-  const triggerDownloadIfSelected = async (): Promise<void> => {
-    const variant = choiceToSpeechVariant(selectedModel);
+  const startBackgroundDownload = (choice: Exclude<PcAppSpeechModelChoice, 'system'>): void => {
+    const variant = choiceToSpeechVariant(choice);
     if (!variant) return;
+    const totalBytes = variantManifestTotal(variant);
+    downloadingVariant = variant;
+    targetModelAfterDownload = choice;
+    lastStatusVariant = variant;
+    variantMeta[variant] = {
+      state: 'downloading',
+      progress: 0,
+      downloadedBytes: 0,
+      totalBytes,
+    };
+    notifyStatusChanged(true);
+    void downloader.ensureDownloaded(variant).then((ok) => {
+      if (downloadingVariant === variant) {
+        downloadingVariant = null;
+      }
+      if (!ok) {
+        if (targetModelAfterDownload === choice) {
+          targetModelAfterDownload = null;
+        }
+        notifyStatusChanged(true);
+        return;
+      }
+      variantMeta[variant] = {
+        state: 'ready',
+        progress: 1,
+        downloadedBytes: totalBytes,
+        totalBytes,
+      };
+      if (targetModelAfterDownload === choice) {
+        targetModelAfterDownload = null;
+        selectedModel = choice;
+        modelStore.save(choice);
+      }
+      notifyStatusChanged(true);
+    });
+  };
+
+  const triggerDownloadIfSelected = async (): Promise<void> => {
+    const candidate = targetModelAfterDownload ?? pendingStartupModel ?? (selectedModel !== 'system' ? selectedModel : null);
+    pendingStartupModel = null;
+    if (!candidate) return;
+    const variant = choiceToSpeechVariant(candidate);
+    if (!variant) return;
+    lastStatusVariant = variant;
     const supported = await checkMlxSupported();
     if (!supported) {
-      modelDownloadState = 'unsupported';
+      selectedModel = 'system';
       notifyStatusChanged(true);
       return;
     }
     if (downloader.isModelReadySync(variant)) {
       const valid = await downloader.verifyModelFilesOnDisk(variant);
       if (valid) {
-        modelDownloadState = 'ready';
-        modelDownloadProgress = 1;
+        const totalBytes = variantManifestTotal(variant);
+        variantMeta[variant] = {
+          state: 'ready',
+          progress: 1,
+          downloadedBytes: totalBytes,
+          totalBytes,
+        };
+        selectedModel = candidate;
         notifyStatusChanged(true);
         return;
       }
     }
-    const manifest = downloader.getManifest(variant);
-    modelTotalBytes = manifest.files.reduce((sum, f) => sum + f.expectedSize, 0);
-    modelDownloadError = undefined;
-    void downloader.ensureDownloaded(variant);
+    startBackgroundDownload(candidate);
   };
 
   const isTrustedSender = (event: PcAppIpcInvokeEventLike): boolean => {
@@ -705,11 +901,13 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     return true;
   };
 
-  const getSpeechModel = (): PcAppSpeechModelChoice => selectedModel;
+  const getSpeechModel = (): PcAppSpeechModelChoice => getEffectiveSelectedModel();
 
   const getSpeechModelStatus = async (): Promise<PcAppSpeechModelStatus> => {
-    if (choiceToSpeechVariant(selectedModel)) {
-      await checkMlxSupported();
+    const prevMlx = cachedMlxSupport;
+    await checkMlxSupported();
+    if (prevMlx !== cachedMlxSupport) {
+      notifyStatusChanged(true);
     }
     return computeStatusSync();
   };
@@ -718,23 +916,66 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     if (!isValidSpeechModelChoice(rawModel)) {
       throw new Error(`Invalid speech model: ${String(rawModel)}`);
     }
-    selectedModel = rawModel;
-    modelStore.save(rawModel);
-    modelDownloadError = undefined;
-    modelDownloadProgress = 0;
-    modelDownloadedBytes = 0;
-    modelTotalBytes = 0;
 
     if (rawModel === 'system') {
       downloader.cancelActive();
-      modelDownloadState = 'idle';
+      if (downloadingVariant) {
+        const prevDl = downloadingVariant;
+        downloadingVariant = null;
+        if (variantMeta[prevDl].state === 'downloading') {
+          variantMeta[prevDl] = { state: 'idle', progress: 0, downloadedBytes: 0, totalBytes: 0 };
+        }
+      }
+      targetModelAfterDownload = null;
+      pendingStartupModel = null;
+      lastStatusVariant = null;
+      selectedModel = 'system';
+      modelStore.save('system');
       notifyStatusChanged(true);
       return computeStatusSync();
     }
 
-    modelDownloadState = 'idle';
-    await triggerDownloadIfSelected();
-    notifyStatusChanged(true);
+    const variant = choiceToSpeechVariant(rawModel)!;
+    pendingStartupModel = null;
+    lastStatusVariant = variant;
+    const supported = await checkMlxSupported();
+    if (!supported) {
+      downloader.cancelActive();
+      downloadingVariant = null;
+      targetModelAfterDownload = null;
+      selectedModel = 'system';
+      notifyStatusChanged(true);
+      return computeStatusSync();
+    }
+
+    if (downloader.isModelReadySync(variant)) {
+      const valid = await downloader.verifyModelFilesOnDisk(variant);
+      if (valid) {
+        downloader.cancelActive();
+        downloadingVariant = null;
+        targetModelAfterDownload = null;
+        const totalBytes = variantManifestTotal(variant);
+        variantMeta[variant] = {
+          state: 'ready',
+          progress: 1,
+          downloadedBytes: totalBytes,
+          totalBytes,
+        };
+        selectedModel = rawModel;
+        modelStore.save(rawModel);
+        notifyStatusChanged(true);
+        return computeStatusSync();
+      }
+    }
+
+    // Not downloaded yet: keep selectedModel on current active ready model (e.g. 'system')
+    // and start background download; promote once verified on disk.
+    if (downloadingVariant === variant) {
+      targetModelAfterDownload = rawModel;
+      notifyStatusChanged(true);
+      return computeStatusSync();
+    }
+    startBackgroundDownload(rawModel);
     return computeStatusSync();
   };
 

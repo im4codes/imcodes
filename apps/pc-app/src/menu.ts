@@ -187,9 +187,73 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
   }
 
   const speechStatus = options.speechModelStatus;
-  const selectedSpeechModel = speechStatus?.selectedModel ?? 'system';
+  const activeSelectedModel: PcAppSpeechModelChoice = (() => {
+    if (!speechStatus || !speechStatus.mlxSupported) return 'system';
+    const sel = speechStatus.selectedModel;
+    if (sel === 'system') return 'system';
+    const variantState = speechStatus.models ? speechStatus.models[sel]?.state : speechStatus.state;
+    return variantState === 'ready' ? sel : 'system';
+  })();
+
+  const formatMlxModelItem = (
+    choice: Exclude<PcAppSpeechModelChoice, 'system'>,
+    baseLabel: string,
+  ): { label: string; enabled: boolean; checked: boolean } => {
+    if (!speechStatus) {
+      return { label: baseLabel, enabled: true, checked: false };
+    }
+    const vStatus = speechStatus.models?.[choice];
+    const effectiveState = !speechStatus.mlxSupported
+      ? 'unsupported'
+      : vStatus
+        ? vStatus.state
+        : speechStatus.selectedModel === choice
+          ? speechStatus.state
+          : 'idle';
+
+    switch (effectiveState) {
+      case 'unsupported':
+        return {
+          label: t('menu.voice.modelUnsupported', { label: baseLabel }),
+          enabled: false,
+          checked: false,
+        };
+      case 'downloading':
+        return {
+          label: t('menu.voice.modelDownloading', {
+            label: baseLabel,
+            progress: Math.round((vStatus?.progress ?? speechStatus.progress) * 100),
+          }),
+          enabled: false,
+          checked: false,
+        };
+      case 'ready':
+        return {
+          label: t('menu.voice.modelReady', { label: baseLabel }),
+          enabled: true,
+          checked: activeSelectedModel === choice,
+        };
+      case 'failed':
+        return {
+          label: t('menu.voice.modelFailed', { label: baseLabel }),
+          enabled: true,
+          checked: false,
+        };
+      case 'idle':
+      default:
+        return {
+          label: t('menu.voice.modelNotDownloaded', { label: baseLabel }),
+          enabled: true,
+          checked: false,
+        };
+    }
+  };
+
+  const qwen06bItem = formatMlxModelItem('qwen3-0.6b', t('menu.voice.qwen06b'));
+  const qwen17bItem = formatMlxModelItem('qwen3-1.7b', t('menu.voice.qwen17b'));
+
   const speechStatusLabel = (() => {
-    if (!speechStatus || speechStatus.selectedModel === 'system' || speechStatus.state === 'idle') {
+    if (!speechStatus) {
       return t('menu.voice.statusIdle');
     }
     switch (speechStatus.state) {
@@ -198,11 +262,16 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
           progress: Math.round(speechStatus.progress * 100),
         });
       case 'ready':
-        return t('menu.voice.statusReady');
+        return activeSelectedModel !== 'system'
+          ? t('menu.voice.statusReady')
+          : t('menu.voice.statusIdle');
       case 'failed':
         return t('menu.voice.statusFailed');
       case 'unsupported':
         return t('menu.voice.statusUnsupported');
+      case 'idle':
+      default:
+        return t('menu.voice.statusIdle');
     }
   })();
 
@@ -215,21 +284,23 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
             id: 'voice:model-system',
             label: t('menu.voice.system'),
             type: 'radio',
-            checked: selectedSpeechModel === 'system',
+            checked: activeSelectedModel === 'system',
             click: () => options.onSelectSpeechModel?.('system'),
           },
           {
             id: 'voice:model-qwen3-0.6b',
-            label: t('menu.voice.qwen06b'),
+            label: qwen06bItem.label,
             type: 'radio',
-            checked: selectedSpeechModel === 'qwen3-0.6b',
+            enabled: qwen06bItem.enabled,
+            checked: qwen06bItem.checked,
             click: () => options.onSelectSpeechModel?.('qwen3-0.6b'),
           },
           {
             id: 'voice:model-qwen3-1.7b',
-            label: t('menu.voice.qwen17b'),
+            label: qwen17bItem.label,
             type: 'radio',
-            checked: selectedSpeechModel === 'qwen3-1.7b',
+            enabled: qwen17bItem.enabled,
+            checked: qwen17bItem.checked,
             click: () => options.onSelectSpeechModel?.('qwen3-1.7b'),
           },
           { type: 'separator' },
