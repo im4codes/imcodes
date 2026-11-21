@@ -121,6 +121,53 @@ describe('resolveGlobalVoiceOverlayIconPath', () => {
       }),
     ).toBe(resIcns);
   });
+
+  it('ignores .asar archive paths and resolves disk resourcesPath/icon.icns instead', async () => {
+    const resourcesDir = makeTempDir('imcodes-gv-asar-');
+    const asarDir = join(resourcesDir, 'app.asar', 'build');
+    mkdirSync(asarDir, { recursive: true });
+    const asarIcon = join(asarDir, 'icon.png');
+    writeFileSync(asarIcon, 'asar-png');
+
+    expect(
+      resolveGlobalVoiceOverlayIconPath({
+        resourcesPath: resourcesDir,
+        moduleDir: join(resourcesDir, 'app.asar', 'dist', 'src'),
+      }),
+    ).toBeNull();
+
+    const diskIcns = join(resourcesDir, 'icon.icns');
+    writeFileSync(diskIcns, 'disk-icns');
+    expect(
+      resolveGlobalVoiceOverlayIconPath({
+        resourcesPath: resourcesDir,
+        moduleDir: join(resourcesDir, 'app.asar', 'dist', 'src'),
+      }),
+    ).toBe(diskIcns);
+
+    const overlay = createFakeHelper();
+    const spawnedArgs: string[][] = [];
+    const controller = createPcAppGlobalVoice({
+      platform: 'darwin',
+      userDataDir: makeTempDir('imcodes-gv-asar-ctrl-'),
+      resourcesPath: resourcesDir,
+      iconPath: asarIcon,
+      getLocale: () => 'en',
+      getMainWindow: () => null,
+      getSpeechHelperPath: () => '/usr/local/bin/imcodes-speech',
+      voice: {
+        startListening: vi.fn(async () => ({ ok: true })),
+        stopListening: vi.fn(async () => {}),
+      },
+      spawnHelper: (_bin, args) => {
+        spawnedArgs.push(args);
+        return overlay.proc;
+      },
+    });
+    await controller.toggleDictation();
+    expect(spawnedArgs).toContainEqual(['overlay', '--icon', diskIcns]);
+    await controller.dispose();
+  });
 });
 
 describe('createPcAppGlobalVoice', () => {
@@ -269,6 +316,7 @@ describe('createPcAppGlobalVoice', () => {
     const overlay = createFakeHelper();
     const spawnHelper = vi.fn((_bin: string, args: string[]) => (args[0] === 'hotkey' ? hotkey.proc : overlay.proc));
     const onError = vi.fn();
+    const onAccessibilityDenied = vi.fn();
 
     let mode: 'start-fail' | 'voice-error' | 'paste-denied' = 'start-fail';
     let capturedOnEvent: ((event: PcAppVoiceEvent) => void) | undefined;
@@ -295,6 +343,7 @@ describe('createPcAppGlobalVoice', () => {
       spawnHelper,
       runPasteHelper,
       onError,
+      onAccessibilityDenied,
     });
 
     await controller.toggleDictation();
@@ -308,8 +357,9 @@ describe('createPcAppGlobalVoice', () => {
     mode = 'paste-denied';
     await controller.toggleDictation();
     capturedOnEvent?.({ type: 'start' });
-    capturedOnEvent?.({ type: 'result', text: 'secret text', isFinal: true });
+    capturedOnEvent?.({ type: 'result', text: '  secret text  ', isFinal: true });
     await controller.toggleDictation();
+    expect(onAccessibilityDenied).toHaveBeenCalledWith('secret text');
     expect(onError).toHaveBeenCalledWith('accessibility_denied', 'Grant Accessibility permission');
 
     const overlayCmds = overlay.stdinLines.map((line) => JSON.parse(line) as { cmd: string });

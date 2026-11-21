@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
   Menu,
@@ -13,6 +14,7 @@ import {
   type MenuItemConstructorOptions,
 } from 'electron';
 import { createPcAppGlobalVoice, type PcAppGlobalVoiceController } from './global-voice.js';
+import { tPcApp } from './i18n.js';
 import { createPcAppShell, type PcAppShellInstance } from './shell.js';
 import { createPcAppVoiceHud } from './voice-hud.js';
 
@@ -56,7 +58,11 @@ export async function startPcApp(): Promise<void> {
     onLocaleChanged: (locale) => voiceHud.setLocale(locale),
     getGlobalVoiceEnabled: () => globalVoice?.isEnabled() ?? true,
     onToggleGlobalVoice: (enabled) => {
-      void globalVoice?.setEnabled(enabled);
+      void globalVoice?.setEnabled(enabled).then((nextEnabled) => {
+        if (nextEnabled && process.platform === 'darwin' && !systemPreferences.isTrustedAccessibilityClient(false)) {
+          promptAccessibilityPermission(false);
+        }
+      });
     },
     voiceDeps: {
       resourcesPath: process.resourcesPath,
@@ -118,16 +124,53 @@ export async function startPcApp(): Promise<void> {
   shellInstance = pcShell;
   voiceHud.setLocale(pcShell.getLocale());
 
+  const ACCESSIBILITY_SETTINGS_URL =
+    'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility';
+  let lastAccessibilityPromptAt = 0;
+  function promptAccessibilityPermission(copiedToClipboard: boolean): void {
+    if (process.platform !== 'darwin') return;
+    const now = Date.now();
+    if (now - lastAccessibilityPromptAt < 30_000) return;
+    lastAccessibilityPromptAt = now;
+    try {
+      systemPreferences.isTrustedAccessibilityClient(true);
+    } catch {
+      // Ignore prompt errors if Accessibility API is unavailable.
+    }
+    if (Notification.isSupported()) {
+      const locale = pcShell.getLocale();
+      const notification = new Notification({
+        title: tPcApp(locale, 'globalVoice.accessibilityDenied.title'),
+        body: tPcApp(
+          locale,
+          copiedToClipboard
+            ? 'globalVoice.accessibilityDenied.bodyCopied'
+            : 'globalVoice.accessibilityDenied.body',
+        ),
+      });
+      notification.on('click', () => {
+        void shell.openExternal(ACCESSIBILITY_SETTINGS_URL);
+      });
+      notification.show();
+    }
+    void shell.openExternal(ACCESSIBILITY_SETTINGS_URL).catch(() => {});
+  }
+
   globalVoice = createPcAppGlobalVoice({
     platform: process.platform,
     userDataDir: app.getPath('userData'),
     resourcesPath: process.resourcesPath,
-    iconPath: runtimeIconPath ?? undefined,
     getLocale: () => pcShell.getLocale(),
     getMainWindow: () => pcShell.getMainWindow(),
     getSpeechHelperPath: () => pcShell.voice.getSpeechHelperPath(),
     voice: pcShell.voice,
     onStateChanged: () => pcShell.rebuildMenu(),
+    onAccessibilityDenied: (text) => {
+      if (text) {
+        clipboard.writeText(text);
+      }
+      promptAccessibilityPermission(Boolean(text));
+    },
   });
   pcShell.rebuildMenu();
   globalVoice.start();

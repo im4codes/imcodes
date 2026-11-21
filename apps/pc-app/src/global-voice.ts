@@ -36,6 +36,7 @@ export interface PcAppGlobalVoiceDeps {
   runPasteHelper?: (binPath: string, args: string[], stdinText: string) => Promise<string>;
   onStateChanged?: (enabled: boolean) => void;
   onError?: (code: string, message?: string) => void;
+  onAccessibilityDenied?: (text: string) => void;
   now?: () => number;
 }
 
@@ -89,6 +90,10 @@ export class PcAppGlobalVoiceStore {
   }
 }
 
+function isAsarArchivePath(filePath: string): boolean {
+  return filePath.includes('.asar/') || filePath.includes('.asar\\');
+}
+
 export function resolveGlobalVoiceOverlayIconPath(options?: {
   resourcesPath?: string;
   moduleDir?: string;
@@ -101,7 +106,7 @@ export function resolveGlobalVoiceOverlayIconPath(options?: {
   }
   candidates.push(resolve(moduleDir, '../../build/icon.png'));
   candidates.push(resolve(moduleDir, '../build/icon.png'));
-  return candidates.find((p) => existsSync(p)) ?? null;
+  return candidates.find((p) => !isAsarArchivePath(p) && existsSync(p)) ?? null;
 }
 
 function defaultRunPasteHelper(binPath: string, args: string[], stdinText: string): Promise<string> {
@@ -166,7 +171,12 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
     (deps.spawnHelper ?? ((p, a) => spawn(p, a, { stdio: ['pipe', 'pipe', 'pipe'] })))(binPath, args);
 
   const resolveIconPath = (): string | null => {
-    if (deps.iconPath !== undefined) return deps.iconPath;
+    if (deps.iconPath !== undefined) {
+      if (deps.iconPath === null) return null;
+      return isAsarArchivePath(deps.iconPath)
+        ? resolveGlobalVoiceOverlayIconPath({ resourcesPath: deps.resourcesPath })
+        : deps.iconPath;
+    }
     return resolveGlobalVoiceOverlayIconPath({ resourcesPath: deps.resourcesPath });
   };
 
@@ -279,6 +289,9 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
         try {
           const parsed = JSON.parse(line) as { type?: string; code?: string; message?: string };
           if (parsed.type === 'error' && parsed.code) {
+            if (parsed.code === 'accessibility_denied') {
+              deps.onAccessibilityDenied?.(trimmed);
+            }
             deps.onError?.(parsed.code, parsed.message);
           }
         } catch {
