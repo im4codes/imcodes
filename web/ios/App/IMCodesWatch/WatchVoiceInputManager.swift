@@ -449,6 +449,10 @@ final class WatchVoiceInputManager: NSObject, ObservableObject {
 
     func stopRecording() {
         guard isRecording else { return }
+        if state == .starting {
+            cancelIfRecording()
+            return
+        }
         guard let streamId = captureStreamId else {
             cancelIfRecording()
             return

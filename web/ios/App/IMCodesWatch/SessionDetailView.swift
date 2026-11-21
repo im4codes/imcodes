@@ -12,6 +12,9 @@ struct SessionDetailView: View {
     @State private var statusMessage: String?
     @State private var voiceBaseDraft = ""
     @State private var voiceSessionActive = false
+    @State private var isHoldingVoice = false
+    @State private var isCancelDrag = false
+    @State private var voicePulse = false
     @State private var initialScrollDone = false
     @State private var prevItemCount = 0
     @State private var isAtBottom = true
@@ -19,6 +22,7 @@ struct SessionDetailView: View {
     @State private var scrollProxy: ScrollViewProxy?
 
     private let quickReplies = ["Yes", "Continue", "Fix"]
+    private let voiceCancelDragDistance: CGFloat = 45
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -129,14 +133,26 @@ struct SessionDetailView: View {
         }
         .onChange(of: route) { _ in
             ttsPlayer.stop()
+            cancelHoldVoiceInput(restoreDraft: isHoldingVoice)
         }
         .onDisappear {
             ttsPlayer.stop()
-            if voiceManager.isRecording || voiceManager.state == .transcribing {
-                voiceSessionActive = false
-            }
-            voiceManager.cancelIfRecording()
+            cancelHoldVoiceInput(restoreDraft: isHoldingVoice)
             sessionManager.clearActiveRoute()
+        }
+        .onChange(of: voiceManager.state) { newState in
+            if newState == .idle && isHoldingVoice {
+                isHoldingVoice = false
+                isCancelDrag = false
+                voicePulse = false
+                voiceSessionActive = false
+            } else if voiceManager.isRecording && isHoldingVoice {
+                withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                    voicePulse = true
+                }
+            } else {
+                voicePulse = false
+            }
         }
         .onChange(of: voiceManager.transcriptUpdate) { update in
             guard voiceSessionActive, let update else { return }
@@ -288,39 +304,17 @@ struct SessionDetailView: View {
                 .font(.caption2)
                 .id("replyField")
 
+            holdToTalkControl
+
             HStack(spacing: 8) {
                 Button(isSending ? "…" : "Send") {
-                    if voiceManager.isRecording || voiceManager.state == .transcribing {
-                        voiceSessionActive = false
-                        voiceManager.cancelIfRecording()
+                    if voiceManager.isRecording || voiceManager.state == .transcribing || isHoldingVoice {
+                        cancelHoldVoiceInput(restoreDraft: false)
                     }
                     Task { await sendReply(text: draft) }
                 }
                 .font(.caption2)
                 .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSending)
-
-                Button {
-                    if voiceManager.isRecording {
-                        voiceManager.stopRecording()
-                    } else if voiceManager.state == .idle {
-                        voiceBaseDraft = draft
-                        voiceSessionActive = true
-                        voiceManager.startRecording()
-                    }
-                } label: {
-                    if voiceManager.state == .starting || voiceManager.state == .transcribing {
-                        ProgressView()
-                            .progressViewStyle(.circular)
-                            .scaleEffect(0.6)
-                            .frame(width: 16, height: 16)
-                    } else {
-                        Image(systemName: voiceManager.isRecording ? "stop.circle.fill" : "mic.fill")
-                            .font(.caption2)
-                            .foregroundStyle(voiceManager.isRecording ? .red : .accentColor)
-                    }
-                }
-                .disabled(isSending || voiceManager.state == .starting || voiceManager.state == .transcribing)
-                .accessibilityLabel(voiceManager.isRecording ? "Stop dictation" : "Voice input")
 
                 Spacer()
 
@@ -342,6 +336,132 @@ struct SessionDetailView: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.red)
             }
+        }
+    }
+
+    private var holdToTalkControl: some View {
+        let isTranscribing = !isHoldingVoice && voiceManager.state == .transcribing
+        let isActiveHold = isHoldingVoice && voiceManager.isRecording
+        let isGestureDisabled = isSending || isTranscribing
+
+        let iconName: String = {
+            if isActiveHold && isCancelDrag { return "xmark.circle.fill" }
+            if isActiveHold { return "waveform" }
+            return "mic.fill"
+        }()
+        let labelText: String = {
+            if isTranscribing { return "Transcribing…" }
+            if isActiveHold && isCancelDrag { return "Cancel" }
+            if isActiveHold { return "Release" }
+            return "Hold to Talk"
+        }()
+        let fillColor: Color = {
+            if isActiveHold && isCancelDrag { return Color.red.opacity(0.85) }
+            if isActiveHold { return Color.orange.opacity(0.85) }
+            if isTranscribing { return Color.gray.opacity(0.22) }
+            return Color.accentColor.opacity(0.22)
+        }()
+        let foregroundColor: Color = {
+            if isActiveHold { return .white }
+            if isGestureDisabled { return .secondary }
+            return .accentColor
+        }()
+
+        return HStack(spacing: 5) {
+            if isTranscribing {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .scaleEffect(0.55)
+                    .frame(width: 14, height: 14)
+            } else {
+                Image(systemName: iconName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .opacity(isActiveHold && !isCancelDrag ? (voicePulse ? 0.55 : 1.0) : 1.0)
+            }
+            Text(labelText)
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .foregroundStyle(foregroundColor)
+        .frame(maxWidth: .infinity, minHeight: 30)
+        .padding(.horizontal, 8)
+        .background(Capsule().fill(fillColor))
+        .contentShape(Capsule())
+        .opacity(isSending ? 0.5 : 1.0)
+        .disabled(isGestureDisabled)
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    handleVoiceDragChanged(value)
+                }
+                .onEnded { value in
+                    handleVoiceDragEnded(value)
+                }
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(labelText)
+        .accessibilityHint("Press and hold to record voice input. Slide away to cancel.")
+    }
+
+    private func handleVoiceDragChanged(_ value: DragGesture.Value) {
+        if !isHoldingVoice {
+            guard !isSending, voiceManager.state == .idle else { return }
+            voiceBaseDraft = draft
+            voiceSessionActive = true
+            voiceManager.startRecording()
+            guard voiceManager.isRecording else {
+                voiceSessionActive = false
+                return
+            }
+            isHoldingVoice = true
+            isCancelDrag = false
+            if voiceManager.state == .streaming || voiceManager.state == .recordingFile {
+                withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                    voicePulse = true
+                }
+            }
+        }
+
+        let distance = hypot(value.translation.width, value.translation.height)
+        let shouldCancel = distance > voiceCancelDragDistance
+        if shouldCancel != isCancelDrag {
+            isCancelDrag = shouldCancel
+            WKInterfaceDevice.current().play(shouldCancel ? .directionDown : .click)
+        }
+    }
+
+    private func handleVoiceDragEnded(_ value: DragGesture.Value) {
+        guard isHoldingVoice else { return }
+        let distance = hypot(value.translation.width, value.translation.height)
+        let shouldCancel = isCancelDrag || distance > voiceCancelDragDistance
+        isHoldingVoice = false
+        isCancelDrag = false
+        voicePulse = false
+
+        if shouldCancel {
+            voiceSessionActive = false
+            voiceManager.cancelIfRecording()
+            draft = voiceBaseDraft
+            WKInterfaceDevice.current().play(.failure)
+        } else {
+            voiceManager.stopRecording()
+            if voiceManager.state == .idle {
+                voiceSessionActive = false
+            }
+        }
+    }
+
+    private func cancelHoldVoiceInput(restoreDraft: Bool) {
+        isHoldingVoice = false
+        isCancelDrag = false
+        voicePulse = false
+        if voiceManager.isRecording || voiceManager.state == .transcribing {
+            voiceSessionActive = false
+        }
+        voiceManager.cancelIfRecording()
+        if restoreDraft {
+            draft = voiceBaseDraft
         }
     }
 
