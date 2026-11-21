@@ -171,6 +171,95 @@ export function buildMacosSpeechHelper({
   }
 }
 
+function findReleaseMetallib(rootDir) {
+  if (!existsSync(rootDir)) return null;
+  const queue = [rootDir];
+  while (queue.length > 0) {
+    const dir = queue.shift();
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(fullPath);
+      } else if (entry.name === 'mlx.metallib' || entry.name === 'default.metallib') {
+        return fullPath;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Compile the macOS Apple Silicon Qwen3-ASR MLX helper (`imcodes-speech-mlx`) via SwiftPM release build
+ * and locate any generated `mlx.metallib` / `default.metallib`.
+ * Returns `null` on Intel-only (`x64`) builds or when the host lacks MLX build support (system fallback).
+ */
+export function buildMacosSpeechMlxHelper({
+  pkgDir = DEFAULT_SPEECH_MLX_PKG_DIR,
+  outDir = DEFAULT_SPEECH_BIN_DIR,
+  arch = 'arm64',
+  execFn = execFileSync,
+  warnFn = (msg) => process.stderr.write(`${msg}\n`),
+} = {}) {
+  if (arch === 'x64') {
+    return null;
+  }
+  const manifestPath = join(resolve(pkgDir), 'Package.swift');
+  if (!existsSync(manifestPath)) {
+    warnFn(`[pc-app build] MLX speech package missing at ${pkgDir}; falling back to system speech`);
+    return null;
+  }
+  const absPkgDir = resolve(pkgDir);
+  const absOutDir = resolve(outDir);
+  try {
+    execFn('swift', ['build', '--package-path', absPkgDir, '--arch', 'arm64', '-c', 'release'], {
+      cwd: absPkgDir,
+      stdio: 'inherit',
+    });
+  } catch (err) {
+    warnFn(
+      `[pc-app build] swift build for Qwen3-ASR MLX failed (${err instanceof Error ? err.message : String(err)}); falling back to system speech`,
+    );
+    return null;
+  }
+
+  const binCandidates = [
+    join(absPkgDir, '.build', 'release', 'imcodes-speech-mlx'),
+    join(absPkgDir, '.build', 'arm64-apple-macosx', 'release', 'imcodes-speech-mlx'),
+  ];
+  const builtBin = binCandidates.find((p) => existsSync(p));
+  if (!builtBin) {
+    warnFn(`[pc-app build] imcodes-speech-mlx binary not produced under ${absPkgDir}/.build; falling back to system speech`);
+    return null;
+  }
+
+  mkdirSync(absOutDir, { recursive: true });
+  const destBin = join(absOutDir, 'imcodes-speech-mlx');
+  cpSync(builtBin, destBin);
+  chmodSync(destBin, 0o755);
+
+  const builtMetallib =
+    findReleaseMetallib(join(absPkgDir, '.build', 'arm64-apple-macosx', 'release'))
+    ?? findReleaseMetallib(join(absPkgDir, '.build', 'release'));
+  let destMetallib = null;
+  if (builtMetallib) {
+    destMetallib = join(absOutDir, 'mlx.metallib');
+    cpSync(builtMetallib, destMetallib);
+  } else {
+    warnFn('[pc-app build] mlx.metallib/default.metallib not generated (MetalToolchain missing?); runtime will fall back to system speech');
+  }
+
+  return {
+    binPath: destBin,
+    metallibPath: destMetallib,
+  };
+}
+
 /**
  * Stage `extraResources` for macOS or Windows prior to `electron-builder` packing/signing.
  * - macOS: `imcodes`, `imcodes-speech` (when provided), optional `imcodes-speech-mlx` (+ `mlx.metallib`), `bin/tmux`, `terminfo/`, `licenses/`
@@ -287,12 +376,23 @@ export function verifyPackagedMacosApp(
   }
   accessSync(bundledSpeech, fsConstants.X_OK);
 
+  const bundledMlxSpeech = join(resourcesDir, 'imcodes-speech-mlx');
+  const hasMlxSpeech = existsSync(bundledMlxSpeech);
+  if (hasMlxSpeech) {
+    accessSync(bundledMlxSpeech, fsConstants.X_OK);
+  }
+  const bundledMlxMetallib = join(resourcesDir, 'mlx.metallib');
+  const hasMlxMetallib = existsSync(bundledMlxMetallib);
+
   const tmuxReport = verifyBundledTmux(resourcesDir, { execFn });
 
   // Gate 3: verify nested Mach-O binaries explicitly, then deep-verify outer .app seal.
   execFn('codesign', ['--verify', '--strict', '--verbose=2', tmuxReport.tmuxBin], { stdio: 'pipe' });
   execFn('codesign', ['--verify', '--strict', '--verbose=2', bundledImcodes], { stdio: 'pipe' });
   execFn('codesign', ['--verify', '--strict', '--verbose=2', bundledSpeech], { stdio: 'pipe' });
+  if (hasMlxSpeech) {
+    execFn('codesign', ['--verify', '--strict', '--verbose=2', bundledMlxSpeech], { stdio: 'pipe' });
+  }
   execFn('codesign', ['--verify', '--deep', '--strict', '--verbose=2', absApp], { stdio: 'pipe' });
 
   if (requireNotarized) {
@@ -323,6 +423,8 @@ export function verifyPackagedMacosApp(
     appPath: absApp,
     resourcesDir,
     imcodesPath: bundledImcodes,
+    ...(hasMlxSpeech ? { mlxSpeechPath: bundledMlxSpeech } : {}),
+    mlxMetallibPresent: hasMlxMetallib,
     daemonVersion,
     tmuxReport,
     codesignVerified: true,
@@ -453,43 +555,58 @@ async function ensureBuiltBundledTmux(opts) {
   return targetDir;
 }
 
-export async function runBuildPcApp(opts) {
+export async function runBuildPcApp(opts, deps = {}) {
+  const hostPlatform = deps.platform ?? process.platform;
+  const ensureNodeExeFn = deps.ensureBuiltNodeExeFn ?? ensureBuiltNodeExe;
+  const ensureTmuxFn = deps.ensureBuiltBundledTmuxFn ?? ensureBuiltBundledTmux;
+  const buildSpeechFn = deps.buildMacosSpeechHelperFn ?? buildMacosSpeechHelper;
+  const buildSpeechMlxFn = deps.buildMacosSpeechMlxHelperFn ?? buildMacosSpeechMlxHelper;
+  const stageResourcesFn = deps.stagePcAppResourcesFn ?? stagePcAppResources;
+  const verifyMacAppFn = deps.verifyPackagedMacosAppFn ?? verifyPackagedMacosApp;
+  const verifyWinDirFn = deps.verifyPackagedWindowsDirFn ?? verifyPackagedWindowsDir;
+  const execTscFn = deps.execFn ?? execFileSync;
+
   if (opts.verifyOnly) {
     if (opts.platform === 'darwin') {
       const appPath = opts.appPath || resolveElectronBuilderMacAppPath(opts.outDir, opts.arch);
-      return verifyPackagedMacosApp(appPath, { requireNotarized: opts.requireNotarize });
+      return verifyMacAppFn(appPath, { requireNotarized: opts.requireNotarize });
     }
     const winDir = opts.winDir || join(opts.outDir, 'win-unpacked');
-    return verifyPackagedWindowsDir(winDir, {
+    return verifyWinDirFn(winDir, {
       installerExePath: opts.installerExe || undefined,
       expectedSignerSha256: process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256?.trim() ?? '',
     });
   }
 
-  if (process.platform !== opts.platform) {
-    throw new Error(`Building ${opts.platform} PC App must run on matching host OS (current: ${process.platform})`);
+  if (hostPlatform !== opts.platform) {
+    throw new Error(`Building ${opts.platform} PC App must run on matching host OS (current: ${hostPlatform})`);
   }
 
   if (!opts.skipBuild) {
-    const tscBin = join(PC_APP_DIR, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
-    execFileSync(tscBin, ['-p', join(PC_APP_DIR, 'tsconfig.json')], {
+    const tscBin = join(PC_APP_DIR, 'node_modules', '.bin', hostPlatform === 'win32' ? 'tsc.cmd' : 'tsc');
+    execTscFn(tscBin, ['-p', join(PC_APP_DIR, 'tsconfig.json')], {
       cwd: PC_APP_DIR,
       stdio: 'inherit',
-      ...(process.platform === 'win32' ? { shell: true } : {}),
+      ...(hostPlatform === 'win32' ? { shell: true } : {}),
     });
   }
 
-  const nodeExePath = ensureBuiltNodeExe(opts);
-  const tmuxDir = opts.platform === 'darwin' ? await ensureBuiltBundledTmux(opts) : '';
+  const nodeExePath = ensureNodeExeFn(opts);
+  const tmuxDir = opts.platform === 'darwin' ? await ensureTmuxFn(opts) : '';
   const speechBinPath = opts.platform === 'darwin'
-    ? buildMacosSpeechHelper({ arch: opts.arch })
+    ? buildSpeechFn({ arch: opts.arch })
     : undefined;
+  const mlxSpeech = opts.platform === 'darwin'
+    ? buildSpeechMlxFn({ arch: opts.arch })
+    : null;
 
-  const staged = stagePcAppResources({
+  const staged = stageResourcesFn({
     platform: opts.platform,
     nodeExePath,
     tmuxDir,
     speechBinPath,
+    mlxSpeechBinPath: mlxSpeech?.binPath,
+    mlxMetallibPath: mlxSpeech?.metallibPath ?? undefined,
     stageDir: opts.stageDir,
   });
 
@@ -512,22 +629,27 @@ export async function runBuildPcApp(opts) {
     env: childEnv,
   });
 
-  const require = createRequire(join(PC_APP_DIR, 'package.json'));
-  const electronBuilder = require('electron-builder');
-  const targets = opts.platform === 'darwin'
-    ? electronBuilder.Platform.MAC.createTarget(['dmg'], electronBuilder.archFromString(opts.arch))
-    : electronBuilder.Platform.WINDOWS.createTarget(['nsis'], electronBuilder.archFromString(opts.arch));
+  const electronBuilderBuildFn = deps.electronBuilderBuildFn ?? (async (buildOpts) => {
+    const require = createRequire(join(PC_APP_DIR, 'package.json'));
+    const electronBuilder = require('electron-builder');
+    const targets = opts.platform === 'darwin'
+      ? electronBuilder.Platform.MAC.createTarget(['dmg'], electronBuilder.archFromString(opts.arch))
+      : electronBuilder.Platform.WINDOWS.createTarget(['nsis'], electronBuilder.archFromString(opts.arch));
+    return electronBuilder.build({
+      targets,
+      ...buildOpts,
+    });
+  });
 
-  const artifactPaths = await electronBuilder.build({
-    targets,
+  const artifactPaths = await electronBuilderBuildFn({
     projectDir: PC_APP_DIR,
     config,
     publish: 'never',
   });
 
   if (opts.platform === 'darwin') {
-    const appPath = resolveElectronBuilderMacAppPath(opts.outDir, opts.arch);
-    const verification = verifyPackagedMacosApp(appPath, { requireNotarized: opts.requireNotarize });
+    const appPath = opts.appPath || resolveElectronBuilderMacAppPath(opts.outDir, opts.arch);
+    const verification = verifyMacAppFn(appPath, { requireNotarized: opts.requireNotarize });
     return {
       platform: 'darwin',
       arch: opts.arch,
@@ -539,7 +661,7 @@ export async function runBuildPcApp(opts) {
   const winUnpackedDir = join(opts.outDir, 'win-unpacked');
   const installerExePath = artifactPaths.find((p) => p.endsWith('.exe'))
     ?? readdirSync(opts.outDir).filter((f) => f.endsWith('.exe')).map((f) => join(opts.outDir, f))[0];
-  const verification = verifyPackagedWindowsDir(winUnpackedDir, {
+  const verification = verifyWinDirFn(winUnpackedDir, {
     installerExePath,
     expectedSignerSha256: childEnv.IMCODES_WINDOWS_SIGNING_CERT_SHA256?.trim() ?? '',
     env: childEnv,

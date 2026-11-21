@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -406,5 +406,94 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
 
     await ctx.voice.dispose();
     await ctx2.voice.dispose();
+  });
+
+  it('uses packaged resourcesPath imcodes-speech-mlx when mlx.metallib probe passes, and falls back activeBackend to system when metallib is missing', async () => {
+    const weights = Buffer.from('verified-06b-weights');
+    const sha = createHash('sha256').update(weights).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'aufklarer/test-0.6b',
+        revision: 'rev06',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'aufklarer/test-1.7b',
+        revision: 'rev17',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+    };
+
+    const packagedResDir = path.join(tempDir, 'IM.codes.app', 'Contents', 'Resources');
+    mkdirSync(packagedResDir, { recursive: true });
+    const packagedSpeechBin = path.join(packagedResDir, 'imcodes-speech');
+    const packagedMlxBin = path.join(packagedResDir, 'imcodes-speech-mlx');
+    writeFileSync(packagedSpeechBin, '#!/bin/sh\necho "{}"\n', { mode: 0o755 });
+    writeFileSync(packagedMlxBin, '#!/bin/sh\necho "{}"\n', { mode: 0o755 });
+
+    const createPackagedController = (metallibAvailable: boolean) => {
+      const spawned = createFakeChildProcess();
+      const spawnHelper = vi.fn(() => spawned as unknown as ChildProcess);
+      const runHelperAsync = vi.fn(async (bin: string, args: string[]) => {
+        if (bin === packagedMlxBin && args[0] === 'probe') {
+          return JSON.stringify({
+            arch: 'arm64',
+            metalSupported: true,
+            metallibAvailable,
+            mlxSupported: metallibAvailable,
+          });
+        }
+        return JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true });
+      });
+      const voice = createPcAppVoiceController({
+        platform: 'darwin',
+        arch: 'arm64',
+        userDataDir: tempDir,
+        resourcesPath: packagedResDir,
+        isMainWebContents: () => true,
+        getCurrentTrustedOrigin: () => 'https://app.im.codes',
+        getActiveOrigin: () => 'https://app.im.codes',
+        getTrustedOrigins: () => new Set(['https://app.im.codes']),
+        getSenderUrl: () => 'https://app.im.codes/session/1',
+        sendToRenderer: () => {},
+        getMediaAccessStatus: () => 'granted',
+        runHelperAsync,
+        spawnHelper,
+        manifests,
+        mirrorOrigins: ['https://hf-mirror.com'],
+        fetchModel: async () => new Response(new Uint8Array(weights), { status: 200 }),
+      });
+      return { voice, spawnHelper, runHelperAsync };
+    };
+
+    // Case 1: packaged app without mlx.metallib -> probe reports mlxSupported: false -> activeBackend stays 'system' & falls back to imcodes-speech
+    const missingMetallib = createPackagedController(false);
+    const statusMissing = await missingMetallib.voice.setSpeechModel('qwen3-0.6b');
+    expect(statusMissing.mlxSupported).toBe(false);
+    expect(statusMissing.state).toBe('unsupported');
+    expect(statusMissing.activeBackend).toBe('system');
+    expect(await missingMetallib.voice.startListening({ locale: 'en-US' })).toEqual({ ok: true });
+    expect(missingMetallib.spawnHelper).toHaveBeenLastCalledWith(packagedSpeechBin, ['listen', '--locale', 'en-US']);
+    await missingMetallib.voice.dispose();
+
+    // Case 2: packaged app with imcodes-speech-mlx + mlx.metallib -> downloads weights & routes to packaged imcodes-speech-mlx
+    writeFileSync(path.join(packagedResDir, 'mlx.metallib'), 'METALLIB');
+    const withMetallib = createPackagedController(true);
+    await withMetallib.voice.setSpeechModel('qwen3-0.6b');
+    await new Promise((res) => setTimeout(res, 25));
+    const statusReady = await withMetallib.voice.getSpeechModelStatus();
+    expect(statusReady.mlxSupported).toBe(true);
+    expect(statusReady.state).toBe('ready');
+    expect(statusReady.activeBackend).toBe('qwen3-0.6b');
+    expect(await withMetallib.voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    expect(withMetallib.spawnHelper).toHaveBeenLastCalledWith(
+      packagedMlxBin,
+      ['listen', '--model-dir', statusReady.modelDir, '--variant', '0.6b', '--locale', 'zh-CN'],
+    );
+    await withMetallib.voice.dispose();
   });
 });

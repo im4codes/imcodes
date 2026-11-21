@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -37,9 +38,12 @@ import {
 } from '../../apps/pc-app/electron-builder.config.mjs';
 // @ts-expect-error ESM script module
 import {
+  buildMacosSpeechMlxHelper,
   buildPcAppNodeExeEnv,
+  DEFAULT_SPEECH_MLX_PKG_DIR,
   parseBuildPcAppArgs,
   resolveElectronBuilderMacAppPath,
+  runBuildPcApp,
   stagePcAppResources,
   verifyPackagedMacosApp,
   verifyPackagedWindowsDir,
@@ -424,5 +428,125 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     expect(resolveElectronBuilderMacAppPath('/tmp/release', 'arm64')).toBe('/tmp/release/mac-arm64/IM.codes.app');
     expect(resolveElectronBuilderMacAppPath('/tmp/release', 'x64')).toBe('/tmp/release/mac/IM.codes.app');
     expect(resolveElectronBuilderMacAppPath('/tmp/release', 'universal')).toBe('/tmp/release/mac-universal/IM.codes.app');
+  });
+
+  it('buildMacosSpeechMlxHelper and runBuildPcApp stage imcodes-speech-mlx + mlx.metallib into macOS app Resources and keep fallback when metallib is absent', async () => {
+    const work = makeTempDir();
+    const fakePkgDir = join(work, 'qwen3-asr');
+    mkdirSync(fakePkgDir, { recursive: true });
+    writeFileSync(join(fakePkgDir, 'Package.swift'), '// swift-tools-version: 5.9\n');
+
+    const warnings: string[] = [];
+    const builtNoMetallib = buildMacosSpeechMlxHelper({
+      pkgDir: fakePkgDir,
+      outDir: join(work, 'out-no-metallib'),
+      arch: 'arm64',
+      warnFn: (m) => warnings.push(m),
+      execFn: vi.fn((cmd, args) => {
+        expect(cmd).toBe('swift');
+        expect(args).toEqual(['build', '--package-path', fakePkgDir, '--arch', 'arm64', '-c', 'release']);
+        const relDir = join(fakePkgDir, '.build', 'arm64-apple-macosx', 'release');
+        mkdirSync(relDir, { recursive: true });
+        writeFileSync(join(relDir, 'imcodes-speech-mlx'), '#!/bin/sh\necho "{}"\n', { mode: 0o755 });
+        return '';
+      }),
+    });
+    expect(builtNoMetallib?.binPath).toBe(join(work, 'out-no-metallib', 'imcodes-speech-mlx'));
+    expect(builtNoMetallib?.metallibPath).toBeNull();
+    expect(warnings.some((w) => w.includes('MetalToolchain'))).toBe(true);
+
+    expect(buildMacosSpeechMlxHelper({ pkgDir: fakePkgDir, outDir: join(work, 'out-x64'), arch: 'x64' })).toBeNull();
+
+    // Now simulate release build emitting both imcodes-speech-mlx and default.metallib
+    const outWithMetallib = join(work, 'out-with-metallib');
+    const builtFull = buildMacosSpeechMlxHelper({
+      pkgDir: fakePkgDir,
+      outDir: outWithMetallib,
+      arch: 'universal',
+      execFn: vi.fn(() => {
+        const relDir = join(fakePkgDir, '.build', 'arm64-apple-macosx', 'release');
+        const bundleResDir = join(relDir, 'mlx-swift_Cmlx.bundle', 'Contents', 'Resources');
+        mkdirSync(bundleResDir, { recursive: true });
+        writeFileSync(join(relDir, 'imcodes-speech-mlx'), '#!/bin/sh\necho "{}"\n', { mode: 0o755 });
+        writeFileSync(join(bundleResDir, 'default.metallib'), 'METALLIB');
+        return '';
+      }),
+    });
+    expect(builtFull).toEqual({
+      binPath: join(outWithMetallib, 'imcodes-speech-mlx'),
+      metallibPath: join(outWithMetallib, 'mlx.metallib'),
+    });
+    expect(existsSync(builtFull!.binPath)).toBe(true);
+    expect(existsSync(builtFull!.metallibPath!)).toBe(true);
+
+    // Causal end-to-end runBuildPcApp: verify arm64 build builds/passes MLX helper + metallib into Resources
+    expect(DEFAULT_SPEECH_MLX_PKG_DIR).toMatch(/apps\/pc-app\/native\/qwen3-asr$/);
+    const macExe = join(work, 'imcodes-node-macos');
+    writeFileSync(macExe, '#!/bin/sh\necho 0.1.0\n', { mode: 0o755 });
+    const macSpeech = join(work, 'imcodes-speech');
+    writeFileSync(macSpeech, '#!/bin/sh\necho "{}"\n', { mode: 0o755 });
+    const tmuxDir = createTmuxFixture(join(work, 'tmux-src'));
+    const stageDir = join(work, 'stage-mac');
+    const releaseOutDir = join(work, 'release');
+    const appPath = resolveElectronBuilderMacAppPath(releaseOutDir, 'arm64');
+
+    const passedStageArgs: Array<Record<string, unknown>> = [];
+    const buildReport = await runBuildPcApp(
+      {
+        platform: 'darwin',
+        arch: 'arm64',
+        version: '0.1.0',
+        nodeExe: macExe,
+        tmuxDir,
+        outDir: releaseOutDir,
+        stageDir,
+        appPath,
+        requireSign: false,
+        requireNotarize: false,
+        skipBuild: true,
+        verifyOnly: false,
+      },
+      {
+        platform: 'darwin',
+        ensureBuiltNodeExeFn: () => macExe,
+        ensureBuiltBundledTmuxFn: async () => tmuxDir,
+        buildMacosSpeechHelperFn: () => macSpeech,
+        buildMacosSpeechMlxHelperFn: () => builtFull,
+        stagePcAppResourcesFn: (args: Record<string, unknown>) => {
+          passedStageArgs.push(args);
+          return stagePcAppResources(args as Parameters<typeof stagePcAppResources>[0]);
+        },
+        electronBuilderBuildFn: async ({ config }: { config: { mac: { extraResources: Array<{ from: string }> } } }) => {
+          const fromDir = config.mac.extraResources[0]!.from;
+          const resDir = join(appPath, 'Contents', 'Resources');
+          mkdirSync(resDir, { recursive: true });
+          cpSync(fromDir, resDir, { recursive: true });
+          return [join(releaseOutDir, 'IM.codes-0.1.0-arm64.dmg')];
+        },
+        verifyPackagedMacosAppFn: (targetApp: string) =>
+          verifyPackagedMacosApp(targetApp, {
+            execFn: (cmd: string, args: string[]) => {
+              if (cmd === '/usr/bin/lipo') return 'arm64 x86_64\n';
+              if (cmd === '/usr/bin/otool') {
+                return `${join(targetApp, 'Contents', 'Resources', 'bin', 'tmux')}:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)\n`;
+              }
+              if (args.includes('--version')) return '0.1.0\n';
+              return '';
+            },
+          }),
+      },
+    );
+
+    expect(passedStageArgs).toHaveLength(1);
+    expect(passedStageArgs[0]!.mlxSpeechBinPath).toBe(builtFull!.binPath);
+    expect(passedStageArgs[0]!.mlxMetallibPath).toBe(builtFull!.metallibPath);
+
+    const appResourcesDir = join(appPath, 'Contents', 'Resources');
+    expect(existsSync(join(appResourcesDir, 'imcodes-speech-mlx'))).toBe(true);
+    expect(existsSync(join(appResourcesDir, 'mlx.metallib'))).toBe(true);
+    expect((buildReport.verification as { mlxSpeechPath?: string; mlxMetallibPresent?: boolean }).mlxSpeechPath).toBe(
+      join(appResourcesDir, 'imcodes-speech-mlx'),
+    );
+    expect((buildReport.verification as { mlxMetallibPresent?: boolean }).mlxMetallibPresent).toBe(true);
   });
 });
