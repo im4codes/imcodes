@@ -377,7 +377,7 @@ import {
   shouldSubscribeTerminalRaw,
   type TerminalSubscribeViewMode,
 } from './terminal-subscribe-mode.js';
-import { onWatchCommand } from './watch-bridge.js';
+import { onWatchCommand, resolveWatchApiKey, syncSnapshotToWatch } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import {
   subscribeShareReceiver,
@@ -1466,13 +1466,29 @@ function InternalMainApp() {
       return;
     }
 
-    watchProjectionStore.setApiKey(getApiKey());
+    let cancelled = false;
+    const directKey = getApiKey();
+    if (directKey) {
+      watchProjectionStore.setApiKey(directKey);
+    } else if (!isNative()) {
+      watchProjectionStore.setApiKey(null);
+    } else {
+      void resolveWatchApiKey(auth).then((watchKey) => {
+        if (cancelled) return;
+        const currentAuth = authRef.current;
+        if (!currentAuth || currentAuth.userId !== auth.userId || currentAuth.baseUrl !== auth.baseUrl) return;
+        watchProjectionStore.setApiKey(getApiKey() ?? watchKey);
+      });
+    }
     watchProjectionStore.setServers(servers.map((server) => ({
       id: server.id,
       name: server.name,
       baseUrl: auth.baseUrl,
     })));
     watchProjectionStore.setCurrentServerId(selectedServerId);
+    return () => {
+      cancelled = true;
+    };
   }, [auth, servers, selectedServerId]);
 
   useEffect(() => {
@@ -1551,6 +1567,24 @@ function InternalMainApp() {
       if (command.action === 'openSession') {
         setSelectedServerId(command.serverId);
         navigateToSessionRef.current(command.sessionName);
+        return;
+      }
+      if (command.action === 'requestSnapshot') {
+        const pushCurrentSnapshot = () => {
+          void syncSnapshotToWatch(watchProjectionStore.getSnapshot());
+        };
+        const currentAuth = authRef.current;
+        if (!watchProjectionStore.getSnapshot().apiKey && currentAuth && isNative()) {
+          void resolveWatchApiKey(currentAuth).then((watchKey) => {
+            const latestAuth = authRef.current;
+            if (latestAuth && latestAuth.userId === currentAuth.userId && latestAuth.baseUrl === currentAuth.baseUrl) {
+              watchProjectionStore.setApiKey(getApiKey() ?? watchKey);
+            }
+            pushCurrentSnapshot();
+          });
+        } else {
+          pushCurrentSnapshot();
+        }
         return;
       }
       wsRef.current?.requestSessionList();

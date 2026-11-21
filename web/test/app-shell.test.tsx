@@ -357,6 +357,8 @@ vi.mock('../src/git-status-store.js', () => ({
 
 vi.mock('../src/watch-bridge.js', () => ({
   onWatchCommand: vi.fn(async () => vi.fn()),
+  resolveWatchApiKey: vi.fn(async () => null),
+  syncSnapshotToWatch: vi.fn(async () => undefined),
 }));
 
 vi.mock('../src/watch-projection.js', () => ({

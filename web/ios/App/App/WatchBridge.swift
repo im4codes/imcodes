@@ -117,7 +117,7 @@ final class WatchBridge: NSObject, WCSessionDelegate {
                     "serverId": serverId
                 ]
             )
-        case "refresh":
+        case "refresh", "requestSnapshot":
             NotificationCenter.default.post(
                 name: .watchCommand,
                 object: nil,

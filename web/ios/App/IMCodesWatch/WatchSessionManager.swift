@@ -31,6 +31,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
     private var pendingRoute: WatchRoute?
     private var routeTimeoutWorkItem: DispatchWorkItem?
     private var networkLoadedSessionServers: Set<String> = []
+    private var lastSnapshotRequestAt: Date = .distantPast
 
     private override init() {
         super.init()
@@ -205,7 +206,10 @@ final class WatchSessionManager: NSObject, ObservableObject {
     }
 
     func ensureLoaded() async {
-        guard canUseDirectApi else { return }
+        guard canUseDirectApi else {
+            requestSnapshotFromPhoneIfReachable()
+            return
+        }
         async let tasksStep: Void = loadGlobalTasks(force: false)
         if servers.isEmpty {
             await loadServers(force: false)
@@ -225,6 +229,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
         guard canUseDirectApi else {
             isUsingFallbackSnapshot = true
             lastErrorMessage = "Open IM.codes on iPhone to sync first."
+            requestSnapshotFromPhoneIfReachable(force: true)
             return
         }
         async let tasksStep: Void = loadGlobalTasks(force: true)
@@ -237,7 +242,10 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     /// Immediate refresh when the Watch app wakes/becomes active in foreground.
     func refreshOnForeground() async {
-        guard canUseDirectApi else { return }
+        guard canUseDirectApi else {
+            requestSnapshotFromPhoneIfReachable()
+            return
+        }
         async let tasksStep: Void = loadGlobalTasks(force: true)
         if servers.isEmpty {
             await loadServers(force: false)
@@ -685,6 +693,18 @@ final class WatchSessionManager: NSObject, ObservableObject {
         routeTimeoutWorkItem = nil
     }
 
+    private func requestSnapshotFromPhoneIfReachable(force: Bool = false) {
+        guard WCSession.isSupported() else { return }
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else { return }
+        let now = Date()
+        if !force && now.timeIntervalSince(lastSnapshotRequestAt) < 3 {
+            return
+        }
+        lastSnapshotRequestAt = now
+        session.sendMessage(["action": "requestSnapshot"], replyHandler: nil, errorHandler: nil)
+    }
+
     private func sendControlMessage(_ payload: [String: Any]) {
         guard WCSession.isSupported() else { return }
         let session = WCSession.default
@@ -742,6 +762,8 @@ extension WatchSessionManager: WCSessionDelegate {
                     self.resolvePendingRouteIfPossible()
                 } else if self.canUseDirectApi {
                     await self.ensureLoaded()
+                } else {
+                    self.requestSnapshotFromPhoneIfReachable()
                 }
             }
         }
@@ -808,5 +830,11 @@ extension WatchSessionManager: WCSessionDelegate {
         }
     }
 
-    nonisolated func sessionReachabilityDidChange(_ session: WCSession) {}
+    nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
+        Task { @MainActor in
+            if session.isReachable, !self.canUseDirectApi {
+                self.requestSnapshotFromPhoneIfReachable()
+            }
+        }
+    }
 }
