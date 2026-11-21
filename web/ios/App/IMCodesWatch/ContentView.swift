@@ -503,6 +503,32 @@ private struct TaskRowView: View {
                             .lineLimit(1)
                     }
                 }
+
+                if let checklist = task.checklist, checklist.total > 0 {
+                    let total = checklist.total
+                    let implemented = min(max(checklist.implemented, 0), total)
+                    let audited = min(max(checklist.audited, 0), total)
+                    let countLabel = (audited > 0 && audited < total)
+                        ? "\(implemented)/\(total) ✓\(audited)"
+                        : "\(implemented)/\(total)"
+                    HStack(spacing: 4) {
+                        ProgressView(value: Double(implemented), total: Double(total))
+                            .progressViewStyle(.linear)
+                            .tint(statusColor)
+                        Text(countLabel)
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                if let summary = task.liveSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !summary.isEmpty {
+                    Text(summary)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
 
             if hasNavigation {
