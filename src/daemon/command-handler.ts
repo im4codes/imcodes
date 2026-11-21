@@ -10309,12 +10309,11 @@ function extractAttachmentEntrySessionName(entry: unknown): string {
  * attachments are the one deliberate exception: uploads live under the
  * daemon-owned ~/.imcodes/uploads directory, outside every project root.
  *
- * Keep the exception capability-based AND session-bound rather than trusting
- * global registry entries or unproven timeline text: non-server shared actors
- * require an explicit same-session `entry.sessionName` binding minted at the
- * authenticated upload entrypoint. Legacy owner/whole-server attachment previews
- * keep working when `entry.sessionName` is absent, while explicit cross-session
- * bindings fail closed.
+ * Keep the exception capability-based AND session-bound for tab-level shares:
+ * non-server shared actors require an explicit same-session `entry.sessionName`
+ * binding minted at the authenticated upload entrypoint. Device owners and
+ * whole-server share participants have global download/read access to valid
+ * registered uploads on that device regardless of `entry.sessionName`.
  */
 async function resolveRegisteredUploadReadTarget(
   sessionName: string,
@@ -10328,8 +10327,6 @@ async function resolveRegisteredUploadReadTarget(
   const entrySessionName = extractAttachmentEntrySessionName(entry);
   if (isNonServerSharedActor(sharedActor)) {
     if (!entrySessionName || entrySessionName !== sessionName) return null;
-  } else if (entrySessionName && entrySessionName !== sessionName) {
-    return null;
   }
 
   const uploadRoot = nodePath.resolve(imcodesStateDir(), 'uploads');

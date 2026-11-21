@@ -422,6 +422,52 @@ describe('fs.ls handler', () => {
     expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(unboundLegacyUploadPath, 'read-owner-legacy-chat', expect.any(Function));
     expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(crossSessionUploadPath, 'read-whole-server-upload', expect.any(Function));
     expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(crossSessionUploadPath, 'read-shared-server-upload', expect.any(Function));
+
+    // 4) Owner and whole-server share participant can read cross-session registered uploads even when another sessionName is passed.
+    sent.length = 0;
+    mockPreviewCoordinator.handle.mockClear();
+    handleWebCommand({
+      type: 'fs.read',
+      path: crossSessionUploadPath,
+      requestId: 'read-owner-cross-session-regular',
+      sessionName: 'deck_session_b',
+    }, mockServerLink as any);
+    handleWebCommand({
+      type: 'fs.read',
+      path: crossSessionUploadPath,
+      requestId: 'read-owner-cross-session-chat',
+      sessionName: 'deck_session_b',
+      chatFileReference: true,
+    }, mockServerLink as any);
+    handleWebCommand({
+      type: 'fs.read',
+      path: crossSessionUploadPath,
+      requestId: 'read-shared-server-cross-session-regular',
+      sessionName: 'deck_session_b',
+      sharedActor: {
+        origin: 'shared-server',
+        effectiveActorRole: 'participant',
+        snapshot: { target: { kind: 'server', serverId: 'srv-1' } },
+      },
+    }, mockServerLink as any);
+    handleWebCommand({
+      type: 'fs.read',
+      path: crossSessionUploadPath,
+      requestId: 'read-shared-server-cross-session-chat',
+      sessionName: 'deck_session_b',
+      chatFileReference: true,
+      sharedActor: {
+        origin: 'shared-server',
+        effectiveActorRole: 'participant',
+        snapshot: { target: { kind: 'server', serverId: 'srv-1' } },
+      },
+    }, mockServerLink as any);
+    await flushAsync();
+    expect(sent).toEqual([]);
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(crossSessionUploadPath, 'read-owner-cross-session-regular', expect.any(Function));
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(crossSessionUploadPath, 'read-owner-cross-session-chat', expect.any(Function));
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(crossSessionUploadPath, 'read-shared-server-cross-session-regular', expect.any(Function));
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(crossSessionUploadPath, 'read-shared-server-cross-session-chat', expect.any(Function));
   });
 
   it('stamps sharedActor onto process user.message and blocks @upload attachment smuggling across sessions', async () => {

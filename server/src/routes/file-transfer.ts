@@ -880,7 +880,11 @@ async function authorizeSessionFileAccess(
     ?? c.req.query('sessionName')
     ?? ''
   ).trim();
-  if (member.ok) return { ok: true, ...(requestedSessionName ? { sessionName: requestedSessionName } : {}) };
+  if (member.ok) {
+    return mode === 'read'
+      ? { ok: true }
+      : { ok: true, ...(requestedSessionName ? { sessionName: requestedSessionName } : {}) };
+  }
 
   const sessionName = requestedSessionName;
 
@@ -893,7 +897,9 @@ async function authorizeSessionFileAccess(
     if (mode === 'write' && serverAccess.actor.effectiveActorRole !== 'participant') {
       return { ok: false, reason: 'share-role-denied' };
     }
-    return { ok: true, sessionName: sessionName || undefined };
+    return mode === 'read'
+      ? { ok: true }
+      : { ok: true, sessionName: sessionName || undefined };
   }
 
   const target = shareTargetFromSessionName(serverId, sessionName);

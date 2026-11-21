@@ -1471,10 +1471,19 @@ describe('file-transfer download route', () => {
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveHttpShareAccess.mockReset().mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'none', effectiveActorRole: null, coverage: null },
+    });
     mockResolveHttpShareAccessForCoveredSession.mockReset();
-    queryOneMock.mockReset().mockResolvedValue({
-      user_id: 'user-1', node_role: 'full', exec_enabled: true,
-      revoked_at: null, access_role: 'owner',
+    queryOneMock.mockReset().mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM users')) {
+        return { id: 'user-1', status: 'active' };
+      }
+      return {
+        user_id: 'user-1', node_role: 'full', exec_enabled: true,
+        revoked_at: null, access_role: 'owner',
+      };
     });
   });
 
@@ -1499,6 +1508,104 @@ describe('file-transfer download route', () => {
     expect(mockResolveHttpShareAccessForCoveredSession).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_project_brain' },
     }));
+  });
+
+  it('gives owners and whole-server share participants global download and unpinned download-token access', async () => {
+    mockResolveHttpShareAccess.mockReset();
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: { target: { kind: 'server', serverId: 'srv-1' } },
+      },
+    });
+    const app = makeApp();
+    sendFileTransferRequestMock.mockResolvedValue({
+      type: FILE_TRANSFER_MSG.DOWNLOAD_DONE,
+      content: Buffer.from('global bytes').toString('base64'),
+      mime: 'text/plain',
+      filename: 'global.txt',
+    });
+
+    // 1) Owner minting download-token with a sessionName query param stays global (never pins token to tab).
+    const ownerTokenRes = await app.request(
+      '/api/server/srv-1/uploads/abc123/download-token?sessionName=deck_session_a',
+      { method: 'POST', headers: { Authorization: 'Bearer test' } },
+    );
+    expect(ownerTokenRes.status).toBe(200);
+    const { token: ownerToken } = await ownerTokenRes.json() as { token: string };
+    const ownerRedeemRes = await app.request(
+      `/api/server/srv-1/uploads/abc123/download?token=${ownerToken}&sessionName=deck_session_b`,
+    );
+    expect(ownerRedeemRes.status).toBe(200);
+    expect(await ownerRedeemRes.text()).toBe('global bytes');
+    expect(mockResolveHttpShareAccessForCoveredSession).not.toHaveBeenCalled();
+
+    // 2) Whole-server share participant downloads globally without or across sessionName values.
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+    const serverTokenRes = await app.request(
+      '/api/server/srv-1/uploads/abc123/download-token?sessionName=deck_session_a',
+      { method: 'POST', headers: { Authorization: 'Bearer test' } },
+    );
+    expect(serverTokenRes.status).toBe(200);
+    const { token: serverToken } = await serverTokenRes.json() as { token: string };
+    const serverRedeemRes = await app.request(
+      `/api/server/srv-1/uploads/abc123/download?token=${serverToken}`,
+    );
+    expect(serverRedeemRes.status).toBe(200);
+    expect(await serverRedeemRes.text()).toBe('global bytes');
+
+    const serverDirectRes = await app.request(
+      '/api/server/srv-1/uploads/abc123/download',
+      { headers: { Authorization: 'Bearer test' } },
+    );
+    expect(serverDirectRes.status).toBe(200);
+    expect(await serverDirectRes.text()).toBe('global bytes');
+    expect(mockResolveHttpShareAccessForCoveredSession).not.toHaveBeenCalled();
+  });
+
+  it('keeps tab-level share downloads and download-tokens strictly scoped to their shared session', async () => {
+    mockResolveHttpShareAccess.mockReset().mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'none', effectiveActorRole: null, coverage: null },
+    });
+    mockSharedFileAccess('viewer');
+    const app = makeApp();
+    sendFileTransferRequestMock.mockResolvedValue({
+      type: FILE_TRANSFER_MSG.DOWNLOAD_DONE,
+      content: Buffer.from('tab bytes').toString('base64'),
+      mime: 'text/plain',
+      filename: 'tab.txt',
+    });
+
+    // Without sessionName, tab-level share is denied.
+    const noSessionRes = await app.request(
+      '/api/server/srv-1/uploads/abc123/download',
+      { headers: { Authorization: 'Bearer test' } },
+    );
+    expect(noSessionRes.status).toBe(403);
+
+    // Minting a download-token binds it to deck_project_brain even if redeemed later with a different sessionName query.
+    const tabTokenRes = await app.request(
+      '/api/server/srv-1/uploads/abc123/download-token?sessionName=deck_project_brain',
+      { method: 'POST', headers: { Authorization: 'Bearer test' } },
+    );
+    expect(tabTokenRes.status).toBe(200);
+    const { token: tabToken } = await tabTokenRes.json() as { token: string };
+    const tabRedeemRes = await app.request(
+      `/api/server/srv-1/uploads/abc123/download?token=${tabToken}&sessionName=deck_other_session`,
+    );
+    expect(tabRedeemRes.status).toBe(200);
+    expect(mockResolveHttpShareAccessForCoveredSession).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_project_brain' },
+      }),
+    );
   });
 
   it('uses canonical SERVER_URL for the controlled-node staged upload callback', async () => {
