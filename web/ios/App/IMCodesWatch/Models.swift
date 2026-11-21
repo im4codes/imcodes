@@ -390,7 +390,7 @@ struct WatchHistoryResponse: Equatable {
 
 extension WatchHistoryResponse: Decodable {
     enum CodingKeys: String, CodingKey {
-        case sessionName, epoch, events, hasMore, nextCursor
+        case sessionName, epoch, events, hasMore, nextCursor, earliestTs, legacyBeforeTs
     }
 
     init(from decoder: Decoder) throws {
@@ -398,7 +398,31 @@ extension WatchHistoryResponse: Decodable {
         sessionName = try container.decode(String.self, forKey: .sessionName)
         epoch = try container.decodeIfPresent(Double.self, forKey: .epoch)
         hasMore = (try? container.decode(Bool.self, forKey: .hasMore)) ?? false
-        nextCursor = try container.decodeIfPresent(Double.self, forKey: .nextCursor)
+        let rawCursor = try? container.decodeIfPresent(JSONValue.self, forKey: .nextCursor)
+        let decodedCursor: Double?
+        switch rawCursor {
+        case .number(let value) where value.isFinite:
+            decodedCursor = value
+        case .object(let obj):
+            if case .number(let ts) = obj["ts"], ts.isFinite {
+                decodedCursor = ts
+            } else if case .string(let tsStr) = obj["ts"], let ts = Double(tsStr), ts.isFinite {
+                decodedCursor = ts
+            } else {
+                decodedCursor = nil
+            }
+        case .string(let value):
+            if let parsed = Double(value), parsed.isFinite {
+                decodedCursor = parsed
+            } else {
+                decodedCursor = nil
+            }
+        default:
+            decodedCursor = nil
+        }
+        let legacyBeforeTs = try? container.decodeIfPresent(Double.self, forKey: .legacyBeforeTs)
+        let earliestTs = try? container.decodeIfPresent(Double.self, forKey: .earliestTs)
+        nextCursor = decodedCursor ?? (hasMore ? (legacyBeforeTs ?? earliestTs) : nil)
         // Lenient event decoding — skip individual events that fail to decode
         var eventsArray = try container.nestedUnkeyedContainer(forKey: .events)
         var decoded: [WatchTimelineEvent] = []
