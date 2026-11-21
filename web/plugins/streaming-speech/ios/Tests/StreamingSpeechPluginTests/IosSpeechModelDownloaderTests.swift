@@ -166,7 +166,7 @@ final class IosSpeechModelDownloaderTests: XCTestCase {
         try Data("v1".utf8).write(to: downloadedDir.appendingPathComponent(IosSpeechModelDownloader.verifiedMarkerFilename))
 
         let exp = expectation(description: "async verification marks downloaded store ready")
-        store.ensureBackgroundModelDownloadIfNeeded { ok in
+        downloader.ensureDownloadedIfNeeded { ok in
             XCTAssertTrue(ok)
             exp.fulfill()
         }
@@ -191,11 +191,14 @@ final class IosSpeechModelDownloaderTests: XCTestCase {
         try Data().write(to: modelsDir.appendingPathComponent("hotwords.txt"))
         try Data("v1".utf8).write(to: modelsDir.appendingPathComponent(IosSpeechModelDownloader.verifiedMarkerFilename))
 
-        let gateLock = NSLock()
-        var startedSignaled = false
+        final class VerifierGateState: @unchecked Sendable {
+            let lock = NSLock()
+            var startedSignaled = false
+            var ranOffMainThread = false
+        }
+        let gateState = VerifierGateState()
         let verificationStarted = DispatchSemaphore(value: 0)
         let allowVerificationToFinish = DispatchSemaphore(value: 0)
-        var ranOffMainThread = false
 
         let downloader = IosSpeechModelDownloader(
             modelsDirectory: modelsDir,
@@ -203,11 +206,12 @@ final class IosSpeechModelDownloaderTests: XCTestCase {
             sessionIdentifier: nil,
             urlSessionConfiguration: .ephemeral,
             fileVerifier: { url, asset in
-                ranOffMainThread = !Thread.isMainThread
-                gateLock.lock()
-                let shouldSignal = !startedSignaled && asset.downloadable
-                if shouldSignal { startedSignaled = true }
-                gateLock.unlock()
+                let isMain = Thread.isMainThread
+                gateState.lock.lock()
+                gateState.ranOffMainThread = !isMain
+                let shouldSignal = !gateState.startedSignaled && asset.downloadable
+                if shouldSignal { gateState.startedSignaled = true }
+                gateState.lock.unlock()
                 if shouldSignal {
                     verificationStarted.signal()
                     allowVerificationToFinish.wait()
@@ -236,7 +240,10 @@ final class IosSpeechModelDownloaderTests: XCTestCase {
         wait(for: [readyExp], timeout: 5)
 
         XCTAssertEqual(callbackResult, true)
-        XCTAssertTrue(ranOffMainThread)
+        gateState.lock.lock()
+        let ranOffMain = gateState.ranOffMainThread
+        gateState.lock.unlock()
+        XCTAssertTrue(ranOffMain)
         XCTAssertEqual(downloader.status, .ready)
         XCTAssertTrue(downloader.hasVerifiedLocalModels)
         XCTAssertEqual(store.modelRoot, modelsDir)
@@ -306,7 +313,7 @@ final class IosSpeechModelDownloaderTests: XCTestCase {
 
         // Post-ready same-size tampering must also invalidate the fingerprint snapshot immediately.
         let configURL = modelsDir.appendingPathComponent("config.json")
-        try corruptData.write(to: configURL, options: .atomic)
+        try badSameSizeData.write(to: configURL, options: .atomic)
         try FileManager.default.setAttributes(
             [.modificationDate: Date().addingTimeInterval(10)],
             ofItemAtPath: configURL.path
