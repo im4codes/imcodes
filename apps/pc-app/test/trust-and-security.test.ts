@@ -229,16 +229,37 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
     wc.emit('will-attach-webview', webviewEv);
     expect(webviewEv.preventDefault).toHaveBeenCalledTimes(1);
 
-    // 3. setWindowOpenHandler always denies; openExternal uses strict docs allowlist (not trustedOrigins)
+    // 3. setWindowOpenHandler always denies BrowserWindow creation and routes safe http/https URLs to openExternal
     expect(wc.windowOpenHandler).toBeTruthy();
-    expect(wc.windowOpenHandler!({ url: 'https://docs.im.codes/guide' })).toEqual({ action: 'deny' });
-    expect(openExternal).toHaveBeenCalledWith('https://docs.im.codes/guide');
+    for (const safeUrl of [
+      'https://docs.im.codes/guide',
+      'https://example.com/article?id=42#top',
+      'http://localhost:3000/preview',
+      'https://second.im.codes/admin',
+    ]) {
+      openExternal.mockClear();
+      expect(wc.windowOpenHandler!({ url: safeUrl })).toEqual({ action: 'deny' });
+      expect(openExternal).toHaveBeenCalledTimes(1);
+      expect(openExternal).toHaveBeenCalledWith(safeUrl);
+    }
 
     openExternal.mockClear();
-    expect(wc.windowOpenHandler!({ url: 'https://evil.example/phish' })).toEqual({ action: 'deny' });
-    expect(wc.windowOpenHandler!({ url: 'http://docs.im.codes/insecure' })).toEqual({ action: 'deny' });
-    expect(wc.windowOpenHandler!({ url: 'https://second.im.codes/admin' })).toEqual({ action: 'deny' });
-    expect(wc.windowOpenHandler!({ url: 'https://evil.docs.im.codes/phish' })).toEqual({ action: 'deny' });
+    for (const blockedUrl of [
+      'file:///etc/passwd',
+      'javascript:alert(1)',
+      'vbscript:msgbox(1)',
+      'data:text/html,<script>alert(1)</script>',
+      'smb://fileserver/share',
+      'ftp://example.com/file',
+      'https://user:pass@example.com/secret',
+      'http://user@example.com/',
+      'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example',
+      'https://imcodes-prompt.local/submit?url=https%3A%2F%2Fevil.example',
+      'not-a-valid-url',
+      '',
+    ]) {
+      expect(wc.windowOpenHandler!({ url: blockedUrl })).toEqual({ action: 'deny' });
+    }
     expect(openExternal).not.toHaveBeenCalled();
 
     // 4. Permission gate: clipboard/media allowed only for active + trusted origin
@@ -339,7 +360,13 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
     activeOrigin = null;
     expect(isSameActiveOrigin('https://app.im.codes/x', activeOrigin, trusted)).toBe(false);
     expect(isAllowedExternalUrl('https://github.com/im4codes/imcodes')).toBe(true);
+    expect(isAllowedExternalUrl('http://127.0.0.1:8080/app')).toBe(true);
+    expect(isAllowedExternalUrl('https://arbitrary-external-site.org/path')).toBe(true);
     expect(isAllowedExternalUrl('https://user:pass@github.com/im4codes')).toBe(false);
+    expect(isAllowedExternalUrl('file:///etc/passwd')).toBe(false);
+    expect(isAllowedExternalUrl('javascript:alert(1)')).toBe(false);
+    expect(isAllowedExternalUrl('https://imcodes-welcome.local/connect')).toBe(false);
+    expect(isAllowedExternalUrl('https://evil.example', ['docs.im.codes'])).toBe(false);
     expect(
       isAllowedPermissionRequest({
         requestingUrl: 'https://app.im.codes',
@@ -481,5 +508,59 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
     expect(spoofEv.preventDefault).toHaveBeenCalled();
     await new Promise((r) => setTimeout(r, 20));
     expect(shell.store.list().map((s) => s.origin)).toEqual(['https://app.im.codes']);
+  });
+
+  it('routes external http/https windowOpenHandler links from createPcAppShell to openExternal while keeping virtual and unsafe URLs blocked', async () => {
+    const session = new MockSession();
+    const wc = new MockWebContents(session);
+    const openExternal = vi.fn();
+    const win: ShellWindowLike = {
+      isDestroyed: () => false,
+      loadURL: async (nextUrl: string) => {
+        wc.url = nextUrl;
+      },
+      on: vi.fn(),
+      webContents: Object.assign(wc, {
+        reload: vi.fn(),
+        reloadIgnoringCache: vi.fn(),
+        toggleDevTools: vi.fn(),
+      }),
+    };
+
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      bindDeps: { imcodesHome: tempDir },
+      createMainWindow: () => win,
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: () => {},
+      openExternal,
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 1 }),
+    });
+
+    await shell.ensureWindow();
+    expect(wc.windowOpenHandler).toBeTruthy();
+
+    expect(wc.windowOpenHandler!({ url: 'https://example.org/docs' })).toEqual({ action: 'deny' });
+    expect(wc.windowOpenHandler!({ url: 'http://127.0.0.1:4321/preview' })).toEqual({ action: 'deny' });
+    expect(openExternal).toHaveBeenNthCalledWith(1, 'https://example.org/docs');
+    expect(openExternal).toHaveBeenNthCalledWith(2, 'http://127.0.0.1:4321/preview');
+
+    openExternal.mockClear();
+    expect(wc.windowOpenHandler!({ url: 'file:///etc/passwd' })).toEqual({ action: 'deny' });
+    expect(wc.windowOpenHandler!({ url: 'javascript:alert(1)' })).toEqual({ action: 'deny' });
+    expect(wc.windowOpenHandler!({ url: 'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fapp.im.codes' })).toEqual({ action: 'deny' });
+    expect(openExternal).not.toHaveBeenCalled();
+
+    // imcodes-welcome.local virtual navigation on the welcome page still connects normally
+    const connectEv = { preventDefault: vi.fn() };
+    wc.emit('will-navigate', connectEv, 'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fapp.im.codes');
+    expect(connectEv.preventDefault).toHaveBeenCalled();
+    await vi.waitFor(() => expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes'));
+    expect(openExternal).not.toHaveBeenCalled();
   });
 });

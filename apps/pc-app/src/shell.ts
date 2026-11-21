@@ -169,9 +169,9 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     onStateChanged: () => rebuildMenu(),
   });
 
-  const openDocsSafely = (url: string) => {
+  const openExternalSafely = (url: string) => {
     if (isAllowedExternalUrl(url, deps.externalDocsHosts)) {
-      return deps.openExternal(url);
+      return Promise.resolve(deps.openExternal(url)).catch(() => {});
     }
     return undefined;
   };
@@ -380,7 +380,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       },
       onClearSession: () => void handleClearSession(),
       onBindFallback: () => void handleBindFallback(),
-      onOpenDocs: () => void openDocsSafely(DOCS_HELP_URL),
+      onOpenDocs: () => void openExternalSafely(DOCS_HELP_URL),
       onOpenSettings: deps.onOpenSettings ?? handleOpenSettings,
       settingsEnabled: Boolean(controller.currentTrustedOrigin()),
     });
@@ -430,7 +430,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       getActiveOrigin: () => controller.getActiveOrigin(),
       getTrustedOrigins: () => controller.trustedOrigins(),
       getCurrentTrustedOrigin: () => controller.currentTrustedOrigin(),
-      openExternal: openDocsSafely,
+      openExternal: openExternalSafely,
       promptSavePathSync: (suggestedFilename) => {
         if (!mainWindow || mainWindow.isDestroyed()) return null;
         return deps.showSaveDialogSync(mainWindow, suggestedFilename) ?? null;

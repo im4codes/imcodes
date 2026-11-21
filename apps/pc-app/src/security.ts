@@ -13,6 +13,11 @@ export const DEFAULT_EXTERNAL_DOCS_HOSTS = [
   'docs.github.com',
 ] as const;
 
+const INTERNAL_VIRTUAL_HOSTS = new Set([
+  'imcodes-welcome.local',
+  'imcodes-prompt.local',
+]);
+
 export const ALLOWED_WEB_PERMISSIONS = new Set<string>([
   'clipboard-read',
   'clipboard-sanitized-write',
@@ -55,13 +60,15 @@ export function isSameActiveOrigin(
 }
 
 /**
- * Separate external-link policy (§4.7): ONLY `https:` URLs targeting explicit
- * documentation / help domains are permitted. Never reuses `trustedOrigins` and
- * never allows arbitrary `https:` destinations.
+ * External-link policy for opening URLs in the system default browser (§4.7):
+ * - Permits valid `https:` and `http:` URLs with a non-empty host and no embedded credentials.
+ * - Rejects dangerous/unsupported schemes (`file:`, `javascript:`, `vbscript:`, `data:`, `smb:`, `ftp:`, etc.),
+ *   malformed URLs, and internal virtual Electron hosts.
+ * - When `allowedHosts` is explicitly supplied, restricts the hostname to that list.
  */
 export function isAllowedExternalUrl(
   rawUrl: string,
-  allowedHosts: readonly string[] = DEFAULT_EXTERNAL_DOCS_HOSTS,
+  allowedHosts?: readonly string[],
 ): boolean {
   if (!rawUrl) return false;
   let parsed: URL;
@@ -70,11 +77,14 @@ export function isAllowedExternalUrl(
   } catch {
     return false;
   }
-  if (parsed.protocol !== 'https:') return false;
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
   if (parsed.username || parsed.password) return false;
   const host = parsed.hostname.toLowerCase();
-  if (!host) return false;
-  return allowedHosts.some((entry) => entry.trim().toLowerCase() === host);
+  if (!host || INTERNAL_VIRTUAL_HOSTS.has(host)) return false;
+  if (allowedHosts !== undefined) {
+    return allowedHosts.some((entry) => entry.trim().toLowerCase() === host);
+  }
+  return true;
 }
 
 export function isAllowedPermissionRequest(params: {
@@ -171,7 +181,7 @@ export function attachWindowSecurityGuards(options: WindowSecurityGuardOptions):
     openExternal,
     promptSavePathSync,
     onTrustedMediaPermissionRequest,
-    externalDocsHosts = DEFAULT_EXTERNAL_DOCS_HOSTS,
+    externalDocsHosts,
   } = options;
 
   const enforceNavigation = (event: PreventableEventLike, targetUrl: string) => {
@@ -188,7 +198,7 @@ export function attachWindowSecurityGuards(options: WindowSecurityGuardOptions):
 
   webContents.setWindowOpenHandler(({ url }) => {
     if (isAllowedExternalUrl(url, externalDocsHosts)) {
-      void openExternal(url);
+      void Promise.resolve(openExternal(url)).catch(() => {});
     }
     return { action: 'deny' };
   });
