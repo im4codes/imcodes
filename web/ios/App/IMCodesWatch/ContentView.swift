@@ -28,6 +28,7 @@ private enum WatchViewMode: String, CaseIterable {
 
 struct ContentView: View {
     @EnvironmentObject private var sessionManager: WatchSessionManager
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("watchViewMode") private var viewMode: WatchViewMode = .tasks
     @State private var path: [WatchRoute] = []
     @State private var showServerPicker = false
@@ -404,12 +405,21 @@ struct ContentView: View {
             }
             .task {
                 await sessionManager.ensureLoaded()
-                // Auto-refresh every 12s while list is visible
+                // Auto-refresh every 12s while list is visible and active
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(12))
                     guard !Task.isCancelled else { break }
-                    await sessionManager.refreshSessions()
+                    if scenePhase == .active {
+                        await sessionManager.refreshSessions()
+                    }
                 }
+            }
+            .onChange(of: scenePhase) { newPhase in
+                guard newPhase == .active else { return }
+                Task { await sessionManager.refreshOnForeground() }
+            }
+            .onChange(of: viewMode) { _ in
+                Task { await sessionManager.refreshSessions() }
             }
             .onChange(of: sessionManager.activeRoute) { newRoute in
                 guard let newRoute else { return }

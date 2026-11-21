@@ -40,8 +40,8 @@ actor WatchRestClient {
             self.session = session
         } else {
             let config = URLSessionConfiguration.default
-            config.timeoutIntervalForRequest = 30
-            config.timeoutIntervalForResource = 30
+            config.timeoutIntervalForRequest = 12
+            config.timeoutIntervalForResource = 12
             self.session = URLSession(configuration: config)
         }
     }

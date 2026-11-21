@@ -235,11 +235,26 @@ final class WatchSessionManager: NSObject, ObservableObject {
         _ = await tasksStep
     }
 
-    /// Light refresh — reload sessions and task statuses (no servers). Used by auto-poll timer.
-    func refreshSessions() async {
-        guard canUseDirectApi, let selectedServerId else { return }
+    /// Immediate refresh when the Watch app wakes/becomes active in foreground.
+    func refreshOnForeground() async {
+        guard canUseDirectApi else { return }
         async let tasksStep: Void = loadGlobalTasks(force: true)
-        await loadSessions(serverId: selectedServerId, force: true)
+        if servers.isEmpty {
+            await loadServers(force: false)
+        }
+        if let selectedServerId {
+            await loadSessions(serverId: selectedServerId, force: true)
+        }
+        _ = await tasksStep
+    }
+
+    /// Light refresh — reload sessions and task statuses (no servers). Used by auto-poll timer and view switches.
+    func refreshSessions() async {
+        guard canUseDirectApi else { return }
+        async let tasksStep: Void = loadGlobalTasks(force: true)
+        if let selectedServerId {
+            await loadSessions(serverId: selectedServerId, force: true)
+        }
         _ = await tasksStep
     }
 
@@ -714,7 +729,21 @@ extension WatchSessionManager: WCSessionDelegate {
     nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
         Task { @MainActor in
             self.activationState = activationState
-            self.lastErrorMessage = error?.localizedDescription
+            if let error {
+                self.lastErrorMessage = error.localizedDescription
+            }
+            if activationState == .activated {
+                let received = WCSession.default.receivedApplicationContext
+                if !received.isEmpty, self.currentApiKey() == nil, let decoded = self.decodeContext(received) {
+                    self.applicationContext = decoded
+                    self.reconcileCommandReceipts(from: decoded)
+                    self.bootstrapFromContext(decoded, triggerReload: true)
+                    self.lastErrorMessage = nil
+                    self.resolvePendingRouteIfPossible()
+                } else if self.canUseDirectApi {
+                    await self.ensureLoaded()
+                }
+            }
         }
     }
 
