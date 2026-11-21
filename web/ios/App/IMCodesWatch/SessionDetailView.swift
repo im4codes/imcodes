@@ -1,6 +1,13 @@
 import SwiftUI
 import WatchKit
 
+private enum VoiceSwipeIntent {
+    case none
+    case cancel
+    case send
+    case edit
+}
+
 struct SessionDetailView: View {
     @EnvironmentObject private var sessionManager: WatchSessionManager
     @StateObject private var voiceManager = WatchVoiceInputManager.shared
@@ -13,7 +20,8 @@ struct SessionDetailView: View {
     @State private var voiceBaseDraft = ""
     @State private var voiceSessionActive = false
     @State private var isHoldingVoice = false
-    @State private var isCancelDrag = false
+    @State private var voiceSwipeIntent: VoiceSwipeIntent = .none
+    @State private var autoSendAfterVoice = false
     @State private var voicePulse = false
     @State private var hasScrolledInitialLoad = false
     @State private var prevItemCount = 0
@@ -23,7 +31,7 @@ struct SessionDetailView: View {
     @State private var scrollProxy: ScrollViewProxy?
 
     private let quickReplies = ["Yes", "Continue", "Fix"]
-    private let voiceCancelDragDistance: CGFloat = 45
+    private let voiceSwipeThreshold: CGFloat = 28
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -171,9 +179,10 @@ struct SessionDetailView: View {
         .onChange(of: voiceManager.state) { newState in
             if newState == .idle && isHoldingVoice {
                 isHoldingVoice = false
-                isCancelDrag = false
+                voiceSwipeIntent = .none
                 voicePulse = false
                 voiceSessionActive = false
+                autoSendAfterVoice = false
             } else if voiceManager.isRecording && isHoldingVoice {
                 withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
                     voicePulse = true
@@ -189,6 +198,18 @@ struct SessionDetailView: View {
                 draft = mergeVoiceDraft(base: voiceBaseDraft, dictated: trimmed)
             }
             if update.isFinal {
+                voiceSessionActive = false
+                if autoSendAfterVoice {
+                    autoSendAfterVoice = false
+                    if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Task { await sendReply(text: draft) }
+                    }
+                }
+            }
+        }
+        .onChange(of: voiceManager.errorMessage) { errorMessage in
+            if let errorMessage, !errorMessage.isEmpty {
+                autoSendAfterVoice = false
                 voiceSessionActive = false
             }
         }
@@ -402,19 +423,33 @@ struct SessionDetailView: View {
         let isGestureDisabled = isSending || isTranscribing
 
         let iconName: String = {
-            if isActiveHold && isCancelDrag { return "xmark.circle.fill" }
-            if isActiveHold { return "waveform" }
-            return "mic.fill"
+            guard isActiveHold else { return "mic.fill" }
+            switch voiceSwipeIntent {
+            case .cancel: return "xmark.circle.fill"
+            case .send: return "paperplane.fill"
+            case .edit: return "pencil"
+            case .none: return "waveform"
+            }
         }()
         let labelText: String = {
             if isTranscribing { return "Transcribing…" }
-            if isActiveHold && isCancelDrag { return "Cancel" }
-            if isActiveHold { return "Release" }
-            return "Hold to Talk"
+            guard isActiveHold else { return "Hold to Talk" }
+            switch voiceSwipeIntent {
+            case .cancel: return "Cancel"
+            case .send: return "Send"
+            case .edit: return "Edit"
+            case .none: return "←Cancel  ↑Send  →Edit"
+            }
         }()
         let fillColor: Color = {
-            if isActiveHold && isCancelDrag { return Color.red.opacity(0.85) }
-            if isActiveHold { return Color.orange.opacity(0.85) }
+            if isActiveHold {
+                switch voiceSwipeIntent {
+                case .cancel: return Color.red.opacity(0.85)
+                case .send: return Color.green.opacity(0.85)
+                case .edit: return Color.blue.opacity(0.85)
+                case .none: return Color.orange.opacity(0.85)
+                }
+            }
             if isTranscribing { return Color.gray.opacity(0.22) }
             return Color.accentColor.opacity(0.22)
         }()
@@ -433,12 +468,12 @@ struct SessionDetailView: View {
             } else {
                 Image(systemName: iconName)
                     .font(.system(size: 11, weight: .semibold))
-                    .opacity(isActiveHold && !isCancelDrag ? (voicePulse ? 0.55 : 1.0) : 1.0)
+                    .opacity(isActiveHold && voiceSwipeIntent == .none ? (voicePulse ? 0.55 : 1.0) : 1.0)
             }
             Text(labelText)
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
-                .minimumScaleFactor(0.8)
+                .minimumScaleFactor(0.7)
         }
         .foregroundStyle(foregroundColor)
         .frame(maxWidth: .infinity, minHeight: 30)
@@ -458,12 +493,28 @@ struct SessionDetailView: View {
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(labelText)
-        .accessibilityHint("Press and hold to record voice input. Slide away to cancel.")
+        .accessibilityHint("Press and hold to record. Swipe left to cancel, up to send, or right to edit.")
+    }
+
+    private func swipeIntent(for translation: CGSize) -> VoiceSwipeIntent {
+        let dx = translation.width
+        let dy = translation.height
+        if dx < -voiceSwipeThreshold && abs(dx) >= abs(dy) {
+            return .cancel
+        }
+        if dy < -voiceSwipeThreshold && abs(dy) > abs(dx) {
+            return .send
+        }
+        if dx > voiceSwipeThreshold && abs(dx) >= abs(dy) {
+            return .edit
+        }
+        return .none
     }
 
     private func handleVoiceDragChanged(_ value: DragGesture.Value) {
         if !isHoldingVoice {
             guard !isSending, voiceManager.state == .idle else { return }
+            autoSendAfterVoice = false
             voiceBaseDraft = draft
             voiceSessionActive = true
             voiceManager.startRecording()
@@ -472,7 +523,7 @@ struct SessionDetailView: View {
                 return
             }
             isHoldingVoice = true
-            isCancelDrag = false
+            voiceSwipeIntent = .none
             if voiceManager.state == .streaming || voiceManager.state == .recordingFile {
                 withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
                     voicePulse = true
@@ -480,28 +531,46 @@ struct SessionDetailView: View {
             }
         }
 
-        let distance = hypot(value.translation.width, value.translation.height)
-        let shouldCancel = distance > voiceCancelDragDistance
-        if shouldCancel != isCancelDrag {
-            isCancelDrag = shouldCancel
-            WKInterfaceDevice.current().play(shouldCancel ? .directionDown : .click)
+        let nextIntent = swipeIntent(for: value.translation)
+        if nextIntent != voiceSwipeIntent {
+            voiceSwipeIntent = nextIntent
+            switch nextIntent {
+            case .cancel:
+                WKInterfaceDevice.current().play(.directionDown)
+            case .send:
+                WKInterfaceDevice.current().play(.directionUp)
+            case .edit, .none:
+                WKInterfaceDevice.current().play(.click)
+            }
         }
     }
 
     private func handleVoiceDragEnded(_ value: DragGesture.Value) {
         guard isHoldingVoice else { return }
-        let distance = hypot(value.translation.width, value.translation.height)
-        let shouldCancel = isCancelDrag || distance > voiceCancelDragDistance
+        let finalIntent = voiceSwipeIntent != .none ? voiceSwipeIntent : swipeIntent(for: value.translation)
         isHoldingVoice = false
-        isCancelDrag = false
+        voiceSwipeIntent = .none
         voicePulse = false
 
-        if shouldCancel {
+        switch finalIntent {
+        case .cancel:
+            autoSendAfterVoice = false
             voiceSessionActive = false
             voiceManager.cancelIfRecording()
             draft = voiceBaseDraft
             WKInterfaceDevice.current().play(.failure)
-        } else {
+        case .send:
+            autoSendAfterVoice = true
+            voiceManager.stopRecording()
+            if voiceManager.state == .idle {
+                voiceSessionActive = false
+                autoSendAfterVoice = false
+                if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Task { await sendReply(text: draft) }
+                }
+            }
+        case .edit, .none:
+            autoSendAfterVoice = false
             voiceManager.stopRecording()
             if voiceManager.state == .idle {
                 voiceSessionActive = false
@@ -511,7 +580,8 @@ struct SessionDetailView: View {
 
     private func cancelHoldVoiceInput(restoreDraft: Bool) {
         isHoldingVoice = false
-        isCancelDrag = false
+        voiceSwipeIntent = .none
+        autoSendAfterVoice = false
         voicePulse = false
         if voiceManager.isRecording || voiceManager.state == .transcribing {
             voiceSessionActive = false
