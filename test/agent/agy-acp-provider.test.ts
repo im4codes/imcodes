@@ -5196,4 +5196,100 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       await runtime.kill();
     }
   });
+
+  it('prevents stale compaction reset to ~979 on resume, streams real PLANNER_RESPONSE ctx, ignores cumulative PromptResponse.usage, and isolates child transcripts', async () => {
+    const { provider, root } = await setup('usage-cumulative');
+    const id = 'deck_agy_ctx_regression';
+    await provider.createSession({
+      sessionKey: id,
+      sessionName: id,
+      cwd: root,
+      agentId: 'model-a',
+      resumeId: 'native-1',
+    });
+
+    const logsDir = path.join(root, '.gemini/antigravity-cli/brain/native-1/.system_generated/logs');
+    await mkdir(logsDir, { recursive: true });
+    // Seed historical step-2748 compaction (~979 tokens) superseded by step-2835 PLANNER_RESPONSE (212,644 tokens).
+    await writeFile(
+      path.join(logsDir, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 2748, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-20T14:43:02Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }),
+        JSON.stringify({ step_index: 2835, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-20T14:46:57Z', content: 'restored reply' }),
+      ].join('\n') + '\n',
+    );
+    await writeFile(
+      path.join(logsDir, 'transcript_full.jsonl'),
+      [
+        JSON.stringify({ step_index: 2748, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-20T14:43:02Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }),
+        JSON.stringify({ step_index: 2835, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-20T14:46:57Z', content: 'restored reply', input_tokens: 3324, cache_read_tokens: 209320, output_tokens: 180 }),
+      ].join('\n') + '\n',
+    );
+
+    const logFile = path.join(root, 'rpc.jsonl');
+    const holdFile = `${logFile}.hold`;
+    await writeFile(holdFile, 'hold');
+
+    const usageEvents: Array<{ finalized?: boolean; usage: any }> = [];
+    const completes: any[] = [];
+    provider.onUsage((_sid, evt) => usageEvents.push(evt));
+    provider.onComplete((_sid, msg) => completes.push(msg));
+
+    await provider.send(id, 'continue after reconnect');
+
+    // Immediately after send() (startAgyBridge + checkSessionCompaction + beginPrompt), seeded 212k occupancy MUST NOT reset to ~979.
+    const state = (provider as any).sessions.get(id);
+    const seededAfterSend = state.agyContextUsage.normalize();
+    expect(seededAfterSend.cache_read_input_tokens).toBe(209320);
+    expect(seededAfterSend.input_tokens).toBeGreaterThanOrEqual(3324);
+
+    // Emit live multi-step PLANNER_RESPONSE rows + GENERIC tool row while turn is in flight, plus a child transcript row.
+    const fullPath = path.join(logsDir, 'transcript_full.jsonl');
+    await appendFile(fullPath, JSON.stringify({ step_index: 2843, type: 'PLANNER_RESPONSE', status: 'DONE', content: '', tool_calls: [{ name: 'run_command', args: {} }], input_tokens: 3100, cache_read_tokens: 211000, output_tokens: 400 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 211000 && e.usage.input_tokens === 3100)).toBe(true), { timeout: 5000 });
+
+    // Subsequent GENERIC row must preserve 211,000 cacheTokens without wiping it to 0.
+    await appendFile(fullPath, JSON.stringify({ step_index: 2844, type: 'GENERIC', status: 'DONE', content: 'tool done' }) + '\n');
+    const afterStep1Count = usageEvents.length;
+    await vi.waitFor(() => expect(usageEvents.length).toBeGreaterThan(afterStep1Count), { timeout: 5000 });
+    expect(usageEvents.at(-1)!.usage.cache_read_input_tokens).toBe(211000);
+    expect(usageEvents.at(-1)!.usage.input_tokens).toBeGreaterThanOrEqual(3100);
+
+    // Child transcript row must NEVER pollute parent session usage.
+    const childLogs = path.join(root, '.gemini/antigravity-cli/brain/child-isolated/.system_generated/logs');
+    await mkdir(childLogs, { recursive: true });
+    await writeFile(path.join(childLogs, 'transcript_full.jsonl'), JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'child done', input_tokens: 999999, cache_read_tokens: 999999, output_tokens: 999 }) + '\n');
+    await (provider as any).startAgyBridge(id, state, 'child-isolated');
+    expect(usageEvents.some((e) => e.usage.input_tokens === 999999 || e.usage.cache_read_input_tokens === 999999)).toBe(false);
+
+    // Second steering/continuation step raises real occupancy to 324,000.
+    await appendFile(fullPath, JSON.stringify({ step_index: 2926, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'final step', input_tokens: 3324, cache_read_tokens: 320676, output_tokens: 600 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 320676 && e.usage.input_tokens === 3324)).toBe(true), { timeout: 5000 });
+
+    // Release fixture hold: fixture sends cumulative PromptResponse.usage (263,842 + 5,178,828 = 5.44M).
+    await unlink(holdFile);
+    await vi.waitFor(() => expect(completes).toHaveLength(1), { timeout: 5000 });
+
+    const finalUsage = completes[0].metadata.usage;
+    expect(finalUsage).toMatchObject({
+      input_tokens: 3324,
+      cache_read_input_tokens: 320676,
+      output_tokens: 1000,
+    });
+    expect((finalUsage.input_tokens ?? 0) + (finalUsage.cache_read_input_tokens ?? 0)).toBe(324000);
+    expect(finalUsage.inputTokens).toBeUndefined();
+    expect(finalUsage.cachedReadTokens).toBeUndefined();
+    // Every emitted usage event across the entire turn stayed far above 979 and well below 5.44M.
+    for (const evt of usageEvents) {
+      const total = (evt.usage.input_tokens ?? 0) + (evt.usage.cache_read_input_tokens ?? 0);
+      expect(total).toBeGreaterThanOrEqual(212644);
+      expect(total).toBeLessThan(400000);
+    }
+    const finalizedEvent = usageEvents.find((e) => e.finalized === true);
+    expect(finalizedEvent?.usage).toMatchObject({
+      input_tokens: 3324,
+      cache_read_input_tokens: 320676,
+      output_tokens: 1000,
+    });
+  });
 });

@@ -17,6 +17,8 @@ export class AgyCompactionWatermark {
   private marker?: string;
   private checking?: Promise<boolean>;
   summaryTokens = 0;
+  compactionStepIndex?: number;
+  hasPostCompactionPlannerResponse = false;
 
   check(home: string | undefined, conversationId: string | undefined): Promise<boolean> {
     if (!home || !path.isAbsolute(home) || !conversationId || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}$/.test(conversationId)) return Promise.resolve(false);
@@ -34,6 +36,8 @@ export class AgyCompactionWatermark {
       let partial = reset ? '' : this.partial;
       let latest = this.marker;
       let summaryTokens = this.summaryTokens;
+      let compactionStepIndex = reset ? undefined : this.compactionStepIndex;
+      let hasPostCompactionPlannerResponse = reset ? false : this.hasPostCompactionPlannerResponse;
       const start = reset ? 0 : this.offset;
       if (reset) this.decoder = new StringDecoder('utf8');
       const consume = (text: string) => {
@@ -44,8 +48,14 @@ export class AgyCompactionWatermark {
           partial = partial.slice(newline + 1);
           try {
             const row = JSON.parse(line);
-            if (row.status !== 'DONE' || !Number.isSafeInteger(row.step_index) || typeof row.created_at !== 'string'
-              || typeof row.content !== 'string') continue;
+            if (row.status !== 'DONE' || !Number.isSafeInteger(row.step_index)) continue;
+            if (row.type === 'PLANNER_RESPONSE') {
+              if (latest !== undefined && (compactionStepIndex === undefined || row.step_index > compactionStepIndex)) {
+                hasPostCompactionPlannerResponse = true;
+              }
+              continue;
+            }
+            if (typeof row.created_at !== 'string' || typeof row.content !== 'string') continue;
             const summary = row.type === 'USER_INPUT' && row.source === 'USER_EXPLICIT'
               && row.content.trimStart().startsWith('<CONTEXT_SUMMARY>');
             // AG 1.5.6 /compact uses a native SYSTEM checkpoint, verified on
@@ -55,6 +65,8 @@ export class AgyCompactionWatermark {
             if (!summary && !checkpoint) continue;
             latest = JSON.stringify([row.step_index, row.created_at]);
             summaryTokens = countTokensFallback(row.content);
+            compactionStepIndex = row.step_index;
+            hasPostCompactionPlannerResponse = false;
           } catch { /* A diagnostic/non-JSON line is not a summary. */ }
         }
       };
@@ -64,6 +76,8 @@ export class AgyCompactionWatermark {
       const changed = latest !== undefined && latest !== this.marker;
       this.file = file; this.inode = info.ino; this.offset = info.size; this.mtime = info.mtimeMs;
       this.partial = partial; this.marker = latest; this.summaryTokens = summaryTokens;
+      this.compactionStepIndex = compactionStepIndex;
+      this.hasPostCompactionPlannerResponse = hasPostCompactionPlannerResponse;
       return changed;
     } catch {
       // Missing/not-yet-created transcript or transient rotation: no invented

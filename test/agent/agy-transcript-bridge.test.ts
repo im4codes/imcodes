@@ -177,4 +177,27 @@ describe('AG native transcript event bridge',()=>{
    expect(cb.mock.calls[7][0]).toMatchObject({step_index:7,content:'after-resume'});
  });
 
+ it('tracks latestStepUsage across baseline and live rows and clears it on compaction checkpoints',async()=>{
+   const home=await mkdtemp(path.join(tmpdir(),'imcodes-ag-usage-bridge-'));roots.push(home);
+   const file=agyTranscriptFile(home,'usage-bridge')!;await mkdir(path.dirname(file),{recursive:true});
+   await writeFile(file,[
+     JSON.stringify({step_index:2748,type:'CHECKPOINT',source:'SYSTEM',status:'DONE',content:'# Resuming from a compaction\nsummary'}),
+     JSON.stringify({step_index:2835,type:'PLANNER_RESPONSE',status:'DONE',content:'post-compaction',input_tokens:3324,cache_read_tokens:209320,output_tokens:180}),
+   ].join('\n')+'\n');
+
+   const cb=vi.fn(),b=new AgyTranscriptBridge(file,cb);bridges.push(b);
+   await b.start(false);
+   expect(cb).not.toHaveBeenCalled();
+   expect(b.latestStepUsage).toEqual({stepIndex:2835,input_tokens:3324,cache_read_tokens:209320,output_tokens:180});
+
+   // Live compaction clears latestStepUsage until a subsequent PLANNER_RESPONSE arrives.
+   await appendFile(file,JSON.stringify({step_index:2836,type:'CHECKPOINT',source:'SYSTEM',status:'DONE',content:'# Resuming from a compaction\nnewer'})+'\n');
+   await b.flush();
+   expect(b.latestStepUsage).toBeUndefined();
+
+   await appendFile(file,JSON.stringify({step_index:2837,type:'PLANNER_RESPONSE',status:'DONE',content:'fresh',input_tokens:500,cache_read_tokens:1200,output_tokens:45})+'\n');
+   await b.flush();
+   expect(b.latestStepUsage).toEqual({stepIndex:2837,input_tokens:500,cache_read_tokens:1200,output_tokens:45});
+ });
+
 });

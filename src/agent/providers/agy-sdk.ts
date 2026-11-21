@@ -498,7 +498,9 @@ export class AgySdkProvider implements TransportProvider {
     if (this.sessions.get(sessionId) !== state || state.cancelled) return false;
     if (changed) {
       state.sessionSystemTextInjected = undefined;
-      state.contextUsage.resetToSummary(state.compactionWatermark.summaryTokens);
+      if (!state.compactionWatermark.hasPostCompactionPlannerResponse) {
+        state.contextUsage.resetToSummary(state.compactionWatermark.summaryTokens);
+      }
     }
     return changed;
   }

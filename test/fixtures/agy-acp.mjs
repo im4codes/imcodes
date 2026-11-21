@@ -87,7 +87,7 @@ function finish(sid, state) {
   if (scenario === 'usage-used') note(sid,{sessionUpdate:'usage_update',used:45000,size:1000000});
   const pending = state.pending.splice(0);
   if (scenario === 'reordered') pending.reverse();
-  for (const [i, id] of pending.entries()) setTimeout(() => ok(id, { stopReason: 'end_turn', usage: scenario === 'usage-missing' ? {} : scenario === 'usage-zero' ? {inputTokens:0,outputTokens:0} : { inputTokens: 10, outputTokens: 5 } }), i * (Number(process.env.AGY_ACP_FIXTURE_REPLY_GAP_MS) || 20));
+  for (const [i, id] of pending.entries()) setTimeout(() => ok(id, { stopReason: 'end_turn', usage: scenario === 'usage-missing' ? {} : scenario === 'usage-zero' ? {inputTokens:0,outputTokens:0} : scenario === 'usage-cumulative' ? { inputTokens: 263842, cachedReadTokens: 5178828, outputTokens: 22308, totalTokens: 5464978 } : { inputTokens: 10, outputTokens: 5 } }), i * (Number(process.env.AGY_ACP_FIXTURE_REPLY_GAP_MS) || 20));
   state.inputs = [];
   if (shouldScheduleWakeup) state.autoTimer = setTimeout(() => startAutoWakeup(sid, state), 20);
 }

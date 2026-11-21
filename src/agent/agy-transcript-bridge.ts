@@ -8,11 +8,25 @@ export interface AgyTranscriptRow {
   tool_calls?: Array<{ name?: string; args?: unknown }>;
   input_tokens?: number; output_tokens?: number; cache_read_tokens?: number;
 }
+export interface AgyStepUsage {
+  stepIndex: number;
+  input_tokens?: number;
+  cache_read_tokens?: number;
+  output_tokens?: number;
+}
 export interface AgyTranscriptCursor {
   incarnation: string;
   byteOffset: number;
 }
 const BACKGROUND_TASK_RUNNING_RE = /Tool is running as a background task with task id:/i;
+const isFiniteNonNegative = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0;
+function isAgyCompactionTranscriptRow(row: AgyTranscriptRow): boolean {
+  if (row.status !== 'DONE' || typeof row.content !== 'string') return false;
+  const trimmed = row.content.trimStart();
+  return (row.type === 'USER_INPUT' && row.source === 'USER_EXPLICIT' && trimmed.startsWith('<CONTEXT_SUMMARY>'))
+    || (row.type === 'CHECKPOINT' && row.source === 'SYSTEM' && trimmed.startsWith('# Resuming from a compaction'));
+}
 export function agyTranscriptFile(home: string, id: string): string | undefined {
   if (!path.isAbsolute(home) || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}$/.test(id)) return;
   return path.join(home, '.gemini/antigravity-cli/brain', id, '.system_generated/logs/transcript_full.jsonl');
@@ -36,11 +50,15 @@ export class AgyTranscriptBridge {
   private partial = '';
   private decoder = new StringDecoder('utf8');
   private lastStep = -1;
+  private latestUsage?: AgyStepUsage;
   private watched?: { dir: string; ino: number; dev: number };
   private fileWatched?: { ino: number; dev: number };
 
   constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow, cursor?: AgyTranscriptCursor) => void) {}
   get isClosed(): boolean { return this.closed; }
+  get latestStepUsage(): AgyStepUsage | undefined {
+    return this.latestUsage ? { ...this.latestUsage } : undefined;
+  }
   currentCursor(): AgyTranscriptCursor | undefined {
     try {
       const s = statSync(this.file);
@@ -237,6 +255,20 @@ export class AgyTranscriptBridge {
             && BACKGROUND_TASK_RUNNING_RE.test(row.content ?? '');
           if (row.status !== 'DONE' && !allowRunningBackgroundTask) continue;
           this.lastStep = row.step_index;
+          if (isAgyCompactionTranscriptRow(row)) {
+            this.latestUsage = undefined;
+          } else if (
+            row.type === 'PLANNER_RESPONSE'
+            && row.status === 'DONE'
+            && (isFiniteNonNegative(row.input_tokens) || isFiniteNonNegative(row.cache_read_tokens))
+          ) {
+            this.latestUsage = {
+              stepIndex: row.step_index,
+              ...(isFiniteNonNegative(row.input_tokens) ? { input_tokens: row.input_tokens } : {}),
+              ...(isFiniteNonNegative(row.cache_read_tokens) ? { cache_read_tokens: row.cache_read_tokens } : {}),
+              ...(isFiniteNonNegative(row.output_tokens) ? { output_tokens: row.output_tokens } : {}),
+            };
+          }
           if (!this.closed && !baseline) this.onRow(row, { incarnation, byteOffset: rowByteEnd });
         }
       }
