@@ -74,6 +74,13 @@ export function readSafeAreaBottomPx(
   return Number.isFinite(sabRaw) && sabRaw > 0 ? sabRaw : 0;
 }
 
+export interface ModelDropdownStyleOptions {
+  minWidth?: number;
+  preferredWidth?: number;
+  viewportHeightCapRatio?: number;
+  maxHeightPx?: number;
+}
+
 /**
  * Compute fixed portal positioning and bounded `maxHeight` for `.menu-dropdown-models`.
  *
@@ -85,6 +92,7 @@ export function readSafeAreaBottomPx(
 export function computeModelDropdownStyle(
   rect: ModelDropdownTriggerRect,
   viewport: ModelDropdownViewport,
+  options?: ModelDropdownStyleOptions,
 ): JSX.CSSProperties {
   const layoutWidth = isPositiveFinite(viewport.innerWidth) ? viewport.innerWidth : 0;
   const layoutHeight = isPositiveFinite(viewport.innerHeight) ? viewport.innerHeight : 0;
@@ -125,7 +133,13 @@ export function computeModelDropdownStyle(
   const shouldOpenBelow =
     availableAbove < MODEL_DROPDOWN_OPEN_BELOW_THRESHOLD_PX && availableBelow > availableAbove;
 
-  const rawViewportCap = Math.floor(effectiveHeight * MODEL_DROPDOWN_VIEWPORT_HEIGHT_CAP_RATIO);
+  const heightCapRatio = isPositiveFinite(options?.viewportHeightCapRatio)
+    ? options.viewportHeightCapRatio
+    : MODEL_DROPDOWN_VIEWPORT_HEIGHT_CAP_RATIO;
+  const rawViewportCap = Math.floor(effectiveHeight * heightCapRatio);
+  const boundedViewportCap = isPositiveFinite(options?.maxHeightPx)
+    ? Math.min(rawViewportCap, Math.floor(options.maxHeightPx))
+    : rawViewportCap;
   let maxHeight: string;
   if (shouldOpenBelow) {
     const numericRoom = Math.max(0, availableBelow);
@@ -133,7 +147,7 @@ export function computeModelDropdownStyle(
       ? Math.min(MODEL_DROPDOWN_MIN_HEIGHT_PX, Math.max(0, Math.floor(visibleBottom - effectiveBelowTopY - safeBottom)))
       : MODEL_DROPDOWN_MIN_HEIGHT_PX;
     const numericCap = effectiveHeight > 0
-      ? Math.min(rawViewportCap, Math.max(tinyFloor, numericRoom))
+      ? Math.min(boundedViewportCap, Math.max(tinyFloor, numericRoom))
       : MODEL_DROPDOWN_MIN_HEIGHT_PX;
     const maxVisibleBelowRoom = Math.max(
       0,
@@ -148,7 +162,7 @@ export function computeModelDropdownStyle(
       ? Math.min(MODEL_DROPDOWN_MIN_HEIGHT_PX, Math.max(0, Math.floor(resolvedAboveBottomY - Math.max(visibleTop, safeTop))))
       : MODEL_DROPDOWN_MIN_HEIGHT_PX;
     const numericCap = effectiveHeight > 0
-      ? Math.min(rawViewportCap, Math.max(tinyFloor, numericRoom))
+      ? Math.min(boundedViewportCap, Math.max(tinyFloor, numericRoom))
       : MODEL_DROPDOWN_MIN_HEIGHT_PX;
     const cssSafeAboveRoom = `calc(${resolvedAboveBottomY}px - ${SAFE_TOP_CSS} - ${MODEL_DROPDOWN_TOP_MARGIN_PX}px)`;
     const cssTopRoom = visibleTop > 0
@@ -158,12 +172,18 @@ export function computeModelDropdownStyle(
   }
 
   const isRightHalf = rect.left + rect.width / 2 > effectiveWidth / 2;
+  const horizontalLimit = Math.max(0, effectiveWidth - MODEL_DROPDOWN_HORIZONTAL_INSET_PX * 2);
+  const requestedMinWidth = isPositiveFinite(options?.minWidth) ? options.minWidth : MODEL_DROPDOWN_MIN_WIDTH_PX;
+  const clampedMinWidth = Math.max(0, Math.min(requestedMinWidth, horizontalLimit));
+  const preferredWidth = isPositiveFinite(options?.preferredWidth)
+    ? Math.min(options.preferredWidth, horizontalLimit)
+    : undefined;
 
   const style: JSX.CSSProperties = {
     position: 'fixed',
     zIndex: 2147483646,
     width: 'max-content',
-    minWidth: `${Math.max(0, Math.min(MODEL_DROPDOWN_MIN_WIDTH_PX, effectiveWidth - MODEL_DROPDOWN_HORIZONTAL_INSET_PX * 2))}px`,
+    minWidth: `${Math.round(clampedMinWidth)}px`,
     maxHeight,
     overflowY: 'auto',
     overscrollBehavior: 'contain',
@@ -177,18 +197,30 @@ export function computeModelDropdownStyle(
     style.top = 'auto';
   }
 
-  const horizontalLimit = Math.max(0, effectiveWidth - MODEL_DROPDOWN_HORIZONTAL_INSET_PX * 2);
   if (isRightHalf) {
-    const rightOffset = Math.max(MODEL_DROPDOWN_HORIZONTAL_INSET_PX, layoutWidth - rect.right);
-    const maxAvailableWidth = Math.max(
+    const minRightInset = MODEL_DROPDOWN_HORIZONTAL_INSET_PX + Math.max(0, layoutWidth - effectiveWidth);
+    const idealRightOffset = Math.max(minRightInset, layoutWidth - rect.right);
+    const maxShiftRightOffset = preferredWidth !== undefined
+      ? Math.max(minRightInset, layoutWidth - targetRightBound(effectiveWidth, preferredWidth))
+      : idealRightOffset;
+    const rightOffset = preferredWidth !== undefined
+      ? Math.min(idealRightOffset, maxShiftRightOffset)
+      : idealRightOffset;
+    const availableLeftWidth = Math.max(
       MODEL_DROPDOWN_FALLBACK_MAX_WIDTH_PX,
-      rect.right - MODEL_DROPDOWN_HORIZONTAL_INSET_PX,
+      layoutWidth - rightOffset - MODEL_DROPDOWN_HORIZONTAL_INSET_PX,
     );
     style.right = `${Math.round(rightOffset)}px`;
     style.left = 'auto';
-    style.maxWidth = `${Math.round(Math.min(maxAvailableWidth, horizontalLimit))}px`;
+    style.maxWidth = `${Math.round(Math.min(availableLeftWidth, horizontalLimit))}px`;
   } else {
-    const leftOffset = Math.max(MODEL_DROPDOWN_HORIZONTAL_INSET_PX, rect.left);
+    const idealLeftOffset = Math.max(MODEL_DROPDOWN_HORIZONTAL_INSET_PX, rect.left);
+    const maxShiftLeftOffset = preferredWidth !== undefined
+      ? Math.max(MODEL_DROPDOWN_HORIZONTAL_INSET_PX, effectiveWidth - preferredWidth - MODEL_DROPDOWN_HORIZONTAL_INSET_PX)
+      : idealLeftOffset;
+    const leftOffset = preferredWidth !== undefined
+      ? Math.min(idealLeftOffset, maxShiftLeftOffset)
+      : idealLeftOffset;
     const maxAvailableWidth = Math.max(
       MODEL_DROPDOWN_FALLBACK_MAX_WIDTH_PX,
       effectiveWidth - leftOffset - MODEL_DROPDOWN_HORIZONTAL_INSET_PX,
@@ -199,4 +231,11 @@ export function computeModelDropdownStyle(
   }
 
   return style;
+}
+
+function targetRightBound(effectiveWidth: number, preferredWidth: number): number {
+  return Math.min(
+    effectiveWidth - MODEL_DROPDOWN_HORIZONTAL_INSET_PX,
+    MODEL_DROPDOWN_HORIZONTAL_INSET_PX + preferredWidth,
+  );
 }

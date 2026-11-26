@@ -10792,6 +10792,24 @@ function InternalMainApp() {
                     session.name === s.name ? { ...session, transportConfig } : session
                   )));
                 }}
+                onSessionSaved={(fields) => {
+                  setSessions((prev) => prev.map((session) => {
+                    if (session.name !== s.name) return session;
+                    const updated = { ...session };
+                    if (fields.type !== undefined) {
+                      updated.agentType = fields.type;
+                      updated.runtimeType = getSessionRuntimeType(fields.type);
+                      if (fields.type !== session.agentType) delete updated.qwenModel;
+                    }
+                    if (fields.requestedModel === null) delete updated.requestedModel;
+                    else if (fields.requestedModel !== undefined) updated.requestedModel = fields.requestedModel;
+                    if (fields.activeModel === null) delete updated.activeModel;
+                    else if (fields.activeModel !== undefined) updated.activeModel = fields.activeModel;
+                    if (fields.modelDisplay === null) delete updated.modelDisplay;
+                    else if (fields.modelDisplay !== undefined) updated.modelDisplay = fields.modelDisplay;
+                    return updated;
+                  }));
+                }}
                 onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
                 onOpenLocalWebPreview={openLocalWebPreviewFromChat}
                 onCloudDocClick={openCloudDocPreview}
@@ -11904,6 +11922,13 @@ function InternalMainApp() {
               onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
+              onSessionSaved={(fields) => updateSubLocal(sub.id, {
+                type: fields.type !== undefined ? fields.type : undefined,
+                runtimeType: fields.type !== undefined ? getSessionRuntimeType(fields.type) : undefined,
+                requestedModel: fields.requestedModel,
+                activeModel: fields.activeModel,
+                modelDisplay: fields.modelDisplay,
+              })}
               onLiveSessionStateChange={(liveState) => updateSubLocal(sub.id, {
                 state: liveState,
                 ...(liveState === 'idle'

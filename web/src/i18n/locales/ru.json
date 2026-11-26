@@ -1119,6 +1119,17 @@
       "loading": "Загрузка доступных моделей…",
       "unsupported": "Этот тип сеанса не поддерживает смену модели."
     },
+    "quickSwitch": {
+      "sdkTitle": "SDK",
+      "modelsTitle": "Модели",
+      "handoffHint": "Смена SDK с передачей контекста",
+      "useDefaultModel": "Переключить на модель по умолчанию",
+      "loadingModels": "Загрузка моделей…",
+      "noModels": "Список моделей недоступен — по умолчанию",
+      "noModelsCurrent": "Используется модель SDK по умолчанию",
+      "switching": "Переключение…",
+      "switchFailed": "Не удалось переключить SDK: {{error}}"
+    },
     "capacity_retrying": "Модель перегружена — автоматический повтор (каждые ≤15 с)",
     "state_error": "Ошибка сеанса",
     "state_error_detail": "Ошибка: {{error}}"

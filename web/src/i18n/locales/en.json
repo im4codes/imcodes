@@ -1119,6 +1119,17 @@
       "loading": "Loading available models…",
       "unsupported": "This session type does not support model switching."
     },
+    "quickSwitch": {
+      "sdkTitle": "SDK",
+      "modelsTitle": "Models",
+      "handoffHint": "Switch SDK & handoff",
+      "useDefaultModel": "Switch with default",
+      "loadingModels": "Loading models…",
+      "noModels": "No model list — switch with default",
+      "noModelsCurrent": "Using SDK default model",
+      "switching": "Switching…",
+      "switchFailed": "Failed to switch SDK: {{error}}"
+    },
     "capacity_retrying": "Model at capacity — retrying automatically (every ≤15 s)",
     "state_error": "Session error",
     "state_error_detail": "Error: {{error}}"

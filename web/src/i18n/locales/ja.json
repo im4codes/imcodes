@@ -1119,6 +1119,17 @@
       "loading": "利用可能なモデルを読み込み中…",
       "unsupported": "このセッション種別はモデル切り替えに対応していません。"
     },
+    "quickSwitch": {
+      "sdkTitle": "SDK",
+      "modelsTitle": "モデル",
+      "handoffHint": "SDK を切り替えて引き継ぐ",
+      "useDefaultModel": "デフォルトモデルで切替",
+      "loadingModels": "モデルを読み込み中…",
+      "noModels": "モデル一覧なし — デフォルトで切替",
+      "noModelsCurrent": "SDK デフォルトモデルを使用中",
+      "switching": "切り替え中…",
+      "switchFailed": "SDK の切り替えに失敗しました: {{error}}"
+    },
     "capacity_retrying": "モデルが混雑しています。自動で再試行中（15 秒以内の間隔）",
     "state_error": "セッションエラー",
     "state_error_detail": "エラー: {{error}}"

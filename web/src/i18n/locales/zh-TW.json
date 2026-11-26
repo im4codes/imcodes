@@ -1119,6 +1119,17 @@
       "loading": "正在載入可用模型…",
       "unsupported": "此工作階段類型不支援切換模型。"
     },
+    "quickSwitch": {
+      "sdkTitle": "SDK",
+      "modelsTitle": "模型",
+      "handoffHint": "切換 SDK 並交接上下文",
+      "useDefaultModel": "使用預設模型切換",
+      "loadingModels": "正在載入模型…",
+      "noModels": "無模型列表 — 使用預設切換",
+      "noModelsCurrent": "目前使用 SDK 預設模型",
+      "switching": "切換中…",
+      "switchFailed": "切換 SDK 失敗：{{error}}"
+    },
     "capacity_retrying": "模型容量已滿，正在自動重試（間隔不超過 15 秒）",
     "state_error": "工作階段錯誤",
     "state_error_detail": "錯誤：{{error}}"

@@ -1119,6 +1119,17 @@
       "loading": "Cargando modelos disponibles…",
       "unsupported": "Este tipo de sesión no permite cambiar el modelo."
     },
+    "quickSwitch": {
+      "sdkTitle": "SDK",
+      "modelsTitle": "Modelos",
+      "handoffHint": "Cambiar SDK con handoff",
+      "useDefaultModel": "Cambiar con el predeterminado",
+      "loadingModels": "Cargando modelos…",
+      "noModels": "Sin lista de modelos — usar predeterminado",
+      "noModelsCurrent": "Usando modelo predeterminado del SDK",
+      "switching": "Cambiando…",
+      "switchFailed": "Error al cambiar de SDK: {{error}}"
+    },
     "capacity_retrying": "Modelo al límite de capacidad: reintentando automáticamente (cada ≤15 s)",
     "state_error": "Error de sesión",
     "state_error_detail": "Error: {{error}}"

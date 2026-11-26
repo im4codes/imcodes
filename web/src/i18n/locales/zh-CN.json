@@ -1119,6 +1119,17 @@
       "loading": "正在加载可用模型…",
       "unsupported": "此会话类型不支持切换模型。"
     },
+    "quickSwitch": {
+      "sdkTitle": "SDK",
+      "modelsTitle": "模型",
+      "handoffHint": "切换并 Handoff",
+      "useDefaultModel": "用默认模型切换",
+      "loadingModels": "正在加载模型…",
+      "noModels": "无模型列表，可按默认模型切换",
+      "noModelsCurrent": "使用当前 SDK 默认模型",
+      "switching": "切换中…",
+      "switchFailed": "切换 SDK 失败：{{error}}"
+    },
     "capacity_retrying": "模型容量已满，正在自动重试（间隔不超过 15 秒）",
     "state_error": "会话错误",
     "state_error_detail": "错误：{{error}}"

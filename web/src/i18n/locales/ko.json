@@ -1119,6 +1119,17 @@
       "loading": "사용 가능한 모델을 불러오는 중…",
       "unsupported": "이 세션 유형은 모델 전환을 지원하지 않습니다."
     },
+    "quickSwitch": {
+      "sdkTitle": "SDK",
+      "modelsTitle": "모델",
+      "handoffHint": "SDK 전환 및 컨텍스트 핸드오프",
+      "useDefaultModel": "기본 모델로 전환",
+      "loadingModels": "모델 불러오는 중…",
+      "noModels": "모델 목록 없음 — 기본값으로 전환",
+      "noModelsCurrent": "SDK 기본 모델 사용 중",
+      "switching": "전환 중…",
+      "switchFailed": "SDK 전환 실패: {{error}}"
+    },
     "capacity_retrying": "모델 용량이 가득 찼습니다. 자동으로 재시도 중 (15초 이내 간격)",
     "state_error": "세션 오류",
     "state_error_detail": "오류: {{error}}"
