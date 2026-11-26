@@ -20,6 +20,7 @@ import {
   RETIRED_SUPERVISION_MCP_TOOL_SET,
 } from '../../shared/memory-mcp-contracts.js';
 import logger from '../util/logger.js';
+import { IMCODES_MEMORY_MCP_BACKEND_ENV } from './mcp-stdio-lifecycle.js';
 
 export type RegisteredMcpToolCatalog = ReadonlyMap<string, RegisteredTool>;
 
@@ -258,7 +259,9 @@ export function registerMcpToolDiscovery(
       ? `${MCP_TOOL_GROUP_QUERY_PREFIX}${exactGroup.id}`
       : (exactToolName ?? null);
     const attachPublishedMeta = <T extends { [key: string]: unknown }>(payload: T): T => {
-      if (!shouldPublish || staticFullCatalog) return payload;
+      if (!shouldPublish || staticFullCatalog || process.env[IMCODES_MEMORY_MCP_BACKEND_ENV] !== '1') {
+        return payload;
+      }
       const existingMeta = payload._meta && typeof payload._meta === 'object' && !Array.isArray(payload._meta)
         ? (payload._meta as Record<string, unknown>)
         : {};
