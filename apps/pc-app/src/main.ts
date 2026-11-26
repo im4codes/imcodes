@@ -214,6 +214,7 @@ export async function startPcApp(): Promise<void> {
     createOverlayWindow: (opts) => new BrowserWindow(opts),
     getOverlayWorkArea: () => screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea,
     onStateChanged: () => pcShell.rebuildMenu(),
+    log: (message) => pcShell.voice.appendLog(message),
     onAccessibilityDenied: (text) => {
       if (text) {
         clipboard.writeText(text);

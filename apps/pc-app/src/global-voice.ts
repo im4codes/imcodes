@@ -91,6 +91,7 @@ export interface PcAppGlobalVoiceDeps {
   onError?: (code: string, message?: string) => void;
   onAccessibilityDenied?: (text: string) => void;
   onUipiDenied?: (text: string) => void;
+  log?: (message: string) => void;
   now?: () => number;
 }
 
@@ -539,6 +540,9 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
     const bin = deps.getSpeechHelperPath();
     if (!bin) return;
     const runPaste = deps.runPasteHelper ?? defaultRunPasteHelper;
+    const startedAt = currentNow();
+    const formatMeta = (): string =>
+      `len=${trimmed.length} enter=${sendEnter ? 1 : 0} elapsedMs=${Math.max(0, currentNow() - startedAt)}`;
     try {
       const pasteArgs = sendEnter ? ['paste', '--stdin', '--enter'] : ['paste', '--stdin'];
       const stdout = await runPaste(bin, pasteArgs, trimmed);
@@ -547,6 +551,7 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
         try {
           const parsed = JSON.parse(line) as { type?: string; code?: string; message?: string };
           if (parsed.type === 'error' && parsed.code) {
+            deps.log?.(`global-voice paste error code=${parsed.code} ${formatMeta()}`);
             if (parsed.code === 'accessibility_denied') {
               deps.onAccessibilityDenied?.(trimmed);
             } else if (parsed.code === 'uipi_elevated_target') {
@@ -557,12 +562,19 @@ export function createPcAppGlobalVoice(deps: PcAppGlobalVoiceDeps): PcAppGlobalV
               }
             }
             deps.onError?.(parsed.code, parsed.message);
+            return;
+          }
+          if (parsed.type === 'ok') {
+            deps.log?.(`global-voice paste ok ${formatMeta()}`);
+            return;
           }
         } catch {
-          // Ignore non-JSON paste output.
+          // Fall through to log non-JSON paste output.
         }
       }
+      deps.log?.(`global-voice paste unexpected_output ${formatMeta()}`);
     } catch (err) {
+      deps.log?.(`global-voice paste failed code=paste_failed ${formatMeta()}`);
       deps.onError?.('paste_failed', err instanceof Error ? err.message : String(err));
     }
   };

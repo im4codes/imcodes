@@ -547,4 +547,88 @@ describe('createPcAppGlobalVoice', () => {
     await controller.dispose();
     expect(destroySpy).toHaveBeenCalled();
   });
+
+  it('logs sanitized paste outcomes without leaking dictated text and preserves accessibility_denied clipboard fallback', async () => {
+    const userDataDir = makeTempDir('imcodes-gv-log-');
+    const hotkey = createFakeHelper();
+    const overlay = createFakeHelper();
+    const logs: string[] = [];
+    const onAccessibilityDenied = vi.fn();
+    const onError = vi.fn();
+    let pasteResponse: () => Promise<string> = async () => '{"type":"ok","length":17,"trusted":true}\n';
+
+    let capturedOnEvent: ((event: PcAppVoiceEvent) => void) | undefined;
+    const startListening = vi.fn(async (opts?: { onEvent?: (e: PcAppVoiceEvent) => void }) => {
+      capturedOnEvent = opts?.onEvent;
+      return { ok: true };
+    });
+    const stopListening = vi.fn(async () => {
+      capturedOnEvent?.({ type: 'end' });
+    });
+
+    let clock = 10_000;
+    const controller = createPcAppGlobalVoice({
+      platform: 'darwin',
+      userDataDir,
+      iconPath: null,
+      getLocale: () => 'zh-CN',
+      getMainWindow: () => ({ isDestroyed: () => false, isFocused: () => false }),
+      getSpeechHelperPath: () => '/usr/local/bin/imcodes-speech',
+      voice: { startListening, stopListening },
+      spawnHelper: (_bin, args) => (args[0] === 'hotkey' ? hotkey.proc : overlay.proc),
+      runPasteHelper: async () => {
+        clock += 155;
+        return pasteResponse();
+      },
+      log: (msg) => logs.push(msg),
+      onAccessibilityDenied,
+      onError,
+      now: () => clock,
+    });
+
+    controller.start();
+
+    // 1. Successful paste logs sanitized ok summary with length, enter=0, and elapsedMs
+    hotkey.stdout.write('{"type":"double_tap"}\n');
+    await new Promise((r) => setTimeout(r, 10));
+    capturedOnEvent?.({ type: 'start' });
+    capturedOnEvent?.({ type: 'result', text: 'SECRET_OK_DICTATION', isFinal: true });
+    hotkey.stdout.write('{"type":"single_tap"}\n');
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(logs[0]).toBe('global-voice paste ok len=19 enter=0 elapsedMs=155');
+    expect(logs.join('\n')).not.toContain('SECRET_OK_DICTATION');
+    expect(onAccessibilityDenied).not.toHaveBeenCalled();
+
+    // 2. accessibility_denied triggers clipboard fallback and logs error code without raw text
+    pasteResponse = async () => '{"type":"error","code":"accessibility_denied"}\n';
+    hotkey.stdout.write('{"type":"double_tap"}\n');
+    await new Promise((r) => setTimeout(r, 10));
+    capturedOnEvent?.({ type: 'start' });
+    capturedOnEvent?.({ type: 'result', text: 'SECRET_DENIED_TEXT', isFinal: true });
+    hotkey.stdout.write('{"type":"double_tap"}\n');
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(onAccessibilityDenied).toHaveBeenCalledWith('SECRET_DENIED_TEXT');
+    expect(onError).toHaveBeenCalledWith('accessibility_denied', undefined);
+    expect(logs[1]).toBe('global-voice paste error code=accessibility_denied len=18 enter=1 elapsedMs=155');
+    expect(logs.join('\n')).not.toContain('SECRET_DENIED_TEXT');
+
+    // 3. Helper failure logs paste_failed without raw text
+    pasteResponse = async () => {
+      throw new Error('helper exited 1');
+    };
+    hotkey.stdout.write('{"type":"double_tap"}\n');
+    await new Promise((r) => setTimeout(r, 10));
+    capturedOnEvent?.({ type: 'start' });
+    capturedOnEvent?.({ type: 'result', text: 'SECRET_THROW_TEXT', isFinal: true });
+    hotkey.stdout.write('{"type":"single_tap"}\n');
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(onError).toHaveBeenCalledWith('paste_failed', 'helper exited 1');
+    expect(logs[2]).toBe('global-voice paste failed code=paste_failed len=17 enter=0 elapsedMs=155');
+    expect(logs.join('\n')).not.toContain('SECRET_THROW_TEXT');
+
+    await controller.dispose();
+  });
 });

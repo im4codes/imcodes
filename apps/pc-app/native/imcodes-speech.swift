@@ -1318,7 +1318,16 @@ func runPasteCommand(args: [String]) -> Int32 {
 
   let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
   let trusted = AXIsProcessTrustedWithOptions(options)
+  var postTrusted = CGPreflightPostEventAccess()
+  if !postTrusted && prompt {
+    _ = CGRequestPostEventAccess()
+    postTrusted = CGPreflightPostEventAccess()
+  }
   if !trusted {
+    emitJson(["type": "error", "code": "accessibility_denied"])
+    return 1
+  }
+  if !postTrusted {
     emitJson(["type": "error", "code": "accessibility_denied"])
     return 1
   }
@@ -1341,6 +1350,10 @@ func runPasteCommand(args: [String]) -> Int32 {
     return 0
   }
 
+  // Keep the helper alive briefly after posting CGEvents so WindowServer can
+  // complete async TCCAccessRequest() against our live Mach connection before exit.
+  let pastePostEventSettleMicroseconds: useconds_t = 150_000
+  var postedEvent = false
   var offset = 0
   let chunkSize = 16
   while offset < utf16.count {
@@ -1357,6 +1370,7 @@ func runPasteCommand(args: [String]) -> Int32 {
       }
       down.post(tap: .cghidEventTap)
       up.post(tap: .cghidEventTap)
+      postedEvent = true
     }
     offset = end
     if offset < utf16.count {
@@ -1374,7 +1388,12 @@ func runPasteCommand(args: [String]) -> Int32 {
       retUp.flags = []
       retDown.post(tap: .cghidEventTap)
       retUp.post(tap: .cghidEventTap)
+      postedEvent = true
     }
+  }
+
+  if postedEvent {
+    usleep(pastePostEventSettleMicroseconds)
   }
 
   emitJson(["type": "ok", "length": utf16.count, "trusted": true])

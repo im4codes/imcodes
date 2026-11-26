@@ -1180,6 +1180,8 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     const pasteStart = swiftSrc.indexOf('func runPasteCommand(args: [String])');
     const pasteBody = swiftSrc.slice(pasteStart, swiftSrc.indexOf('private extension Int32', pasteStart));
     expect(pasteBody).toContain('let trusted = AXIsProcessTrustedWithOptions(options)');
+    expect(pasteBody).toContain('var postTrusted = CGPreflightPostEventAccess()');
+    expect(pasteBody).toContain('CGRequestPostEventAccess()');
     expect(pasteBody).not.toContain('CGEventSource(stateID: .hidSystemState)');
     expect(pasteBody).toContain('CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)');
     expect(pasteBody).toContain('down.flags = []');
@@ -1189,7 +1191,14 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     expect(pasteBody).toContain('retUp.flags = []');
     expect(pasteBody).toContain('waitForModifierRelease()');
     expect(pasteBody).toContain('if !trusted {');
+    expect(pasteBody).toContain('if !postTrusted {');
     expect(pasteBody).toContain('emitJson(["type": "error", "code": "accessibility_denied"])');
+    expect(pasteBody).toContain('let pastePostEventSettleMicroseconds: useconds_t = 150_000');
+    expect(pasteBody).toContain('if postedEvent {\n    usleep(pastePostEventSettleMicroseconds)\n  }');
+    const emptyGuardIdx = pasteBody.indexOf('if utf16.isEmpty && !sendEnter {');
+    const postSettleIdx = pasteBody.indexOf('if postedEvent {');
+    expect(emptyGuardIdx).toBeGreaterThan(-1);
+    expect(postSettleIdx).toBeGreaterThan(emptyGuardIdx);
     expect(pasteBody).toContain('emitJson(["type": "ok", "length": utf16.count, "trusted": true])');
     expect(pasteBody).not.toContain('"trusted": trusted');
 

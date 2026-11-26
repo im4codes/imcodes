@@ -2718,6 +2718,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
   return {
     isTrustedSender,
+    appendLog: appendVoiceLog,
     getSpeechHelperPath: resolveSpeechHelperPath,
     getPermissions,
     requestPermissions,
