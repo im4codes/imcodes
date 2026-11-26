@@ -9,6 +9,7 @@ import {
   beginCrossVendorHandoffState,
 } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff, sourceConversationKey } from '../../src/daemon/cross-vendor-handoff.js';
+import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
 import * as tokenizer from '../../src/context/tokenizer.js';
 
@@ -246,6 +247,86 @@ describe('reported lost provider-switch context counterexamples', () => {
     expect(countMock.mock.calls.length).toBeGreaterThanOrEqual(1);
     expect(countMock.mock.calls.length).toBeLessThanOrEqual(2);
     expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it('bounds and delivers a valid pack when countTokensAsync stalls past remaining timeout budget (NFKC byte ceiling)', async () => {
+    resetMetricsForTests();
+    const countMock = vi.mocked(tokenizer.countTokensAsync);
+    const prevImpl = countMock.getMockImplementation();
+    // Stall countTokensAsync beyond the total timeout budget, using an unspaced
+    // ASCII payload that countTokensFallback alone would severely underestimate.
+    const unspacedText = 'A'.repeat(10_000);
+    countMock.mockImplementation(() => new Promise<number>(() => {}));
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([
+      event('user.message', { text: `MARKER_UNSPACED ${unspacedText}` }, 1, 10),
+    ]);
+    try {
+      const pack = await resolveCrossVendorHandoffPack(
+        buildCrossVendorHandoffPack(
+          record('claude-code-sdk'),
+          { epoch: 7, seq: 1, ts: 10 },
+          'codex-sdk',
+          'transport',
+          { maxTokens: 300, timeoutMs: 250 },
+        ),
+        250,
+      );
+      expect(pack).toBeDefined();
+      expect(pack!.tokenCount).toBeLessThanOrEqual(300);
+      expect(Buffer.byteLength(pack!.text.normalize('NFKC'), 'utf8')).toBeLessThanOrEqual(300);
+      expect(pack!.text).toContain('MARKER_UNSPACED');
+      expect(getCounter('handoff.build_timeout', {})).toBe(0);
+    } finally {
+      if (prevImpl) countMock.mockImplementation(prevImpl);
+    }
+  });
+
+  it('shares timeoutMs budget with timeline reads so stalled countTokensAsync still resolves before outer timeout', async () => {
+    resetMetricsForTests();
+    const countMock = vi.mocked(tokenizer.countTokensAsync);
+    const prevImpl = countMock.getMockImplementation();
+    countMock.mockImplementation(() => new Promise<number>(() => {}));
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve([
+        event('user.message', { text: 'SLOW_TIMELINE_THEN_STALLED_TOKENIZER' }, 1, 10),
+      ]), 180)),
+    );
+    try {
+      const started = Date.now();
+      const pack = await resolveCrossVendorHandoffPack(
+        buildCrossVendorHandoffPack(
+          record('codex-sdk'),
+          { epoch: 7, seq: 1, ts: 10 },
+          'claude-code-sdk',
+          'transport',
+          { maxTokens: 500, timeoutMs: 260 },
+        ),
+        260,
+      );
+      expect(pack).toBeDefined();
+      expect(pack!.text).toContain('SLOW_TIMELINE_THEN_STALLED_TOKENIZER');
+      expect(Date.now() - started).toBeLessThan(350);
+      expect(getCounter('handoff.build_timeout', {})).toBe(0);
+    } finally {
+      if (prevImpl) countMock.mockImplementation(prevImpl);
+    }
+  });
+
+  it('still triggers handoff.build_timeout when timeline reading itself stalls beyond timeoutMs', async () => {
+    resetMetricsForTests();
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockImplementation(() => new Promise(() => {}));
+    const pack = await resolveCrossVendorHandoffPack(
+      buildCrossVendorHandoffPack(
+        record('codex-sdk'),
+        { epoch: 7, seq: 1, ts: 10 },
+        'claude-code-sdk',
+        'transport',
+        { maxTokens: 500, timeoutMs: 250 },
+      ),
+      80,
+    );
+    expect(pack).toBeUndefined();
+    expect(getCounter('handoff.build_timeout', {})).toBe(1);
   });
 
   it('includes concise redacted active/recent task-pair state and excludes daemon reset notices', async () => {

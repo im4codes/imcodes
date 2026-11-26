@@ -75,25 +75,49 @@ export function sourceConversationKey(record: Pick<SessionRecord, 'agentType' | 
   return record.providerResumeId ?? record.providerSessionId ?? record.ccSessionId ?? record.codexSessionId;
 }
 
+function countTokensConservativeFallback(text: string): number {
+  if (!text) return 0;
+  // Byte-level BPE tokenizers encode NFKC UTF-8 bytes, so byte length is a safe
+  // upper bound even on long unspaced ASCII strings that countTokensFallback
+  // would treat as a single word.
+  return Math.max(countTokensFallback(text), Buffer.byteLength(text.normalize('NFKC'), 'utf8'));
+}
+
 export function resolveCrossVendorHandoffPack(
   build: Promise<CrossVendorHandoffPack | undefined>,
   timeoutMs: number,
 ): Promise<CrossVendorHandoffPack | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  const guardedBuild = build.then((pack) => {
+    settled = true;
+    return pack;
+  });
+  // Ensure late rejections from a timed-out build cannot surface unhandled.
+  void guardedBuild.catch(() => {});
   return Promise.race([
-    build,
-    new Promise<undefined>((resolve) => setTimeout(() => {
-      incrementCounter('handoff.build_timeout', {});
-      resolve(undefined);
-    }, Math.max(1, timeoutMs))),
-  ]).catch((err) => {
+    guardedBuild,
+    new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => {
+        if (!settled) incrementCounter('handoff.build_timeout', {});
+        resolve(undefined);
+      }, Math.max(1, timeoutMs));
+    }),
+  ]).catch(() => {
+    settled = true;
     incrementCounter('handoff.build_failed', {});
     return undefined;
+  }).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
   });
 }
 
 export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff: CrossVendorHandoffCutoff, targetAgentType: string, targetRuntimeType: 'process' | 'transport', inputConfig?: Partial<CrossVendorHandoffConfig>, _afterCutoff?: CrossVendorHandoffCutoff): Promise<CrossVendorHandoffPack | undefined> {
   const config = normalizeCrossVendorHandoffConfig(inputConfig);
   if (!config.enabled) return undefined;
+  const buildStartedAt = Date.now();
+  const tokenizerReserveMs = Math.min(250, Math.max(20, Math.floor(config.timeoutMs * 0.15)));
+  const tokenizerDeadlineAt = buildStartedAt + Math.max(1, config.timeoutMs - tokenizerReserveMs);
   let messages;
   try {
     messages = await readSessionTextMessages(record.name, config.recentTurns, cutoff, true, { excludeDaemonNotices: true });
@@ -126,9 +150,14 @@ export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff:
   let includeTasks = taskLines.length > 0;
   let maxTextChars = Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.maxTextChars, Math.max(0, ...selectedMessages.map((message) => message.text.length)));
 
-  const trimSyncToTarget = (renderFn: () => string, currentTokens: number, targetBudget: number): { text: string; tokens: number } => {
-    let text = renderFn();
-    let est = currentTokens;
+  const trimSyncToTarget = (
+    initialText: string,
+    initialTokens: number,
+    targetBudget: number,
+    countFn: (value: string) => number,
+  ): { text: string; tokens: number } => {
+    let text = initialText;
+    let est = initialTokens;
     while (est > targetBudget && selectedMessages.length > 1) {
       const dropCount = Math.min(
         selectedMessages.length - 1,
@@ -136,58 +165,126 @@ export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff:
       );
       selectedMessages = selectedMessages.slice(dropCount);
       text = render(selectedMessages, maxTextChars, includeTasks);
-      est = countTokensFallback(text);
+      est = countFn(text);
     }
     if (est > targetBudget && includeTasks) {
       includeTasks = false;
       text = render(selectedMessages, maxTextChars, includeTasks);
-      est = countTokensFallback(text);
+      est = countFn(text);
     }
     if (est > targetBudget && maxTextChars > 0) {
       const ratio = (targetBudget / est) * 0.85;
       maxTextChars = Math.max(0, Math.floor(maxTextChars * ratio));
       text = render(selectedMessages, maxTextChars, includeTasks);
-      est = countTokensFallback(text);
+      est = countFn(text);
+    }
+    if (est > targetBudget && text.length > 1) {
+      const ratio = (targetBudget / est) * 0.85;
+      text = text.slice(0, Math.max(1, Math.floor(text.length * ratio)));
+      est = countFn(text);
+      if (est > targetBudget && text.length > 1) {
+        let lo = 1;
+        let hi = text.length;
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi) / 2);
+          const candidate = text.slice(0, mid);
+          if (countFn(candidate) <= targetBudget) lo = mid;
+          else hi = mid - 1;
+        }
+        // Avoid slicing cleanly between a UTF-16 surrogate pair when shrinking.
+        if (lo > 1 && lo < text.length) {
+          const code = text.charCodeAt(lo - 1);
+          if (code >= 0xd800 && code <= 0xdbff) lo -= 1;
+        }
+        text = text.slice(0, Math.max(1, lo));
+        est = countFn(text);
+      }
     }
     return { text, tokens: est };
+  };
+
+  const measureTokensWithinBudget = async (text: string): Promise<{ count: number; exact: boolean }> => {
+    const remainingMs = tokenizerDeadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      incrementCounter('handoff.tokenizer_fallback', {});
+      return { count: countTokensConservativeFallback(text), exact: false };
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const tokenPromise = Promise.resolve().then(() => countTokensAsync(text));
+    // Prevent a stalled worker that rejects late from raising an unhandled rejection.
+    void tokenPromise.catch(() => {});
+    try {
+      const exactCount = await Promise.race<number | null>([
+        tokenPromise.then((count) => {
+          settled = true;
+          return count;
+        }),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => {
+            if (!settled) resolve(null);
+          }, remainingMs);
+        }),
+      ]);
+      if (exactCount !== null) {
+        return { count: exactCount, exact: true };
+      }
+    } catch {
+      // Fall through to conservative fallback when tokenizer worker fails.
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    incrementCounter('handoff.tokenizer_fallback', {});
+    return { count: countTokensConservativeFallback(text), exact: false };
   };
 
   let bounded = render(selectedMessages, maxTextChars, includeTasks);
   let estTokens = countTokensFallback(bounded);
   if (estTokens > maxTokens) {
-    ({ text: bounded, tokens: estTokens } = trimSyncToTarget(() => bounded, estTokens, maxTokens));
-    if (estTokens > maxTokens && bounded.length > 1) {
-      const ratio = (maxTokens / estTokens) * 0.85;
-      bounded = bounded.slice(0, Math.max(1, Math.floor(bounded.length * ratio)));
-    }
+    ({ text: bounded, tokens: estTokens } = trimSyncToTarget(bounded, estTokens, maxTokens, countTokensFallback));
   }
 
   // Keep tokenizer worker IPC bounded to 1 call in normal cases (<= 3 on rare
-  // dense-token divergence) so large histories never stall or hit timeoutMs.
-  let tokenCount = await countTokensAsync(bounded);
-  for (let attempt = 0; tokenCount > maxTokens && bounded.length > 1 && attempt < 3; attempt += 1) {
-    if (selectedMessages.length > 1) {
-      const dropCount = Math.min(
-        selectedMessages.length - 1,
-        Math.max(1, Math.ceil(selectedMessages.length * (1 - (maxTokens * 0.9) / tokenCount))),
-      );
-      selectedMessages = selectedMessages.slice(dropCount);
-      bounded = render(selectedMessages, maxTextChars, includeTasks);
-    } else if (includeTasks) {
-      includeTasks = false;
-      bounded = render(selectedMessages, maxTextChars, includeTasks);
-    } else {
-      const ratio = (maxTokens / tokenCount) * 0.85;
-      const nextTextChars = Math.floor(maxTextChars * ratio);
-      if (attempt === 0 && nextTextChars > 0 && nextTextChars < maxTextChars) {
-        maxTextChars = nextTextChars;
+  // dense-token divergence) and share total timeoutMs budget so slow worker
+  // startup never drops an already-bounded pack.
+  let measured = await measureTokensWithinBudget(bounded);
+  let tokenCount = measured.count;
+  if (!measured.exact) {
+    if (tokenCount > maxTokens) {
+      ({ text: bounded, tokens: tokenCount } = trimSyncToTarget(bounded, tokenCount, maxTokens, countTokensConservativeFallback));
+    }
+  } else {
+    for (let attempt = 0; tokenCount > maxTokens && bounded.length > 1 && attempt < 3; attempt += 1) {
+      if (selectedMessages.length > 1) {
+        const dropCount = Math.min(
+          selectedMessages.length - 1,
+          Math.max(1, Math.ceil(selectedMessages.length * (1 - (maxTokens * 0.9) / tokenCount))),
+        );
+        selectedMessages = selectedMessages.slice(dropCount);
+        bounded = render(selectedMessages, maxTextChars, includeTasks);
+      } else if (includeTasks) {
+        includeTasks = false;
         bounded = render(selectedMessages, maxTextChars, includeTasks);
       } else {
-        maxTextChars = 0;
-        bounded = bounded.slice(0, Math.max(1, Math.floor(bounded.length * ratio)));
+        const ratio = (maxTokens / tokenCount) * 0.85;
+        const nextTextChars = Math.floor(maxTextChars * ratio);
+        if (attempt === 0 && nextTextChars > 0 && nextTextChars < maxTextChars) {
+          maxTextChars = nextTextChars;
+          bounded = render(selectedMessages, maxTextChars, includeTasks);
+        } else {
+          maxTextChars = 0;
+          bounded = bounded.slice(0, Math.max(1, Math.floor(bounded.length * ratio)));
+        }
+      }
+      measured = await measureTokensWithinBudget(bounded);
+      tokenCount = measured.count;
+      if (!measured.exact) {
+        if (tokenCount > maxTokens) {
+          ({ text: bounded, tokens: tokenCount } = trimSyncToTarget(bounded, tokenCount, maxTokens, countTokensConservativeFallback));
+        }
+        break;
       }
     }
-    tokenCount = await countTokensAsync(bounded);
   }
   return { text: bounded, sourceAgentType: record.agentType, sourceRuntimeType: record.runtimeType ?? 'process', sourceConversationKey: sourceConversationKey(record), cutoff, createdAt: Date.now(), tokenCount };
 }

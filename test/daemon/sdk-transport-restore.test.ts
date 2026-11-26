@@ -126,6 +126,9 @@ vi.mock('node:child_process', async (importOriginal) => {
           if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
             stdout.write(JSON.stringify({ id: msg.id, result: { status: 'unsubscribed' } }) + '\n');
           }
+          if (msg.method === 'mcpServer/tool/call' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({ id: msg.id, result: { content: [] } }) + '\n');
+          }
         }
         cb();
       },
@@ -207,6 +210,14 @@ vi.mock('../../src/daemon/transport-relay.js', () => ({
 vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
+
+vi.mock('../../src/context/tokenizer.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/context/tokenizer.js')>();
+  return {
+    ...actual,
+    countTokensAsync: vi.fn((...args: Parameters<typeof actual.countTokensAsync>) => actual.countTokensAsync(...args)),
+  };
+});
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: timelineEmitterEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
@@ -3679,6 +3690,97 @@ describe('sdk transport session restore', () => {
     runtime!.send('turn two');
     await settleCodexRun(name, 'start', 'turn two');
     expect(codexRunForSession(name, 'start')?.input).toBe('turn two');
+  });
+
+  it('delivers only the newest pack once across consecutive /handoff calls even when countTokensAsync stalls', async () => {
+    const tokenizerMod = await import('../../src/context/tokenizer.js');
+    const countMock = vi.mocked(tokenizerMod.countTokensAsync);
+    const actualMod = await vi.importActual<typeof import('../../src/context/tokenizer.js')>('../../src/context/tokenizer.js');
+    countMock.mockImplementation(() => new Promise<number>(() => {}));
+    try {
+      const name = 'deck_consecutive_stalled_tok_brain';
+      const record = {
+        name,
+        projectName: 'consecutivestalledtok',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/consecutive-stalled-tok',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-cx-stalled-tok',
+        codexSessionId: 'codex-thread-stalled-tok',
+        crossVendorHandoff: {
+          config: { timeoutMs: 250 },
+        },
+      };
+      mocks.store.set(name, record);
+
+      const firstSlow = deferred<any[]>();
+      timelineReadPreferredMock.mockResolvedValue([{
+        eventId: 'ev-stalled-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'STALE_FIRST_STALLED_HANDOFF' },
+      } as any]);
+      timelineReadCompletedTextTailMock
+        .mockImplementationOnce(() => firstSlow.promise)
+        .mockResolvedValueOnce([{
+          eventId: 'ev-stalled-2',
+          sessionId: name,
+          ts: 200,
+          seq: 2,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'LATEST_SECOND_STALLED_HANDOFF' },
+        } as any]);
+
+      await connectProvider('codex-sdk', {});
+      await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+      await relaunchSessionWithSettings(mocks.store.get(name) as any, { fresh: true, handoff: true });
+
+      firstSlow.resolve([{
+        eventId: 'ev-stalled-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'STALE_FIRST_STALLED_HANDOFF' },
+      }]);
+      const deadline = Date.now() + 2_000;
+      while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < deadline) {
+        await flush();
+      }
+      expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).toContain('LATEST_SECOND_STALLED_HANDOFF');
+      expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).not.toContain('STALE_FIRST_STALLED_HANDOFF');
+
+      mocks.codexRuns.length = 0;
+      const runtime = getTransportRuntime(name);
+      runtime!.send('turn one');
+      await settleCodexRun(name, 'start');
+      const firstTurnDeadline = Date.now() + 2_000;
+      while (!codexRunForSession(name, 'start')?.input.includes('turn one') && Date.now() < firstTurnDeadline) {
+        await flush();
+      }
+      expect(codexRunForSession(name, 'start')?.input).toContain('LATEST_SECOND_STALLED_HANDOFF');
+      expect(codexRunForSession(name, 'start')?.input).not.toContain('STALE_FIRST_STALLED_HANDOFF');
+    } finally {
+      countMock.mockImplementation((...args) => actualMod.countTokensAsync(...args));
+    }
   });
 
   it('preserves codex-sdk ccPreset and resolves getCodexPresetTransportConfig on /handoff with one-time pack delivery', async () => {
