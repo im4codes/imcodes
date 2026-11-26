@@ -1557,6 +1557,57 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     await handle!.stop(false);
   });
 
+  it('preserves prior non-empty partial across tag-only isFinal without borrowing across sessions', async () => {
+    setupFakeWebAudio({ sampleRate: 16_000 });
+    const delivered1: Array<{ text: string; isFinal: boolean }> = [];
+    let handle1: { stop: (abort?: boolean) => Promise<void> } | null = null;
+    const p1 = startRemoteVoiceSession({
+      targetDeviceId: 'dev-mac-1',
+      onResult: (text, isFinal) => delivered1.push({ text, isFinal }),
+      onCaptureStarted: (h) => { handle1 = h; },
+      fetchTicket: async () => ({ ticket: 'tkt-tag-final-1' }),
+    });
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.emitOpen();
+    const s1 = JSON.parse(ws1.sent[0]!) as { sessionId: string };
+    ws1.emitMessage({ type: 'voice.session.ready', sessionId: s1.sessionId });
+    await expect(p1).resolves.toMatchObject({ ok: true });
+
+    ws1.emitMessage({ type: 'voice.session.result', sessionId: s1.sessionId, text: '第一段', isFinal: false });
+    ws1.emitMessage({ type: 'voice.session.result', sessionId: s1.sessionId, text: 'language None<asr_text>', isFinal: true });
+    ws1.emitMessage({ type: 'voice.session.end', sessionId: s1.sessionId });
+    await handle1!.stop(false);
+
+    expect(delivered1).toEqual([
+      { text: '第一段', isFinal: false },
+      { text: '第一段', isFinal: true },
+    ]);
+    expect(delivered1.filter((item) => item.isFinal)).toHaveLength(1);
+
+    // Second session receiving only tag-only final must not reuse '第一段'
+    const delivered2: Array<{ text: string; isFinal: boolean }> = [];
+    let handle2: { stop: (abort?: boolean) => Promise<void> } | null = null;
+    const p2 = startRemoteVoiceSession({
+      targetDeviceId: 'dev-mac-1',
+      onResult: (text, isFinal) => delivered2.push({ text, isFinal }),
+      onCaptureStarted: (h) => { handle2 = h; },
+      fetchTicket: async () => ({ ticket: 'tkt-tag-final-2' }),
+    });
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.emitOpen();
+    const s2 = JSON.parse(ws2.sent[0]!) as { sessionId: string };
+    ws2.emitMessage({ type: 'voice.session.ready', sessionId: s2.sessionId });
+    await expect(p2).resolves.toMatchObject({ ok: true });
+
+    ws2.emitMessage({ type: 'voice.session.result', sessionId: s2.sessionId, text: 'language\r\nNone<asr_text>', isFinal: true });
+    ws2.emitMessage({ type: 'voice.session.end', sessionId: s2.sessionId });
+    await handle2!.stop(false);
+
+    expect(delivered2).toEqual([{ text: '', isFinal: true }]);
+  });
+
   it('prefers physical built-in mic over Bluetooth/AirPods via enumerateDevices without brittle exact constraint', async () => {
     expect(
       selectPreferredBuiltInMicDeviceId([

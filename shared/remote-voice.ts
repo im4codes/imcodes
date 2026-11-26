@@ -851,16 +851,36 @@ function collapseRunsForPeriod(chars: string[], period: number): { next: string[
   return { next: out, changed: true };
 }
 
-const ASR_CONTROL_TAG_RE = /(?:(?<![A-Za-z0-9_])language\s+[A-Za-z0-9_-]+\s*)?<asr_text>|<\|[^|>\r\n]{1,48}\|>/g;
+const ASR_CONTROL_TAG_RE = /(?:(?<![A-Za-z0-9_])language[ \t\r\n]+[A-Za-z0-9_-]+[ \t\r\n]*)?<asr_text>|<\|[^|>\r\n]{1,48}\|>/g;
 
 /**
  * Strip Qwen3-ASR control prefixes/tags (e.g. `language None<asr_text>`,
- * `language Chinese<asr_text>`, standalone `<asr_text>`, `<|endoftext|>`)
+ * `language\nChinese<asr_text>`, standalone `<asr_text>`, `<|endoftext|>`)
  * while leaving ordinary words such as `"the language model"` untouched.
  */
 export function stripAsrControlTags(text: string): string {
   if (!text) return '';
   return text.replace(ASR_CONTROL_TAG_RE, '').trim();
+}
+
+/**
+ * Sanitize an incoming ASR transcript result and preserve the session's last
+ * non-empty sanitized transcript when a terminal `isFinal` frame collapses to
+ * empty (e.g. `language None<asr_text>` or a pure repetition burst from an older helper).
+ */
+export function resolveSessionTranscriptResult(
+  rawText: string,
+  isFinal: boolean,
+  lastNonEmptyText: string,
+): { emit: boolean; text: string; nextLastNonEmptyText: string } {
+  const sanitized = sanitizeAsrRepetitionLoop(rawText);
+  if (sanitized.trim().length > 0) {
+    return { emit: true, text: sanitized, nextLastNonEmptyText: sanitized };
+  }
+  if (!isFinal) {
+    return { emit: false, text: '', nextLastNonEmptyText: lastNonEmptyText };
+  }
+  return { emit: true, text: lastNonEmptyText, nextLastNonEmptyText: lastNonEmptyText };
 }
 
 /**

@@ -1454,6 +1454,69 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
     await proto.handleRawMessage(httpWsB, 'u-http-2', JSON.stringify({ type: 'voice.session.stop', sessionId: 'http-loop-2' }));
     await new Promise((r) => setTimeout(r, 30));
     expect(httpSentB.some((f) => f.type === 'voice.session.result')).toBe(false);
+
+    // 3. Legacy helper tag-only final preserves prior non-empty partial and new sessions start clean
+    const tagSent: Array<Record<string, unknown>> = [];
+    const tagClientWs = { readyState: WebSocket.OPEN, send: (d: string) => tagSent.push(JSON.parse(d)), on: () => {}, close: () => {} } as unknown as WebSocket;
+    hub.handleConnection(tagClientWs, 'u-loop');
+    await proto.handleRawMessage(tagClientWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-tag-final-1',
+      targetDeviceId: 'mac-loop',
+      sampleRate: 16_000,
+    }));
+    await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.ready',
+      sessionId: 'pc-tag-final-1',
+    }));
+    await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-tag-final-1',
+      text: '第一段',
+      isFinal: false,
+    }));
+    await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-tag-final-1',
+      text: 'language None<asr_text>',
+      isFinal: true,
+    }));
+    await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.end',
+      sessionId: 'pc-tag-final-1',
+    }));
+    const tagFinals = tagSent.filter((f) => f.type === 'voice.session.result' && f.isFinal === true);
+    expect(tagFinals).toEqual([
+      { type: 'voice.session.result', sessionId: 'pc-tag-final-1', text: '第一段', isFinal: true },
+    ]);
+
+    // Subsequent new session with only a tag-only final does NOT borrow prior session text
+    const freshSent: Array<Record<string, unknown>> = [];
+    const freshClientWs = { readyState: WebSocket.OPEN, send: (d: string) => freshSent.push(JSON.parse(d)), on: () => {}, close: () => {} } as unknown as WebSocket;
+    hub.handleConnection(freshClientWs, 'u-loop');
+    await proto.handleRawMessage(freshClientWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-tag-final-2',
+      targetDeviceId: 'mac-loop',
+      sampleRate: 16_000,
+    }));
+    await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.ready',
+      sessionId: 'pc-tag-final-2',
+    }));
+    await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-tag-final-2',
+      text: 'language\nNone<asr_text>',
+      isFinal: true,
+    }));
+    await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.end',
+      sessionId: 'pc-tag-final-2',
+    }));
+    expect(freshSent.filter((f) => f.type === 'voice.session.result')).toEqual([
+      { type: 'voice.session.result', sessionId: 'pc-tag-final-2', text: '', isFinal: true },
+    ]);
     expect(httpSentB).toContainEqual({ type: 'voice.session.end', sessionId: 'http-loop-2' });
 
     hub.stop();

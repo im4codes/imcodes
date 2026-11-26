@@ -322,13 +322,21 @@ int main() {
   // 9. Control-tag stripping and CJK vs ASCII segment joining.
   {
     assert(strip_asr_control_tags("language None<asr_text>").empty());
+    assert(strip_asr_control_tags("language\nNone<asr_text>").empty());
+    assert(strip_asr_control_tags("language\r\nNone<asr_text>").empty());
+    assert(strip_asr_control_tags("language\t\n  None\r\n<asr_text>").empty());
     assert(strip_asr_control_tags("language Chinese<asr_text>第一段检查。") == "第一段检查。");
+    assert(strip_asr_control_tags("language\nChinese<asr_text>前文") == "前文");
+    assert(strip_asr_control_tags("language\r\nChinese<asr_text>前文") == "前文");
     assert(strip_asr_control_tags("Whiskey 五百五十。 language None<asr_text>十五x ray") ==
            "Whiskey 五百五十。 十五x ray");
     assert(strip_asr_control_tags("<|endoftext|>hello<asr_text><|zh|>") == "hello");
     assert(strip_asr_control_tags("the language model is fast") == "the language model is fast");
+    assert(strip_asr_control_tags("the language\nmodel is fast") == "the language\nmodel is fast");
     assert(strip_asr_control_tags("language None is just words") == "language None is just words");
     assert(sanitize_asr_repetition_loop("language None<asr_text>").empty());
+    assert(sanitize_asr_repetition_loop("language\nNone<asr_text>").empty());
+    assert(sanitize_asr_repetition_loop("language\r\nNone<asr_text>").empty());
 
     assert(join_transcript_segments("第一段。", "第二段。") == "第一段。第二段。");
     assert(join_transcript_segments("第一段", "第二段") == "第一段第二段");
@@ -401,6 +409,45 @@ int main() {
       assert(extract_json_string_field(line, "text").value_or("").empty());
       assert(extract_json_bool_or_str(line, "isFinal") == "true");
     }
+  }
+
+  // 12. Pipeline with newline/CRLF-separated `language\nNone<asr_text>` / `language\r\nNone<asr_text>`
+  // must NOT retain `"language\nNone"` as active_segment_text.
+  {
+    std::vector<std::string> emitted;
+    int call_count = 0;
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> pipeline(
+        [&](const std::vector<float>&) -> std::string {
+          ++call_count;
+          if (call_count == 1) return "language\nNone<asr_text>";
+          if (call_count == 2) return "language\r\nNone<asr_text>";
+          return "language\nChinese<asr_text>前文";
+        },
+        [&](const std::string& line) { emitted.push_back(line); });
+
+    std::thread worker([&]() { pipeline.run_loop(); });
+    pipeline.push(std::vector<float>(kInitialPartialSamples, 0.2f));
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    pipeline.push(std::vector<float>(kStepPartialSamples, 0.2f));
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    pipeline.request_stop(false, true);
+    worker.join();
+
+    std::vector<std::string> partial_texts;
+    std::string final_text;
+    for (const auto& line : emitted) {
+      if (extract_json_string_field(line, "type") != "result") continue;
+      const auto txt = extract_json_string_field(line, "text").value_or("");
+      if (extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_text = txt;
+      } else {
+        partial_texts.push_back(txt);
+      }
+    }
+    assert(partial_texts.empty());
+    assert(final_text == "前文");
   }
 
   std::printf("segmented-pipeline tests passed\n");

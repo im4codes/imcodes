@@ -265,12 +265,12 @@ std::string strip_asr_control_tags(const std::string& input) {
         input.compare(i, kLangPrefix.size(), kLangPrefix) == 0 &&
         (i == 0 || (!is_ascii_alnum(static_cast<unsigned char>(input[i - 1])) && input[i - 1] != '_'))) {
       size_t p = i + kLangPrefix.size();
-      if (p < input.size() && (input[p] == ' ' || input[p] == '\t')) {
-        while (p < input.size() && (input[p] == ' ' || input[p] == '\t')) ++p;
+      if (p < input.size() && is_ascii_ws(input[p])) {
+        while (p < input.size() && is_ascii_ws(input[p])) ++p;
         const size_t lang_start = p;
         while (p < input.size() && is_lang_token_char(static_cast<unsigned char>(input[p]))) ++p;
         if (p > lang_start) {
-          while (p < input.size() && (input[p] == ' ' || input[p] == '\t')) ++p;
+          while (p < input.size() && is_ascii_ws(input[p])) ++p;
           if (p + kAsrTag.size() <= input.size() && input.compare(p, kAsrTag.size(), kAsrTag) == 0) {
             i = p + kAsrTag.size();
             continue;
@@ -283,10 +283,15 @@ std::string strip_asr_control_tags(const std::string& input) {
       continue;
     }
     if (i + 2 < input.size() && input[i] == '<' && input[i + 1] == '|') {
-      const size_t close = input.find("|>", i + 2);
-      if (close != std::string::npos && close - (i + 2) <= 48 &&
-          input.find('\n', i + 2) > close && input.find('\r', i + 2) > close) {
-        i = close + 2;
+      size_t p = i + 2;
+      while (p < input.size() && (p - (i + 2)) <= 48 &&
+             input[p] != '|' && input[p] != '>' && input[p] != '\r' && input[p] != '\n') {
+        ++p;
+      }
+      const size_t body_len = p - (i + 2);
+      if (body_len >= 1 && body_len <= 48 && p + 1 < input.size() &&
+          input[p] == '|' && input[p + 1] == '>') {
+        i = p + 2;
         continue;
       }
     }

@@ -2,7 +2,7 @@ import {
   REMOTE_VOICE_MAX_PCM_CHUNK_BYTES,
   REMOTE_VOICE_SAMPLE_RATE,
   REMOTE_VOICE_WS_PATH,
-  sanitizeAsrRepetitionLoop,
+  resolveSessionTranscriptResult,
   type RemoteVoiceProviderInfo,
   type RemoteVoiceProvidersSnapshot,
   type RemoteVoiceServerFrame,
@@ -1204,6 +1204,7 @@ export async function startRemoteVoiceSession(
   let readyReceived = false;
   let endReceived = false;
   let hasDeliveredTranscript = false;
+  let lastNonEmptyText = '';
   let resolveReady!: (outcome: { ok: boolean; reason?: string }) => void;
   const readyPromise = new Promise<{ ok: boolean; reason?: string }>((res) => {
     resolveReady = res;
@@ -1895,14 +1896,16 @@ export async function startRemoteVoiceSession(
         return;
       }
       if (frame.type === 'voice.session.result') {
-        const sanitized = sanitizeAsrRepetitionLoop(frame.text);
-        if (sanitized.trim()) {
-          hasDeliveredTranscript = true;
-          fallbackPcmQueue.length = 0;
-        } else if (!frame.isFinal) {
+        const resolved = resolveSessionTranscriptResult(frame.text, frame.isFinal, lastNonEmptyText);
+        lastNonEmptyText = resolved.nextLastNonEmptyText;
+        if (!resolved.emit) {
           return;
         }
-        opts.onResult(sanitized, frame.isFinal);
+        if (resolved.text.trim()) {
+          hasDeliveredTranscript = true;
+          fallbackPcmQueue.length = 0;
+        }
+        opts.onResult(resolved.text, frame.isFinal);
         return;
       }
       if (frame.type === 'voice.session.end') {
