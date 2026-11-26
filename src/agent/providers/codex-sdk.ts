@@ -4759,6 +4759,7 @@ export class CodexSdkProvider implements TransportProvider {
     const channel = this.getChannelForSession(state);
     const generation = channel.generation;
     let result: any;
+    let threadConfigParams: Record<string, unknown> = {};
     for (let attempt = 0; ; attempt++) {
       this.assertSessionStateActiveForSend(sessionId, state, channel, generation);
       if (state.threadId !== targetThreadId) {
@@ -4772,7 +4773,7 @@ export class CodexSdkProvider implements TransportProvider {
           throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Codex SDK session thread changed during resume: ${sessionId}`, false);
         }
       }
-      const threadConfigParams = this.sessionThreadConfigParams(state, false);
+      threadConfigParams = this.sessionThreadConfigParams(state, false);
       try {
         result = await this.requestOnChannel(channel, 'thread/resume', {
           threadId: targetThreadId,
