@@ -1310,7 +1310,7 @@ describe('NewSessionDialog', () => {
     expect(select2.value).toBe('gemini-4-argon-high');
   });
 
-  it('defaults dir to ~/.imcodes/projects/ and auto-fills ~/.imcodes/projects/<sanitized> while typing project name', () => {
+  it('defaults dir to ~/.imcodes/projects/ and auto-fills ~/.imcodes/projects/<readable-slug> while typing project name', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const projectInput = screen.getByPlaceholderText('my-project') as HTMLInputElement;
@@ -1322,7 +1322,7 @@ describe('NewSessionDialog', () => {
     expect(dirInput.value).toBe('~/.imcodes/projects/my_app');
 
     fireEvent.input(projectInput, { target: { value: '我的项目' } });
-    expect(dirInput.value).toBe(`~/.imcodes/projects/${sanitizeProjectName('我的项目')}`);
+    expect(dirInput.value).toBe('~/.imcodes/projects/wo_de_xiang_mu');
 
     fireEvent.input(projectInput, { target: { value: '../../etc/passwd' } });
     expect(dirInput.value).toBe('~/.imcodes/projects/etc_passwd');
@@ -1790,5 +1790,38 @@ describe('NewSessionDialog', () => {
       models: [{ id: 'gpt-6.5-sol' }, { id: 'gpt-6-sol' }],
     }));
     await waitFor(() => expect((screen.getAllByRole('combobox')[1] as HTMLSelectElement).value).toBe('gpt-6.5-sol'));
+  });
+
+  it('auto-populates readable ASCII working directory for non-ASCII project names while preserving sanitizeProjectName and manual dir lock', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog serverId="srv-cjk" ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const projectInput = screen.getByPlaceholderText('my-project') as HTMLInputElement;
+    const dirInput = screen.getByPlaceholderText('~/.imcodes/projects/my-project') as HTMLInputElement;
+
+    fireEvent.input(projectInput, { target: { value: '我的项目' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/wo_de_xiang_mu');
+
+    fireEvent.input(projectInput, { target: { value: '日本語テスト' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/ri_ben_yu_tesuto');
+
+    // Empty/whitespace resets back to base projects dir.
+    fireEvent.input(projectInput, { target: { value: '   ' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/');
+
+    // Submitting keeps raw project name; internal sanitizeProjectName stays untouched (uXXXX).
+    fireEvent.input(projectInput, { target: { value: '我的项目' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/wo_de_xiang_mu');
+    expect(sanitizeProjectName('我的项目')).toBe('u6211_u7684_u9879_u76ee');
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: '我的项目',
+      dir: '~/.imcodes/projects/wo_de_xiang_mu',
+    }));
+
+    // Once directory is manually edited, further project name changes do not overwrite dir.
+    fireEvent.input(dirInput, { target: { value: '/custom/work/path' } });
+    fireEvent.input(projectInput, { target: { value: '另一个项目' } });
+    expect(dirInput.value).toBe('/custom/work/path');
   });
 });
