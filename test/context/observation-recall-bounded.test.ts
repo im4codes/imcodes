@@ -14,6 +14,7 @@ import {
 import {
   searchLocalMemory as searchLocalMemoryCore,
   searchLocalMemoryAuthorized as searchLocalMemoryAuthorizedCore,
+  searchLocalMemoryCandidates,
 } from '../../src/context/memory-recall-core.js';
 import { searchLocalMemorySemanticBounded } from '../../src/context/memory-recall-bounded.js';
 import { DEFAULT_MEMORY_SCORING_WEIGHTS } from '../../shared/memory-scoring.js';
@@ -344,5 +345,129 @@ describe('bounded observation recall and semantic parity', () => {
     const deep = searchLocalMemory({ namespace: ns, offset: 10_005, limit: 10 });
     expect(deep.items).toHaveLength(10);
     expect(deep.stats.matchedRecords).toBe(10_021);
+  });
+
+  it('preserves authorized workspace/org row-level userId filtering, projectless observation exclusion, candidate offset/durable window, and whitespace query zero-match', () => {
+    const wsNs: ContextNamespace = { scope: 'workspace_shared', enterpriseId: 'ent-ws', workspaceId: 'ws-1' };
+    const wsRowNoProj = ensureContextNamespace(wsNs, 100);
+    const orgNs: ContextNamespace = { scope: 'org_shared', enterpriseId: 'ent-ws' };
+    const orgRowNoProj = ensureContextNamespace(orgNs, 100);
+
+    // Projectless workspace_shared & org_shared observations map projectId -> '', excluded when authorized namespace lacks projectId
+    writeContextObservation({
+      namespaceId: wsRowNoProj.id,
+      scope: 'workspace_shared',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'fp-ws-obs',
+      content: { text: 'projectless workspace observation' },
+      now: 200,
+    });
+    writeContextObservation({
+      namespaceId: orgRowNoProj.id,
+      scope: 'org_shared',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'fp-org-obs',
+      content: { text: 'projectless org observation' },
+      now: 210,
+    });
+
+    // Workspace-shared projections with distinct row owners
+    const wsProjOwner1 = writeProcessedProjection({
+      namespace: { scope: 'workspace_shared', enterpriseId: 'ent-ws', workspaceId: 'ws-1', userId: 'owner-1' },
+      class: 'recent_summary',
+      origin: 'chat_compacted',
+      sourceEventIds: ['evt-ws-1'],
+      summary: 'Workspace summary by owner-1',
+      content: { text: 'Workspace summary by owner-1' },
+      createdAt: 300,
+      updatedAt: 300,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'workspace_shared', enterpriseId: 'ent-ws', workspaceId: 'ws-1', userId: 'owner-2' },
+      class: 'recent_summary',
+      origin: 'chat_compacted',
+      sourceEventIds: ['evt-ws-2'],
+      summary: 'Workspace summary by owner-2',
+      content: { text: 'Workspace summary by owner-2' },
+      createdAt: 310,
+      updatedAt: 310,
+    });
+
+    const authOwnerFiltered = searchLocalMemoryAuthorized({
+      authorizedNamespaces: [wsNs, orgNs],
+      userId: 'owner-1',
+      limit: 10,
+    });
+    expect(authOwnerFiltered.items.map((i) => i.id)).toEqual([wsProjOwner1.id]);
+    expect(authOwnerFiltered.stats.matchedRecords).toBe(1);
+
+    const authUnfiltered = searchLocalMemoryAuthorized({
+      authorizedNamespaces: [wsNs, orgNs],
+      limit: 10,
+    });
+    expect(authUnfiltered.items.some((i) => i.type === 'observation')).toBe(false);
+    expect(authUnfiltered.stats.matchedRecords).toBe(2);
+
+    // Semantic candidate path: offset + 41st durable projection behind 40 newer recent summaries
+    const candNs: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/cand', userId: 'user-c' };
+    const hit1 = writeProcessedProjection({
+      namespace: candNs,
+      class: 'recent_summary',
+      origin: 'chat_compacted',
+      sourceEventIds: ['evt-hit-1'],
+      summary: 'memory search hit 1',
+      content: {},
+      createdAt: 100,
+      updatedAt: 100,
+    });
+    writeProcessedProjection({
+      namespace: candNs,
+      class: 'recent_summary',
+      origin: 'chat_compacted',
+      sourceEventIds: ['evt-hit-2'],
+      summary: 'memory search hit 2',
+      content: {},
+      createdAt: 200,
+      updatedAt: 200,
+    });
+    const offsetRes = searchLocalMemoryCandidates({ namespace: candNs, query: 'memory search', offset: 1, limit: 1 });
+    expect(offsetRes.items.map((i) => i.id)).toEqual([hit1.id]);
+
+    const durableNs: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/durable41', userId: 'user-d' };
+    const durable41 = writeProcessedProjection({
+      namespace: durableNs,
+      class: 'durable_memory_candidate',
+      origin: 'chat_compacted',
+      sourceEventIds: ['evt-durable-41'],
+      summary: '41st older durable projection survives ranking',
+      content: {},
+      createdAt: 50,
+      updatedAt: 50,
+    });
+    for (let i = 0; i < 40; i++) {
+      writeProcessedProjection({
+        namespace: durableNs,
+        class: 'recent_summary',
+        origin: 'chat_compacted',
+        sourceEventIds: [`evt-recent-${i}`],
+        summary: `Newer recent summary ${i}`,
+        content: {},
+        createdAt: 100 + i,
+        updatedAt: 100 + i,
+      });
+    }
+    const cand40 = searchLocalMemoryCandidates({ namespace: durableNs, limit: 40 });
+    expect(cand40.items.map((i) => i.id)).toContain(durable41.id);
+
+    // Whitespace-only non-empty query returns 0 hits while '' / undefined browse normally
+    expect(searchLocalMemory({ namespace: candNs, query: '   ' }).items).toEqual([]);
+    expect(searchLocalMemory({ namespace: candNs, query: '   ' }).stats.matchedRecords).toBe(0);
+    expect(searchLocalMemoryAuthorized({ authorizedNamespaces: [candNs], query: '   ' }).items).toEqual([]);
+    expect(searchLocalMemoryAuthorized({ authorizedNamespaces: [candNs], query: '   ' }).stats.matchedRecords).toBe(0);
+    expect(searchLocalMemoryCandidates({ namespace: candNs, query: '   ' }).items).toEqual([]);
+    expect(searchLocalMemory({ namespace: candNs, query: '' }).stats.matchedRecords).toBe(2);
+    expect(searchLocalMemory({ namespace: candNs }).stats.matchedRecords).toBe(2);
   });
 });

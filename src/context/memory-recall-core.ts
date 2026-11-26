@@ -154,11 +154,6 @@ function buildAuthorizedProcessedNamespaceFilters(query: AuthorizedMemorySearchQ
   const seen = new Set<string>();
   for (const namespace of query.authorizedNamespaces) {
     if (query.scope && namespace.scope !== query.scope) continue;
-    if (query.userId && namespace.userId !== query.userId) {
-      if (!(query.includeLegacyPersonalOwner && namespace.scope === 'personal' && (!namespace.userId || namespace.userId === LEGACY_DAEMON_LOCAL_USER_ID))) {
-        continue;
-      }
-    }
     const key = [
       namespace.scope,
       namespace.enterpriseId ?? '',
@@ -216,13 +211,44 @@ function buildSearchProcessedNamespaceFilters(query: MemorySearchQuery): Process
   return out;
 }
 
+function mappedNamespaceRowMatches(row: ContextNamespaceRow, query: MemorySearchQuery): boolean {
+  return matchesNamespace({
+    scope: row.scope as ContextNamespace['scope'],
+    projectId: row.projectId ?? '',
+    enterpriseId: row.orgId,
+    workspaceId: row.workspaceId,
+    userId: row.userId,
+  }, query);
+}
+
 function executePaginatedMemorySearch(input: {
   query: MemorySearchQuery;
   processedNamespaceFilters: readonly ProcessedProjectionNamespaceFilter[];
+  processedRowUserId?: string;
+  processedRowIncludeLegacyPersonalOwner?: boolean;
   observationNamespaces: Map<string, ContextNamespaceRow>;
   observationScope?: ContextNamespace['scope'];
 }): MemorySearchResult {
-  const { query, processedNamespaceFilters, observationNamespaces, observationScope } = input;
+  const {
+    query,
+    processedNamespaceFilters,
+    processedRowUserId,
+    processedRowIncludeLegacyPersonalOwner,
+    observationNamespaces,
+    observationScope,
+  } = input;
+  if (query.query && !query.query.trim()) {
+    return {
+      items: [],
+      stats: {
+        ...computeStats([]),
+        matchedRecords: 0,
+        stagedEventCount: 0,
+        dirtyTargetCount: listDirtyTargets().length,
+        pendingJobCount: 0,
+      },
+    };
+  }
   const offset = Math.max(0, Math.floor(query.offset ?? 0));
   const limit = Math.max(0, Math.floor(query.limit ?? 50));
   const after = query.after ? query.after : undefined;
@@ -274,6 +300,8 @@ function executePaginatedMemorySearch(input: {
   if (!query.observationClass && processedNamespaceFilters.length > 0) {
     const procFilter = {
       namespaceFilters: processedNamespaceFilters,
+      rowUserId: processedRowUserId,
+      rowIncludeLegacyPersonalOwner: processedRowIncludeLegacyPersonalOwner,
       projectionClass: query.projectionClass,
       includeArchived: query.includeArchived,
       after,
@@ -338,7 +366,9 @@ export function searchLocalMemoryAuthorized(query: AuthorizedMemorySearchQuery):
   if (!query.projectionClass && query.includeObservations !== false) {
     const allNamespaces = listContextNamespaces();
     for (const namespace of query.authorizedNamespaces) {
-      for (const [id, row] of observationNamespacesForQuery({ ...query, namespace }, allNamespaces)) {
+      const nsQuery = { ...query, namespace };
+      for (const [id, row] of observationNamespacesForQuery(nsQuery, allNamespaces)) {
+        if (!mappedNamespaceRowMatches(row, nsQuery)) continue;
         observationNamespaces.set(id, row);
       }
     }
@@ -346,6 +376,8 @@ export function searchLocalMemoryAuthorized(query: AuthorizedMemorySearchQuery):
   return executePaginatedMemorySearch({
     query,
     processedNamespaceFilters: buildAuthorizedProcessedNamespaceFilters(query),
+    processedRowUserId: query.userId,
+    processedRowIncludeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
     observationNamespaces,
   });
 }
@@ -504,31 +536,45 @@ export async function rerankCandidatesBySemantic(
 /** Fast bounded candidate collection for semantic rerank (no full COUNT(*) scan). */
 export function searchLocalMemoryCandidates(query: MemorySearchQuery): MemorySearchResult {
   if (!isMemoryDaemonEnabled()) return { items: [], stats: { ...computeStats([]), matchedRecords: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 } };
-  const limit = Math.max(1, Math.floor(query.limit ?? 40));
-  const boundedQuery: MemorySearchQuery = { ...query, offset: 0, limit };
+  if (query.query && !query.query.trim()) {
+    return {
+      items: [],
+      stats: {
+        ...computeStats([]),
+        matchedRecords: 0,
+        stagedEventCount: 0,
+        dirtyTargetCount: listDirtyTargets().length,
+        pendingJobCount: 0,
+      },
+    };
+  }
+  const offset = Math.max(0, Math.floor(query.offset ?? 0));
+  const limit = Math.max(0, Math.floor(query.limit ?? 50));
+  const windowLimit = Math.max(offset + limit, limit, 50);
+  const windowQuery: MemorySearchQuery = { ...query, offset: 0, limit: windowLimit };
   const allItems: MemorySearchResultItem[] = [];
 
-  const processedByNs = collectProcessedProjections(boundedQuery);
+  const processedByNs = collectProcessedProjections(windowQuery);
   for (const projection of processedByNs) {
     const item = projectionToItem(projection);
-    if (matchesQuery(item, boundedQuery)) {
-      allItems.push(withMatchKind(item, boundedQuery));
+    if (matchesQuery(item, windowQuery)) {
+      allItems.push(withMatchKind(item, windowQuery));
     }
   }
 
-  if (boundedQuery.includeObservations !== false && !boundedQuery.projectionClass) {
-    const observationItems = collectObservationItems(boundedQuery);
+  if (windowQuery.includeObservations !== false && !windowQuery.projectionClass) {
+    const observationItems = collectObservationItems(windowQuery);
     for (const item of observationItems) {
-      if (matchesQuery(item, boundedQuery)) {
-        allItems.push(withMatchKind(item, boundedQuery));
+      if (matchesQuery(item, windowQuery)) {
+        allItems.push(withMatchKind(item, windowQuery));
       }
     }
   }
 
-  if (boundedQuery.includeRaw) {
-    const rawItems = collectRawEvents(boundedQuery);
+  if (windowQuery.includeRaw) {
+    const rawItems = collectRawEvents(windowQuery);
     for (const item of rawItems) {
-      if (matchesQuery(item, boundedQuery)) {
+      if (matchesQuery(item, windowQuery)) {
         allItems.push(item);
       }
     }
@@ -536,14 +582,14 @@ export function searchLocalMemoryCandidates(query: MemorySearchQuery): MemorySea
 
   allItems.sort(compareSearchItems);
   const stats = computeStats(allItems);
-  const paginated = allItems.slice(0, limit);
+  const paginated = allItems.slice(offset, offset + limit);
 
   return {
     items: paginated,
     stats: {
       ...stats,
       matchedRecords: allItems.length,
-      stagedEventCount: boundedQuery.includeRaw ? allItems.filter((i) => i.type === 'raw').length : 0,
+      stagedEventCount: windowQuery.includeRaw ? allItems.filter((i) => i.type === 'raw').length : 0,
       dirtyTargetCount: listDirtyTargets().length,
       pendingJobCount: 0,
     },
@@ -552,9 +598,13 @@ export function searchLocalMemoryCandidates(query: MemorySearchQuery): MemorySea
 
 export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult {
   if (!isMemoryDaemonEnabled()) return { items: [], stats: { ...computeStats([]), matchedRecords: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 } };
-  const observationNamespaces = (!query.projectionClass && query.includeObservations !== false)
-    ? observationNamespacesForQuery(query)
-    : new Map<string, ContextNamespaceRow>();
+  const observationNamespaces = new Map<string, ContextNamespaceRow>();
+  if (!query.projectionClass && query.includeObservations !== false) {
+    for (const [id, row] of observationNamespacesForQuery(query)) {
+      if (!mappedNamespaceRowMatches(row, query)) continue;
+      observationNamespaces.set(id, row);
+    }
+  }
   return executePaginatedMemorySearch({
     query,
     processedNamespaceFilters: buildSearchProcessedNamespaceFilters(query),
@@ -565,7 +615,7 @@ export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 export function collectProcessedProjections(query: MemorySearchQuery): ProcessedContextProjection[] {
-  const limit = Math.max(1, Math.floor(query.limit ?? 50));
+  const limit = Math.max((query.limit ?? 50) + (query.offset ?? 0), query.limit ?? 50, 50);
   const baseFilters = {
     scope: query.namespace?.scope ?? query.scope,
     enterpriseId: query.namespace?.enterpriseId,

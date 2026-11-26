@@ -5346,6 +5346,8 @@ export interface ProcessedProjectionNamespaceFilter {
 
 export interface ProcessedProjectionSearchFilters {
   namespaceFilters: readonly ProcessedProjectionNamespaceFilter[];
+  rowUserId?: string;
+  rowIncludeLegacyPersonalOwner?: boolean;
   projectionClass?: ProcessedContextClass;
   includeArchived?: boolean;
   after?: number;
@@ -5424,6 +5426,19 @@ function buildProcessedSearchWhere(
   }
   if (!appendProcessedNamespaceGroupSql(conditions, params, filters.namespaceFilters)) {
     return { empty: true };
+  }
+  if (filters.rowUserId !== undefined) {
+    if (hasFilterValue(filters.rowUserId)) {
+      if (filters.rowIncludeLegacyPersonalOwner) {
+        conditions.push("(user_id = ? OR (scope = 'personal' AND (user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?)))");
+        params.push(filters.rowUserId, LEGACY_DAEMON_LOCAL_USER_ID);
+      } else {
+        conditions.push('user_id = ?');
+        params.push(filters.rowUserId);
+      }
+    } else {
+      conditions.push("user_id = '__imcodes_empty_user_filter_never_matches__'");
+    }
   }
   if (filters.projectionClass) {
     conditions.push('class = ?');
