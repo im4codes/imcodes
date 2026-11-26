@@ -6903,29 +6903,43 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     expect(initialSnap?.lastBackgroundProgressAt).toBeGreaterThanOrEqual(baseTime - 5_000);
     expect(runtime.getDiagnosticSnapshot(baseTime).lastBackgroundProgressAt).toBe(initialSnap?.lastBackgroundProgressAt);
 
-    // During streamed token deltas (`onDelta` -> `hasActiveTurnWork()`) and normal status queries, ZERO statSync calls happen!
+    // Wire session-manager onStatusChange -> getDiagnosticSnapshot() and supervision-style >2s streamed
+    // delta diagnostic reads: natural streaming deltas must trigger ZERO fs.statSync calls.
+    const statusSnapshots: Array<number | null | undefined> = [];
+    runtime.onStatusChange = () => {
+      statusSnapshots.push(runtime.getDiagnosticSnapshot().lastBackgroundProgressAt);
+    };
     statSpy.mockClear();
     state.promptInFlight = true;
     for (let i = 0; i < 10; i += 1) {
+      const streamTs = baseTime + (i + 1) * 2_100;
+      nowSpy.mockReturnValue(streamTs);
       (provider as any).handleAgentChunk(id, state, {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: `chunk-${i} ` },
       });
+      // Simulate supervision-automation throttled (>2s) diagnostic inspection on streamed deltas.
+      expect(runtime.getDiagnosticSnapshot(streamTs).lastBackgroundProgressAt).toBe(initialSnap?.lastBackgroundProgressAt);
     }
     expect(runtime.getStatus()).toBe('streaming');
+    expect(statusSnapshots.length).toBeGreaterThanOrEqual(1);
     const cachedSnap = provider.getActiveWorkSnapshot(id);
     expect(cachedSnap?.lastBackgroundProgressAt).toBe(initialSnap?.lastBackgroundProgressAt);
     expect(statSpy).not.toHaveBeenCalled();
+    runtime.onStatusChange = undefined;
     state.promptInFlight = false;
 
     const t25 = baseTime + 25 * 60_000;
     nowSpy.mockReturnValue(t25);
     await appendFile(liveLog, '653/1223 files passed\n');
-    // Non-sampling snapshot does not hit fs; diagnostic snapshot samples and exposes fresh progress to both.
+    // Default getDiagnosticSnapshot() and getActiveWorkSnapshot() read cache with zero statSync;
+    // explicit watchdog sampling (`{ sampleBackgroundProgress: true }`) refreshes progress and updates cache.
     expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(initialSnap?.lastBackgroundProgressAt);
+    expect(runtime.getDiagnosticSnapshot(t25).lastBackgroundProgressAt).toBe(initialSnap?.lastBackgroundProgressAt);
     expect(statSpy).not.toHaveBeenCalled();
-    expect(runtime.getDiagnosticSnapshot(t25).lastBackgroundProgressAt).toBe(t25);
+    expect(runtime.getDiagnosticSnapshot(t25, { sampleBackgroundProgress: true }).lastBackgroundProgressAt).toBe(t25);
     expect(statSpy).toHaveBeenCalledTimes(1);
+    expect(runtime.getDiagnosticSnapshot(t25).lastBackgroundProgressAt).toBe(t25);
     expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t25);
     statSpy.mockRestore();
 
@@ -6938,20 +6952,20 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       toolStatus: 'complete',
     });
     // Baseline initial observation (matching periodic 30s health poll before next write).
-    runtime.getDiagnosticSnapshot(t25);
+    runtime.getDiagnosticSnapshot(t25, { sampleBackgroundProgress: true });
     const t32 = baseTime + 32 * 60_000;
     nowSpy.mockReturnValue(t32);
     await appendFile(secondLog, 'still going\n');
-    expect(runtime.getDiagnosticSnapshot(t32).lastBackgroundProgressAt).toBe(t32);
+    expect(runtime.getDiagnosticSnapshot(t32, { sampleBackgroundProgress: true }).lastBackgroundProgressAt).toBe(t32);
 
     const t55 = baseTime + 55 * 60_000;
     nowSpy.mockReturnValue(t55);
-    expect(runtime.getDiagnosticSnapshot(t55).lastBackgroundProgressAt).toBe(t32);
+    expect(runtime.getDiagnosticSnapshot(t55, { sampleBackgroundProgress: true }).lastBackgroundProgressAt).toBe(t32);
 
     // 5. Deleting a log file never throws and leaves previous progress intact without advancing it.
     await unlink(secondLog);
     const t60 = baseTime + 60 * 60_000;
     nowSpy.mockReturnValue(t60);
-    expect(runtime.getDiagnosticSnapshot(t60).lastBackgroundProgressAt).toBe(t32);
+    expect(runtime.getDiagnosticSnapshot(t60, { sampleBackgroundProgress: true }).lastBackgroundProgressAt).toBe(t32);
   });
 });

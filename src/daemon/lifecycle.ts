@@ -2807,7 +2807,7 @@ export async function recoverAgyStalledSession(
   if (!isAgyTransportSession(s)) return false;
   const runtime = getTransportRuntime(s.name);
   if (!runtime) return false;
-  const diagnostic = runtime.getDiagnosticSnapshot(nowMs);
+  const diagnostic = runtime.getDiagnosticSnapshot(nowMs, { sampleBackgroundProgress: true });
   if (!isTransportDiagnosticActive(diagnostic)) return false;
 
   const staleMs = getAgyStaleActiveTurnAutoContinueAfterMs();

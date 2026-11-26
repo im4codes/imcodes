@@ -611,11 +611,13 @@ describe('agy stale active-turn watchdog', () => {
       await flushDispatch();
     }
 
+    const diagSpy = vi.spyOn(runtime, 'getDiagnosticSnapshot');
     const t25 = t0 + 25 * 60_000;
     nowSpy.mockReturnValue(t25);
     mock.setBackgroundProgressAt(t25 - 10_000);
-    expect(runtime.getDiagnosticSnapshot(t25).lastBackgroundProgressAt).toBe(t25 - 10_000);
+    expect(runtime.getDiagnosticSnapshot(t25, { sampleBackgroundProgress: true }).lastBackgroundProgressAt).toBe(t25 - 10_000);
     expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t25)).toBe(false);
+    expect(diagSpy).toHaveBeenCalledWith(t25, { sampleBackgroundProgress: true });
 
     const t35 = t0 + 35 * 60_000;
     nowSpy.mockReturnValue(t35);

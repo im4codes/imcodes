@@ -1595,7 +1595,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     return replayed;
   }
 
-  getDiagnosticSnapshot(nowMs: number = Date.now()): TransportRuntimeDiagnosticSnapshot {
+  getDiagnosticSnapshot(
+    nowMs: number = Date.now(),
+    options?: ProviderActiveWorkSnapshotOptions,
+  ): TransportRuntimeDiagnosticSnapshot {
     let providerDiagnostics: Record<string, unknown> | null | undefined;
     if (this._providerSessionId) {
       try {
@@ -1608,7 +1611,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         }, 'Transport provider diagnostics read failed');
       }
     }
-    const activitySnapshot = this.getActivitySnapshot({ sampleBackgroundProgress: true });
+    const activitySnapshot = this.getActivitySnapshot(options);
     const oldestUnacked = this._unacknowledgedActiveAppends[0]?.appendedAt ?? null;
     return {
       status: this._status,
