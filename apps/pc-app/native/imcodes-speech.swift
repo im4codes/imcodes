@@ -1342,13 +1342,13 @@ func runPasteCommand(args: [String]) -> Int32 {
     text = ""
   }
 
-  waitForModifierRelease()
-
   let utf16 = Array(text.utf16)
   if utf16.isEmpty && !sendEnter {
     emitJson(["type": "ok", "length": 0, "trusted": true])
     return 0
   }
+
+  waitForModifierRelease()
 
   // Keep the helper alive briefly after posting CGEvents so WindowServer can
   // complete async TCCAccessRequest() against our live Mach connection before exit.
