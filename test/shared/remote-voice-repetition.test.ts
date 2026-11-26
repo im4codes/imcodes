@@ -1,7 +1,30 @@
 import { describe, expect, it } from 'vitest';
-import { sanitizeAsrRepetitionLoop } from '../../shared/remote-voice.js';
+import { sanitizeAsrRepetitionLoop, stripAsrControlTags } from '../../shared/remote-voice.js';
+
+describe('stripAsrControlTags', () => {
+  it('strips Qwen3-ASR language control prefixes and special tags without altering normal words', () => {
+    expect(stripAsrControlTags('language None<asr_text>')).toBe('');
+    expect(stripAsrControlTags('language Chinese<asr_text>第一段检查。')).toBe('第一段检查。');
+    expect(stripAsrControlTags('language English<asr_text>Hello world')).toBe('Hello world');
+    expect(stripAsrControlTags('Whiskey 五百五十。 language None<asr_text>十五x ray')).toBe(
+      'Whiskey 五百五十。 十五x ray',
+    );
+    expect(stripAsrControlTags('第一句。language None<asr_text>第二句')).toBe('第一句。第二句');
+    expect(stripAsrControlTags('<|endoftext|>hello<asr_text><|zh|>')).toBe('hello');
+    expect(stripAsrControlTags('the language model is fast')).toBe('the language model is fast');
+    expect(stripAsrControlTags('language None is just words')).toBe('language None is just words');
+  });
+});
 
 describe('sanitizeAsrRepetitionLoop', () => {
+  it('eliminates Qwen3-ASR control tags and tag-prefixed repetition bursts', () => {
+    expect(sanitizeAsrRepetitionLoop('language None<asr_text>')).toBe('');
+    expect(sanitizeAsrRepetitionLoop('language Chinese<asr_text>第一段检查。')).toBe('第一段检查。');
+    expect(sanitizeAsrRepetitionLoop('language Chinese<asr_text>' + '想，他'.repeat(30))).toBe('');
+    expect(sanitizeAsrRepetitionLoop('Whiskey 五百五十。 language None<asr_text>十五x ray')).toBe(
+      'Whiskey 五百五十。 十五x ray',
+    );
+  });
   it('eliminates pure runaway repetition bursts matching the live screenshot counterexample', () => {
     expect(sanitizeAsrRepetitionLoop('想，他'.repeat(60))).toBe('');
     expect(sanitizeAsrRepetitionLoop('想，他'.repeat(60) + '想，')).toBe('');

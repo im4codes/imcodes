@@ -1395,20 +1395,26 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
       sessionId: 'pc-loop-1',
     }));
 
-    // Pure hallucination partial MUST NOT be forwarded to client
+    // Pure hallucination and empty control-tag partials MUST NOT be forwarded to client
     await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
       type: 'voice.session.result',
       sessionId: 'pc-loop-1',
       text: '想，他'.repeat(60),
       isFinal: false,
     }));
-    expect(clientSent.filter((f) => f.type === 'voice.session.result')).toHaveLength(0);
-
-    // Normal text stays intact; mixed trailing loop is truncated cleanly
     await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
       type: 'voice.session.result',
       sessionId: 'pc-loop-1',
-      text: '哈哈哈哈',
+      text: 'language None<asr_text>',
+      isFinal: false,
+    }));
+    expect(clientSent.filter((f) => f.type === 'voice.session.result')).toHaveLength(0);
+
+    // Normal text stays intact; control tag prefix is stripped; mixed trailing loop is truncated cleanly
+    await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-loop-1',
+      text: 'language Chinese<asr_text>哈哈哈哈',
       isFinal: false,
     }));
     await proto.handleRawMessage(providerWs, 'u-loop', JSON.stringify({

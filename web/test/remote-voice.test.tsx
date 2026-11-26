@@ -480,7 +480,12 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     expect(clientWs.sent.some((raw) => JSON.parse(raw).type === 'voice.session.audio')).toBe(true);
 
     clientWs.emitMessage({ type: 'voice.session.result', sessionId: startFrame.sessionId, text: '远程识别成功', isFinal: false });
-    expect(results).toContainEqual({ text: '远程识别成功', isFinal: false });
+    clientWs.emitMessage({ type: 'voice.session.result', sessionId: startFrame.sessionId, text: 'language None<asr_text>', isFinal: false });
+    clientWs.emitMessage({ type: 'voice.session.result', sessionId: startFrame.sessionId, text: 'language Chinese<asr_text>继续追加', isFinal: false });
+    expect(results).toEqual([
+      { text: '远程识别成功', isFinal: false },
+      { text: '继续追加', isFinal: false },
+    ]);
 
     const stopP = VoiceInput.stopListening();
     await waitFor(() => expect(clientWs.sent.some((raw) => JSON.parse(raw).type === 'voice.session.stop')).toBe(true));
