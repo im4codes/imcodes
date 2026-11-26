@@ -2,12 +2,32 @@
 #include "imcodes-speech-win.cpp"
 
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <future>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
+
+template <typename Pred>
+void wait_until_or_fail(
+    std::mutex& mu,
+    std::condition_variable& cv,
+    Pred&& pred,
+    const char* label,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+  std::unique_lock<std::mutex> lock(mu);
+  if (!cv.wait_for(lock, timeout, std::forward<Pred>(pred))) {
+    std::fprintf(stderr, "timed out waiting for %s\n", label);
+    std::abort();
+  }
+}
 
 std::string extract_json_bool_or_str(const std::string& line, const std::string& key) {
   const auto str_val = extract_json_string_field(line, key);
@@ -184,24 +204,66 @@ int main() {
   // must STILL be accepted and appear in the single final result.
   {
     std::vector<std::string> emitted;
-    std::mutex emit_mu;
+    std::mutex sync_mu;
+    std::condition_variable sync_cv;
+    bool in_first_decode = false;
+    bool release_first_decode = false;
+    bool first_decode_exited = false;
+    int decode_count = 0;
+
     SegmentedUtterancePipeline<
         std::function<std::string(const std::vector<float>&)>,
         std::function<void(const std::string&)>> pipeline(
-        [](const std::vector<float>& samples) { return decode_by_marker(samples); },
+        [&](const std::vector<float>& samples) {
+          int call = 0;
+          {
+            std::lock_guard<std::mutex> lock(sync_mu);
+            call = ++decode_count;
+          }
+          if (call == 1) {
+            {
+              std::lock_guard<std::mutex> lock(sync_mu);
+              in_first_decode = true;
+            }
+            sync_cv.notify_all();
+            wait_until_or_fail(
+                sync_mu,
+                sync_cv,
+                [&]() { return release_first_decode; },
+                "scenario 5 first decode release");
+          }
+          const std::string out = decode_by_marker(samples);
+          if (call == 1) {
+            {
+              std::lock_guard<std::mutex> lock(sync_mu);
+              first_decode_exited = true;
+            }
+            sync_cv.notify_all();
+          }
+          return out;
+        },
         [&](const std::string& line) {
-          std::lock_guard<std::mutex> lock(emit_mu);
+          std::lock_guard<std::mutex> lock(sync_mu);
           emitted.push_back(line);
         });
 
     pipeline.preload(std::vector<float>(kMaxSegmentSamples, 0.2f));
     std::thread worker([&]() { pipeline.run_loop(); });
+    wait_until_or_fail(
+        sync_mu, sync_cv, [&]() { return in_first_decode; }, "scenario 5 first decode entry");
     pipeline.request_stop(false, false);
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    {
+      std::lock_guard<std::mutex> lock(sync_mu);
+      release_first_decode = true;
+    }
+    sync_cv.notify_all();
+    wait_until_or_fail(
+        sync_mu, sync_cv, [&]() { return first_decode_exited; }, "scenario 5 first decode exit");
     pipeline.push(std::vector<float>(4000, 0.8f));
     pipeline.mark_producer_finished();
     worker.join();
 
+    assert(decode_count == 2);
     int final_count = 0;
     std::string final_text;
     for (const auto& line : emitted) {
@@ -238,30 +300,65 @@ int main() {
   // earlier partial produced "first-part": must preserve "first-part" into segment 2 and final.
   {
     std::vector<std::string> emitted;
-    std::mutex emit_mu;
+    std::mutex sync_mu;
+    std::condition_variable sync_cv;
+    int partial_decode_count = 0;
+    int boundary_decode_count = 0;
+    int seg2_decode_count = 0;
+    bool has_first_partial_emit = false;
+
     SegmentedUtterancePipeline<
         std::function<std::string(const std::vector<float>&)>,
         std::function<void(const std::string&)>> pipeline(
-        [](const std::vector<float>& samples) -> std::string {
-          if (samples.front() >= 0.7f) return "second-part";
-          if (samples.size() >= kMaxSegmentSamples) return "language None<asr_text>";
+        [&](const std::vector<float>& samples) -> std::string {
+          std::lock_guard<std::mutex> lock(sync_mu);
+          if (samples.front() >= 0.7f) {
+            ++seg2_decode_count;
+            sync_cv.notify_all();
+            return "second-part";
+          }
+          if (samples.size() >= kMaxSegmentSamples) {
+            ++boundary_decode_count;
+            sync_cv.notify_all();
+            return "language None<asr_text>";
+          }
+          ++partial_decode_count;
+          sync_cv.notify_all();
           return "first-part";
         },
         [&](const std::string& line) {
-          std::lock_guard<std::mutex> lock(emit_mu);
+          std::lock_guard<std::mutex> lock(sync_mu);
           emitted.push_back(line);
+          if (extract_json_string_field(line, "type") == "result" &&
+              extract_json_bool_or_str(line, "isFinal") == "false" &&
+              extract_json_string_field(line, "text").value_or("") == "first-part") {
+            has_first_partial_emit = true;
+            sync_cv.notify_all();
+          }
         });
 
     std::thread worker([&]() { pipeline.run_loop(); });
-    // Push in partial steps so active_segment_text captures "first-part" before hitting 216k.
-    for (size_t pushed = 0; pushed < kMaxSegmentSamples; pushed += 16000) {
-      const size_t chunk = std::min<size_t>(16000, kMaxSegmentSamples - pushed);
-      pipeline.push(std::vector<float>(chunk, 0.2f));
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    pipeline.push(std::vector<float>(16000, 0.8f));
+    // Push initial partial threshold and wait until "first-part" is emitted into active_segment_text.
+    pipeline.push(std::vector<float>(kInitialPartialSamples, 0.2f));
+    wait_until_or_fail(
+        sync_mu,
+        sync_cv,
+        [&]() { return partial_decode_count >= 1 && has_first_partial_emit; },
+        "scenario 7 first non-empty partial");
+    // Fill remaining samples up to kMaxSegmentSamples and wait for boundary decode to run.
+    pipeline.push(std::vector<float>(kMaxSegmentSamples - kInitialPartialSamples, 0.2f));
+    wait_until_or_fail(
+        sync_mu,
+        sync_cv,
+        [&]() { return boundary_decode_count >= 1; },
+        "scenario 7 boundary decode at kMaxSegmentSamples");
+    pipeline.push(std::vector<float>(4000, 0.8f));
     pipeline.request_stop(false, true);
     worker.join();
+
+    assert(partial_decode_count >= 1);
+    assert(boundary_decode_count == 1);
+    assert(seg2_decode_count == 1);
 
     std::string final_text;
     for (const auto& line : emitted) {
@@ -277,29 +374,49 @@ int main() {
   // must NOT overwrite screen with empty text, and stop with short/empty tail preserves "hello".
   {
     std::vector<std::string> emitted;
-    std::mutex emit_mu;
+    std::mutex sync_mu;
+    std::condition_variable sync_cv;
     int call_count = 0;
+    bool has_first_partial_emit = false;
+
     SegmentedUtterancePipeline<
         std::function<std::string(const std::vector<float>&)>,
         std::function<void(const std::string&)>> pipeline(
         [&](const std::vector<float>&) -> std::string {
-          ++call_count;
-          if (call_count == 1) return "language English<asr_text>hello";
+          int current_call = 0;
+          {
+            std::lock_guard<std::mutex> lock(sync_mu);
+            current_call = ++call_count;
+          }
+          sync_cv.notify_all();
+          if (current_call == 1) return "language English<asr_text>hello";
           return "language None<asr_text>";
         },
         [&](const std::string& line) {
-          std::lock_guard<std::mutex> lock(emit_mu);
+          std::lock_guard<std::mutex> lock(sync_mu);
           emitted.push_back(line);
+          if (extract_json_string_field(line, "type") == "result" &&
+              extract_json_bool_or_str(line, "isFinal") == "false" &&
+              extract_json_string_field(line, "text").value_or("") == "hello") {
+            has_first_partial_emit = true;
+            sync_cv.notify_all();
+          }
         });
 
     std::thread worker([&]() { pipeline.run_loop(); });
     pipeline.push(std::vector<float>(kInitialPartialSamples, 0.2f));
-    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    wait_until_or_fail(
+        sync_mu,
+        sync_cv,
+        [&]() { return call_count >= 1 && has_first_partial_emit; },
+        "scenario 8 first partial");
     pipeline.push(std::vector<float>(kStepPartialSamples, 0.2f));
-    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    wait_until_or_fail(
+        sync_mu, sync_cv, [&]() { return call_count >= 2; }, "scenario 8 second decode");
     pipeline.request_stop(false, true);
     worker.join();
 
+    assert(call_count == 3);
     std::vector<std::string> partial_texts;
     std::string final_text;
     for (const auto& line : emitted) {
@@ -415,26 +532,40 @@ int main() {
   // must NOT retain `"language\nNone"` as active_segment_text.
   {
     std::vector<std::string> emitted;
+    std::mutex sync_mu;
+    std::condition_variable sync_cv;
     int call_count = 0;
+
     SegmentedUtterancePipeline<
         std::function<std::string(const std::vector<float>&)>,
         std::function<void(const std::string&)>> pipeline(
         [&](const std::vector<float>&) -> std::string {
-          ++call_count;
-          if (call_count == 1) return "language\nNone<asr_text>";
-          if (call_count == 2) return "language\r\nNone<asr_text>";
+          int current_call = 0;
+          {
+            std::lock_guard<std::mutex> lock(sync_mu);
+            current_call = ++call_count;
+          }
+          sync_cv.notify_all();
+          if (current_call == 1) return "language\nNone<asr_text>";
+          if (current_call == 2) return "language\r\nNone<asr_text>";
           return "language\nChinese<asr_text>前文";
         },
-        [&](const std::string& line) { emitted.push_back(line); });
+        [&](const std::string& line) {
+          std::lock_guard<std::mutex> lock(sync_mu);
+          emitted.push_back(line);
+        });
 
     std::thread worker([&]() { pipeline.run_loop(); });
     pipeline.push(std::vector<float>(kInitialPartialSamples, 0.2f));
-    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    wait_until_or_fail(
+        sync_mu, sync_cv, [&]() { return call_count >= 1; }, "scenario 12 LF decode");
     pipeline.push(std::vector<float>(kStepPartialSamples, 0.2f));
-    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    wait_until_or_fail(
+        sync_mu, sync_cv, [&]() { return call_count >= 2; }, "scenario 12 CRLF decode");
     pipeline.request_stop(false, true);
     worker.join();
 
+    assert(call_count == 3);
     std::vector<std::string> partial_texts;
     std::string final_text;
     for (const auto& line : emitted) {
@@ -447,6 +578,60 @@ int main() {
       }
     }
     assert(partial_texts.empty());
+    assert(final_text == "前文");
+  }
+
+  // 13. Counterexample for delayed worker startup / arbitrary scheduling latency:
+  // even when worker blocks until after initial push, condvar handshakes still drive all 3 decodes.
+  {
+    std::vector<std::string> emitted;
+    std::mutex sync_mu;
+    std::condition_variable sync_cv;
+    std::promise<void> worker_release;
+    std::shared_future<void> worker_gate = worker_release.get_future().share();
+    int call_count = 0;
+
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> pipeline(
+        [&](const std::vector<float>&) -> std::string {
+          int current_call = 0;
+          {
+            std::lock_guard<std::mutex> lock(sync_mu);
+            current_call = ++call_count;
+          }
+          sync_cv.notify_all();
+          if (current_call == 1) return "language\nNone<asr_text>";
+          if (current_call == 2) return "language\r\nNone<asr_text>";
+          return "language\nChinese<asr_text>前文";
+        },
+        [&](const std::string& line) {
+          std::lock_guard<std::mutex> lock(sync_mu);
+          emitted.push_back(line);
+        });
+
+    std::thread worker([&]() {
+      worker_gate.wait();
+      pipeline.run_loop();
+    });
+    pipeline.push(std::vector<float>(kInitialPartialSamples, 0.2f));
+    worker_release.set_value();
+    wait_until_or_fail(
+        sync_mu, sync_cv, [&]() { return call_count >= 1; }, "scenario 13 delayed LF decode");
+    pipeline.push(std::vector<float>(kStepPartialSamples, 0.2f));
+    wait_until_or_fail(
+        sync_mu, sync_cv, [&]() { return call_count >= 2; }, "scenario 13 delayed CRLF decode");
+    pipeline.request_stop(false, true);
+    worker.join();
+
+    assert(call_count == 3);
+    std::string final_text;
+    for (const auto& line : emitted) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_text = extract_json_string_field(line, "text").value_or("");
+      }
+    }
     assert(final_text == "前文");
   }
 
