@@ -1218,6 +1218,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
             models,
             defaultModel: models.some((m) => m.id === 'muse-spark-1.3') ? 'muse-spark-1.3' : (models[0]?.id || 'muse-spark-1.3'),
             isAuthenticated: true,
+            modelCatalogSource: 'live',
           };
           this.modelCache = { at: now, list };
           return list;
@@ -1231,6 +1232,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
       models: DEFAULT_MUSE_MODELS,
       defaultModel: DEFAULT_MUSE_MODELS[0].id,
       isAuthenticated: true,
+      modelCatalogSource: 'static-fallback',
     };
     this.modelCache = { at: now, list: fallbackList };
     return fallbackList;

@@ -2,15 +2,18 @@ import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
-import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 import {
   DAEMON_USER_NOTICE_CODE,
   attachDaemonUserNotice,
   formatDaemonUserNoticeEnglish,
 } from '../../shared/daemon-user-notices.js';
-import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import {
+  WELCOME_FALLBACK_PROVIDER_ID,
+  WELCOME_SDK_PROBE_ORDER,
+  type WelcomeCandidateSdkId,
+  type WelcomePrimarySdkId,
+} from '../../shared/welcome-sdk-order.js';
 import type { AgentAvailabilityMap } from '../../shared/agent-availability.js';
 import type { WorkerSessionSyncStatus } from '../../shared/worker-session-snapshot.js';
 import { detectInstalledAgentsWithMetadata } from '../agent/agent-availability.js';
@@ -22,36 +25,17 @@ import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 
+export {
+  WELCOME_FALLBACK_PROVIDER_ID,
+  WELCOME_SDK_PROBE_ORDER,
+  type WelcomeCandidateSdkId,
+  type WelcomePrimarySdkId,
+};
+
 export const WELCOME_PROJECT_NAME = 'welcome' as const;
 export const WELCOME_SESSION_NAME = 'deck_welcome_brain' as const;
 export const WELCOME_SESSION_LABEL = 'Welcome' as const;
 export const WELCOME_SENTINEL_FILENAME = 'welcome-session-bootstrapped.json' as const;
-export const WELCOME_FALLBACK_PROVIDER_ID = 'opencode-sdk' as const;
-
-/**
- * Exact New Session dialog transport SDK probe priority order:
- * Antigravity -> Codex SDK -> Claude Code SDK -> remaining visible transport SDKs
- * (excluding hidden providers and OpenCode, which serves as the keyless fallback).
- */
-export const WELCOME_SDK_PROBE_ORDER = [
-  AGY_SDK_PROVIDER_ID,
-  'codex-sdk',
-  'claude-code-sdk',
-  'qoder-sdk',
-  'copilot-sdk',
-  'cursor-headless',
-  'grok-sdk',
-  'kimi-sdk',
-  'muse-code-sdk',
-  HERMES_AGENT_PROVIDER_ID,
-  'deepseek-harness',
-  'pi',
-  CODEBUDDY_PROVIDER_IDS.CHINA,
-  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
-] as const;
-
-export type WelcomePrimarySdkId = typeof WELCOME_SDK_PROBE_ORDER[number];
-export type WelcomeCandidateSdkId = WelcomePrimarySdkId | typeof WELCOME_FALLBACK_PROVIDER_ID;
 
 const DEFAULT_PROBE_TIMEOUT_MS = 12_000;
 const OPENCODE_PROVIDER_PREFIX = 'opencode/';
@@ -76,35 +60,31 @@ function isReliableOpenCodeFreeCandidate(id: string): boolean {
 }
 
 /**
- * Pick a live keyless OpenCode free model while avoiding known geo-blocked or deprecated IDs:
- * 1. Confirmed OpenCode `defaultModel` (free or `opencode/big-pickle`, non-excluded)
+ * Pick a live keyless OpenCode free model while strictly rejecting non-free and known geo-blocked/deprecated IDs:
+ * 1. Confirmed OpenCode `defaultModel` (free or `opencode/big-pickle`, non-excluded & non-deprioritized)
  * 2. `opencode/big-pickle`
  * 3. Reliable verified free models (`*deepseek*free*`, `*nemotron*lightning*free*`, `*mimo*free*`)
- * 4. Other non-excluded `opencode/*free*` (deprioritizing slow/flaky IDs)
- * 5. Any remaining non-excluded `opencode/*` fallback
+ * 4. Other verified non-excluded `opencode/*free*` (deprioritizing slow/flaky IDs)
+ * Returns `null` when no verified free OpenCode model is available.
  */
 export function selectOpenCodeFreeModel(modelList: ProviderModelList): string | null {
   if (modelList.isAuthenticated !== true || !Array.isArray(modelList.models) || modelList.models.length === 0) {
     return null;
   }
-  const openCodeModels = modelList.models.filter(
-    (m) => typeof m.id === 'string' && m.id.startsWith(OPENCODE_PROVIDER_PREFIX),
+  const verifiedFreeCandidates = modelList.models.filter(
+    (m) => typeof m.id === 'string' && isReliableOpenCodeFreeCandidate(m.id),
   );
-  if (openCodeModels.length === 0) return null;
-
-  const eligibleModels = openCodeModels.filter((m) => !OPENCODE_EXCLUDED_FREE_MODELS.has(m.id));
-  const pool = eligibleModels.length > 0 ? eligibleModels : openCodeModels;
+  if (verifiedFreeCandidates.length === 0) return null;
 
   if (
     typeof modelList.defaultModel === 'string'
-    && pool.some((m) => m.id === modelList.defaultModel)
-    && isReliableOpenCodeFreeCandidate(modelList.defaultModel)
+    && verifiedFreeCandidates.some((m) => m.id === modelList.defaultModel)
     && !OPENCODE_DEPRIORITIZED_FREE_MODELS.has(modelList.defaultModel)
   ) {
     return modelList.defaultModel;
   }
 
-  const bigPickle = pool.find((m) => m.id === OPENCODE_BIG_PICKLE_ID);
+  const bigPickle = verifiedFreeCandidates.find((m) => m.id === OPENCODE_BIG_PICKLE_ID);
   if (bigPickle) return bigPickle.id;
 
   const preferredPatterns: RegExp[] = [
@@ -113,23 +93,16 @@ export function selectOpenCodeFreeModel(modelList: ProviderModelList): string | 
     /^opencode\/.*mimo.*free/i,
   ];
   for (const pattern of preferredPatterns) {
-    const match = pool.find((m) => pattern.test(m.id));
+    const match = verifiedFreeCandidates.find((m) => pattern.test(m.id));
     if (match) return match.id;
   }
 
-  const otherFree = pool.find(
-    (m) => isOpenCodeFreeSuffix(m.id) && !OPENCODE_DEPRIORITIZED_FREE_MODELS.has(m.id),
+  const otherFree = verifiedFreeCandidates.find(
+    (m) => !OPENCODE_DEPRIORITIZED_FREE_MODELS.has(m.id),
   );
   if (otherFree) return otherFree.id;
 
-  const deprioritizedFree = pool.find((m) => isOpenCodeFreeSuffix(m.id));
-  if (deprioritizedFree) return deprioritizedFree.id;
-
-  if (typeof modelList.defaultModel === 'string' && pool.some((m) => m.id === modelList.defaultModel)) {
-    return modelList.defaultModel;
-  }
-
-  return pool[0]?.id ?? null;
+  return verifiedFreeCandidates[0]?.id ?? null;
 }
 
 export interface WelcomeWorkerSyncOutcomeLike {
@@ -175,6 +148,8 @@ export interface WelcomeProbeCandidateDeps {
 export interface WelcomeBootstrapDeps {
   stateDir?: string;
   env?: NodeJS.ProcessEnv;
+  /** Must be explicitly set `true` when exercising bootstrap logic under Vitest/`NODE_ENV=test`. */
+  allowInTest?: boolean;
   now?: () => number;
   hasWorkerCreds?: boolean;
   workerSyncOutcome?: WelcomeWorkerSyncOutcomeLike | null;
@@ -246,7 +221,13 @@ export async function probeWelcomeSdkCandidate(
     return null;
   }
 
-  if (!modelList || modelList.isAuthenticated !== true || !Array.isArray(modelList.models) || modelList.models.length === 0) {
+  if (
+    !modelList
+    || modelList.isAuthenticated !== true
+    || modelList.modelCatalogSource === 'static-fallback'
+    || !Array.isArray(modelList.models)
+    || modelList.models.length === 0
+  ) {
     return null;
   }
 
@@ -282,7 +263,7 @@ export async function maybeBootstrapWelcomeSession(
   if (env.IMCODES_SKIP_WELCOME_SESSION === '1') {
     return { status: 'skipped_opt_out' };
   }
-  if (!deps && (env.VITEST || env.NODE_ENV === 'test')) {
+  if (!deps?.allowInTest && (env.VITEST || env.NODE_ENV === 'test')) {
     return { status: 'skipped_opt_out' };
   }
 
@@ -325,12 +306,13 @@ async function runBootstrap(
   const hasWorkerCreds = deps?.hasWorkerCreds ?? false;
   if (hasWorkerCreds) {
     const outcome = deps?.workerSyncOutcome;
-    const isCleanZeroSnapshot = outcome?.status === 'applied'
-      && (outcome.remoteSessionCount ?? 0) === 0
-      && (outcome.remoteSubSessionCount ?? 0) === 0;
-    if (!isCleanZeroSnapshot) {
+    if (outcome?.status !== 'applied') {
       // Do NOT write sentinel yet — wait until a subsequent worker sync succeeds.
       return { status: 'deferred_worker_sync' };
+    }
+    if ((outcome.remoteSessionCount ?? 0) > 0 || (outcome.remoteSubSessionCount ?? 0) > 0) {
+      writeSentinelAtomic(sentinelPath, stateDir, { status: 'skipped_existing_sessions', at: now() });
+      return { status: 'skipped_existing_sessions' };
     }
   }
 

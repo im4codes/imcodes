@@ -100,6 +100,26 @@ describe('daemon user notice web localization', () => {
     }
   });
 
+  it.each(LOCALES)('renders welcome_opencode_free_model as a single concise line in %s without third-party branding', (locale) => {
+    const resource = JSON.parse(readFileSync(
+      resolve(WEB_ROOT, `src/i18n/locales/${locale}.json`),
+      'utf8',
+    )) as { chat?: { daemon_notice?: Record<string, string> } } & Record<string, unknown>;
+    const rawTemplate = resource.chat?.daemon_notice?.welcome_opencode_free_model;
+    expect(typeof rawTemplate).toBe('string');
+    expect(rawTemplate).not.toMatch(/OpenCode|Anomaly|BYOK/i);
+
+    const localized = localizeDaemonUserNoticeEvent(
+      noticeEvent(DAEMON_USER_NOTICE_CODE.WELCOME_OPENCODE_FREE_MODEL, { model: 'opencode/big-pickle' }),
+      resourceTranslator(resource),
+    );
+    const text = String(localized.payload.text);
+    expect(text).toContain('opencode/big-pickle');
+    expect(text).not.toBe('English fallback');
+    expect(text).not.toContain('{{');
+    expect(text).not.toMatch(/[\r\n]/);
+  });
+
   it('falls back for legacy/unknown codes and rejects provider spoofing', () => {
     const t = () => 'localized';
     const unknown = noticeEvent('future_code');

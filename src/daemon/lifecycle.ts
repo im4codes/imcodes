@@ -1869,11 +1869,12 @@ export async function startup(): Promise<DaemonContext> {
   return ctx;
 }
 
-async function runWelcomeBootstrapNonBlocking(
+export async function runWelcomeBootstrapNonBlocking(
   serverLink: ServerLink | null,
   hasWorkerCreds: boolean,
   workerSyncOutcome: WelcomeWorkerSyncOutcomeLike | null,
 ): Promise<void> {
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') return;
   try {
     await maybeBootstrapWelcomeSession({
       hasWorkerCreds,
@@ -1897,7 +1898,7 @@ async function runWelcomeBootstrapNonBlocking(
   }
 }
 
-async function reconcileRuntimesAfterWorkerSessionSync(
+export async function reconcileRuntimesAfterWorkerSessionSync(
   serverLink: ServerLink | null,
   outcome: WorkerSessionSyncOutcome,
 ): Promise<void> {

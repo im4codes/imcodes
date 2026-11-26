@@ -145,6 +145,7 @@ export class AgyAcpProvider extends KimiSdkProvider {
       models: AGY_FALLBACK_MODEL_IDS.map((id) => ({ id })),
       defaultModel: AGY_DEFAULT_MODEL_ID,
       isAuthenticated: true,
+      modelCatalogSource: 'static-fallback',
     };
   }
 

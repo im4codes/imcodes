@@ -865,6 +865,8 @@ export interface ProviderModelList {
   defaultModel?: string;
   /** True when the provider is authenticated and returned real model data. */
   isAuthenticated?: boolean;
+  /** Origin of `models` when a provider falls back to a bundled static catalog. */
+  modelCatalogSource?: 'live' | 'static-fallback';
   /** Human-readable probe error — shown in the picker when models is empty. */
   error?: string;
 }

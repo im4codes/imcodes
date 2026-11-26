@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
+import { MuseCodeSdkProvider } from '../../src/agent/providers/muse-code-sdk.js';
 import {
   WELCOME_FALLBACK_PROVIDER_ID,
   WELCOME_PROJECT_NAME,
@@ -31,7 +32,7 @@ afterEach(() => {
 });
 
 describe('welcome-session-bootstrap', () => {
-  it('defines WELCOME_SDK_PROBE_ORDER in exact New Session dialog transport SDK order (excluding OpenCode fallback and OpenClaw)', () => {
+  it('defines WELCOME_SDK_PROBE_ORDER in expected order (excluding OpenCode fallback and OpenClaw)', () => {
     expect([...WELCOME_SDK_PROBE_ORDER]).toEqual([
       'agy-sdk',
       'codex-sdk',
@@ -53,7 +54,7 @@ describe('welcome-session-bootstrap', () => {
   });
 
   describe('selectOpenCodeFreeModel', () => {
-    it('avoids geo-blocked/deprecated models (beam-free, inkling-2-small-free, longcat-2.5-free) and follows reliable free priority', () => {
+    it('rejects unauthenticated lists, non-opencode models, unconfirmed non-free opencode models, and never re-admits excluded IDs', () => {
       expect(selectOpenCodeFreeModel({
         isAuthenticated: false,
         models: [{ id: 'opencode/gpt-5-nano-free', name: 'Free' }],
@@ -67,6 +68,21 @@ describe('welcome-session-bootstrap', () => {
         ],
         defaultModel: 'anthropic/claude-sonnet-4-5',
       })).toBeNull();
+
+      // Unconfirmed non-free OpenCode model or excluded geo-blocked/deprecated models MUST return null.
+      for (const blockedOnlyId of [
+        'opencode/claude-sonnet-4-6',
+        'opencode/other-zen-model',
+        'opencode/beam-free',
+        'opencode/inkling-2-small-free',
+        'opencode/longcat-2.5-free',
+      ]) {
+        expect(selectOpenCodeFreeModel({
+          isAuthenticated: true,
+          models: [{ id: blockedOnlyId, name: blockedOnlyId }],
+          defaultModel: blockedOnlyId,
+        }), `only ${blockedOnlyId}`).toBeNull();
+      }
 
       // OpenCode v1.19.6 real-device model list: never pick beam-free when big-pickle or deepseek-v4.1-flash-free exists.
       expect(selectOpenCodeFreeModel({
@@ -118,12 +134,148 @@ describe('welcome-session-bootstrap', () => {
         ],
         defaultModel: 'opencode/deepseek-v4.1-flash-free',
       })).toBe('opencode/deepseek-v4.1-flash-free');
-
-      expect(selectOpenCodeFreeModel({
-        isAuthenticated: true,
-        models: [{ id: 'opencode/other-zen-model', name: 'Zen' }],
-      })).toBe('opencode/other-zen-model');
     });
+
+    it('never creates Welcome or emits free notice when OpenCode only exposes excluded or unconfirmed non-free models', async () => {
+      const stateDir = makeStateDir();
+      const launchSession = vi.fn(async () => {});
+      const emitTimelineNotice = vi.fn();
+
+      const result = await maybeBootstrapWelcomeSession({
+        stateDir,
+        allowInTest: true,
+        env: {},
+        listSessions: () => [],
+        detectInstalledAgents: async () => ({ 'opencode-sdk': { installed: true } }),
+        ensureProviderConnected: async () => ({
+          listModels: async () => ({
+            isAuthenticated: true,
+            defaultModel: 'opencode/claude-sonnet-4-6',
+            models: [
+              { id: 'opencode/claude-sonnet-4-6', name: 'Claude' },
+              { id: 'opencode/beam-free', name: 'Beam Free' },
+              { id: 'opencode/inkling-2-small-free', name: 'Inkling' },
+              { id: 'opencode/longcat-2.5-free', name: 'Longcat' },
+            ],
+          }),
+        }),
+        launchSession,
+        emitTimelineNotice,
+      });
+
+      expect(result).toEqual({ status: 'no_available_sdk' });
+      expect(launchSession).not.toHaveBeenCalled();
+      expect(emitTimelineNotice).not.toHaveBeenCalled();
+      expect(existsSync(join(stateDir, WELCOME_SENTINEL_FILENAME))).toBe(false);
+    });
+  });
+
+  it('rejects Muse static fallback catalog during Welcome probe and succeeds only with live model/list verification', async () => {
+    const stateDir = makeStateDir();
+    const unauthMuse = new MuseCodeSdkProvider();
+    (unauthMuse as unknown as {
+      spawned: { connection: { command: (method: string, params: unknown) => Promise<unknown> } };
+    }).spawned = {
+      connection: {
+        command: async () => {
+          throw new Error('not logged in');
+        },
+      },
+    };
+
+    // Regular model picker behavior preserved: listModels still returns static fallback + isAuthenticated: true,
+    // tagged as static-fallback so Welcome probe rejects it.
+    const museFallbackList = await unauthMuse.listModels(true);
+    expect(museFallbackList.isAuthenticated).toBe(true);
+    expect(museFallbackList.modelCatalogSource).toBe('static-fallback');
+
+    const launchSession = vi.fn(async () => {});
+    const emitTimelineNotice = vi.fn();
+    const fallbackResult = await maybeBootstrapWelcomeSession({
+      stateDir,
+      allowInTest: true,
+      env: {},
+      listSessions: () => [],
+      detectInstalledAgents: async () => ({
+        'muse-code-sdk': { installed: true },
+        'opencode-sdk': { installed: true },
+      }),
+      ensureProviderConnected: async (id) => {
+        if (id === 'muse-code-sdk') return unauthMuse;
+        if (id === 'opencode-sdk') {
+          return {
+            listModels: async () => ({
+              isAuthenticated: true,
+              models: [{ id: 'opencode/big-pickle', name: 'Big Pickle' }],
+            }),
+          };
+        }
+        throw new Error(`unexpected provider ${id}`);
+      },
+      launchSession,
+      emitTimelineNotice,
+    });
+
+    expect(fallbackResult).toEqual({
+      status: 'created',
+      sessionName: WELCOME_SESSION_NAME,
+      agentType: 'opencode-sdk',
+      model: 'opencode/big-pickle',
+      fallbackUsed: true,
+    });
+    expect(emitTimelineNotice).toHaveBeenCalledTimes(1);
+
+    // Positive control: Muse with live model/list response IS accepted directly without falling back to OpenCode.
+    const liveStateDir = makeStateDir();
+    const liveMuse = new MuseCodeSdkProvider();
+    (liveMuse as unknown as {
+      spawned: { connection: { command: (method: string, params: unknown) => Promise<unknown> } };
+    }).spawned = {
+      connection: {
+        command: async () => ({
+          models: [{ id: 'muse-spark-1.3', name: 'Muse Spark 1.3' }],
+        }),
+      },
+    };
+    const openCodeConnect = vi.fn();
+    const liveResult = await maybeBootstrapWelcomeSession({
+      stateDir: liveStateDir,
+      allowInTest: true,
+      env: {},
+      listSessions: () => [],
+      detectInstalledAgents: async () => ({
+        'muse-code-sdk': { installed: true },
+        'opencode-sdk': { installed: true },
+      }),
+      ensureProviderConnected: async (id) => {
+        if (id === 'muse-code-sdk') return liveMuse;
+        openCodeConnect(id);
+        throw new Error('should not reach opencode');
+      },
+      launchSession: vi.fn(async () => {}),
+    });
+
+    expect(liveResult).toEqual({
+      status: 'created',
+      sessionName: WELCOME_SESSION_NAME,
+      agentType: 'muse-code-sdk',
+      model: 'muse-spark-1.3',
+      fallbackUsed: false,
+    });
+    expect(openCodeConnect).not.toHaveBeenCalled();
+
+    // Generic static-fallback guard also rejects any other provider tagged static-fallback (e.g. agy-acp).
+    const staticProbe = await probeWelcomeSdkCandidate('agy-sdk', {
+      installedAgents: { 'agy-sdk': { installed: true } },
+      ensureProviderConnected: async () => ({
+        listModels: async () => ({
+          isAuthenticated: true,
+          modelCatalogSource: 'static-fallback',
+          models: [{ id: 'claude-sonnet-4-6' }],
+        }),
+      }),
+    });
+    expect(staticProbe).toBeNull();
   });
 
   it('keeps welcome_opencode_free_model copy strictly single-line and low-key across all 7 locales', () => {
@@ -148,6 +300,7 @@ describe('welcome-session-bootstrap', () => {
 
     const result = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       now: () => 1_700_000_000_000,
       listSessions: () => [],
@@ -212,6 +365,7 @@ describe('welcome-session-bootstrap', () => {
 
     const result = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       listSessions: () => [],
       detectInstalledAgents: async () => ({
@@ -267,6 +421,7 @@ describe('welcome-session-bootstrap', () => {
 
     const result = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       listSessions: () => [],
       detectInstalledAgents: async () => ({
@@ -337,6 +492,7 @@ describe('welcome-session-bootstrap', () => {
 
     const first = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       listSessions: () => sessions,
       detectInstalledAgents: async () => ({ 'agy-sdk': { installed: true } }),
@@ -356,6 +512,7 @@ describe('welcome-session-bootstrap', () => {
     const detectAgain = vi.fn(async () => ({ 'agy-sdk': { installed: true } }));
     const second = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       listSessions: () => sessions,
       detectInstalledAgents: detectAgain,
@@ -374,6 +531,7 @@ describe('welcome-session-bootstrap', () => {
 
     const result = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       listSessions: () => [{ name: 'deck_existing_brain' }],
       detectInstalledAgents,
@@ -388,13 +546,58 @@ describe('welcome-session-bootstrap', () => {
     expect(sentinel.status).toBe('skipped_existing_sessions');
   });
 
-  it('defers while worker sync has not yet returned a clean 0-session snapshot, then bootstraps once clean sync applies', async () => {
+  it('persists skipped_existing_sessions sentinel when applied remote snapshot has nonzero main or sub-sessions even with empty local store', async () => {
+    for (const remoteCounts of [
+      { remoteSessionCount: 1, remoteSubSessionCount: 0 },
+      { remoteSessionCount: 0, remoteSubSessionCount: 1 },
+    ]) {
+      const stateDir = makeStateDir();
+      const detectInstalledAgents = vi.fn(async () => ({ 'agy-sdk': { installed: true } }));
+      const launchSession = vi.fn(async () => {});
+
+      // Empty local listSessions(), but remote applied snapshot proves existing history (e.g. stopped remote session or remote sub-session).
+      const first = await maybeBootstrapWelcomeSession({
+        stateDir,
+        allowInTest: true,
+        env: {},
+        hasWorkerCreds: true,
+        workerSyncOutcome: { status: 'applied', ...remoteCounts },
+        listSessions: () => [],
+        detectInstalledAgents,
+        launchSession,
+      });
+
+      expect(first).toEqual({ status: 'skipped_existing_sessions' });
+      expect(detectInstalledAgents).not.toHaveBeenCalled();
+      expect(launchSession).not.toHaveBeenCalled();
+      const sentinel = JSON.parse(readFileSync(join(stateDir, WELCOME_SENTINEL_FILENAME), 'utf8'));
+      expect(sentinel.status).toBe('skipped_existing_sessions');
+
+      // Even if remote history is deleted before the next restart and applied returns 0, sentinel blocks surprise Welcome creation.
+      const second = await maybeBootstrapWelcomeSession({
+        stateDir,
+        allowInTest: true,
+        env: {},
+        hasWorkerCreds: true,
+        workerSyncOutcome: { status: 'applied', remoteSessionCount: 0, remoteSubSessionCount: 0 },
+        listSessions: () => [],
+        detectInstalledAgents,
+        launchSession,
+      });
+      expect(second).toEqual({ status: 'already_bootstrapped' });
+      expect(detectInstalledAgents).not.toHaveBeenCalled();
+      expect(launchSession).not.toHaveBeenCalled();
+    }
+  });
+
+  it('defers while worker sync has not yet returned applied, then bootstraps once clean 0-session sync applies', async () => {
     const stateDir = makeStateDir();
     const launchSession = vi.fn(async () => {});
 
     // Startup before worker sync or after retryable failure must defer WITHOUT writing sentinel.
     const deferred = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       hasWorkerCreds: true,
       workerSyncOutcome: { status: 'retryable' },
@@ -404,21 +607,10 @@ describe('welcome-session-bootstrap', () => {
     expect(deferred).toEqual({ status: 'deferred_worker_sync' });
     expect(existsSync(join(stateDir, WELCOME_SENTINEL_FILENAME))).toBe(false);
 
-    // Worker sync applied with >0 remote sub-sessions must also defer (re-checks/never assumes empty).
-    const deferredRemoteSub = await maybeBootstrapWelcomeSession({
-      stateDir,
-      env: {},
-      hasWorkerCreds: true,
-      workerSyncOutcome: { status: 'applied', remoteSessionCount: 0, remoteSubSessionCount: 2 },
-      listSessions: () => [],
-      launchSession,
-    });
-    expect(deferredRemoteSub).toEqual({ status: 'deferred_worker_sync' });
-    expect(existsSync(join(stateDir, WELCOME_SENTINEL_FILENAME))).toBe(false);
-
     // Clean 0-session worker sync triggers Welcome creation.
     const created = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       hasWorkerCreds: true,
       workerSyncOutcome: { status: 'applied', remoteSessionCount: 0, remoteSubSessionCount: 0 },
@@ -451,6 +643,7 @@ describe('welcome-session-bootstrap', () => {
 
     const result = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       probeTimeoutMs: 25,
       listSessions: () => [],
@@ -469,10 +662,23 @@ describe('welcome-session-bootstrap', () => {
     expect(existsSync(join(stateDir, WELCOME_SENTINEL_FILENAME))).toBe(false);
   });
 
-  it('honors IMCODES_SKIP_WELCOME_SESSION=1 opt-out and guards concurrent calls + mid-probe session arrival', async () => {
+  it('skips in test mode by default (even when deps object is passed), honors IMCODES_SKIP_WELCOME_SESSION=1, and guards concurrent calls + mid-probe session arrival', async () => {
     const stateDir = makeStateDir();
+    const detectInDefaultTestMode = vi.fn(async () => ({ 'agy-sdk': { installed: true } }));
+    const launchInDefaultTestMode = vi.fn(async () => {});
+    const defaultTestGuard = await maybeBootstrapWelcomeSession({
+      stateDir,
+      listSessions: () => [],
+      detectInstalledAgents: detectInDefaultTestMode,
+      launchSession: launchInDefaultTestMode,
+    });
+    expect(defaultTestGuard).toEqual({ status: 'skipped_opt_out' });
+    expect(detectInDefaultTestMode).not.toHaveBeenCalled();
+    expect(launchInDefaultTestMode).not.toHaveBeenCalled();
+
     const optOut = await maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: { IMCODES_SKIP_WELCOME_SESSION: '1' },
       listSessions: () => [],
     });
@@ -496,6 +702,7 @@ describe('welcome-session-bootstrap', () => {
 
     const p1 = maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       listSessions: () => sessions,
       detectInstalledAgents: async () => ({ 'agy-sdk': { installed: true } }),
@@ -504,6 +711,7 @@ describe('welcome-session-bootstrap', () => {
     });
     const p2 = maybeBootstrapWelcomeSession({
       stateDir,
+      allowInTest: true,
       env: {},
       listSessions: () => sessions,
       detectInstalledAgents: async () => ({ 'agy-sdk': { installed: true } }),
